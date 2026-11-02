@@ -51,6 +51,42 @@ def test_quality_filter_keeps_clean_prose_and_rejects_symbol_heavy_text():
     assert quality_filter("@#$%^&*" * 40) is False
 
 
+HINDI = (
+    "नदी धीरे-धीरे पुराने मिल के पास से बहती है। सुबह होते ही किसान अपने मवेशियों को किनारे की ओर ले जाते हैं, "
+    "और बच्चे पुल के पास पत्थर इकट्ठा करते हैं। माता-पिता बाज़ार में फसल, मौसम और अनाज के दामों पर बात करते हैं। "
+    "सर्दियों में पहाड़ों से आने वाली हवा ठंडी होती है, इसलिए गाँव के लोग शाम को अलाव के पास बैठकर कहानियाँ सुनाते हैं। "
+    "धीरे-धीरे रात गहरी होती है और पूरा गाँव शांत हो जाता है।"
+)
+THAI = (
+    "แม่น้ำไหลอย่างช้าๆ ผ่านโรงสีเก่าริมทุ่งข้าว ทุกเช้าชาวนาจะพาวัวไปตามคันดินที่ชื้นแฉะ "
+    "ก่อนดวงอาทิตย์จะขึ้นเหนือเนินเขา เด็ก ๆ เก็บก้อนหินใกล้สะพานขณะที่พ่อแม่คุยกันเรื่องฤดูกาล "
+    "สภาพอากาศ และราคาข้าวในตลาดของอำเภอ ฤดูหนาวมาถึงเร็วกว่าปีก่อน ผู้เฝ้าบ้านจึงจุดเตาไฟ "
+    "ในกระท่อมเล็ก ๆ และนับฟืนที่เหลืออยู่อีกครั้งหนึ่ง"
+)
+CHINESE = (
+    "河水缓慢地流过老磨坊，农夫们每天清晨都会牵着牛沿着泥泞的河岸走过。孩子们在桥边捡石头，"
+    "父母则谈论收成、天气以及集市上粮食的价格。冬天比往年来得更早，看守房屋的老人点燃小屋里的炉火，"
+    "数了又数剩下的柴火，心里想着这些木柴能否撑到春天。村里的老人常讲《河边的故事》，"
+    "说河神会在大雪之后醒来！你信吗？孩子们笑着点头：信，当然信。夜色渐渐深了，村子安静下来，"
+    "只有远处的河水仍在不停地流动……第二天一早，磨坊的门又被推开，新的麦子运了进来，"
+    "人们忙碌起来，开始了又一年的劳作。"
+)
+
+
+def test_quality_filter_keeps_non_latin_scripts():
+    for text in (HINDI, THAI, CHINESE):
+        assert len(text) >= 200
+        assert quality_filter(text) is True
+
+
+def test_quality_filter_rejects_text_that_is_mostly_emoji_or_symbols():
+    emoji = "😀🎉🔥🌈✨" * 50                      # 250 characters, all So
+    arrows = "→★♥✓©®™€£¥" * 30                    # 300 characters, all S*
+    assert quality_filter(emoji) is False
+    assert quality_filter(arrows) is False
+    assert quality_filter("@#$%^&*" * 40) is False
+
+
 def test_quality_filter_rejects_too_many_repeated_lines():
     distinct = [f"Distinct sentence number {i} about rivers, mills and farms." for i in range(5)]
     repeated = "This line repeats over and over again in the document."
@@ -65,6 +101,14 @@ def test_dedupe_removes_exact_duplicates_after_clean_and_lowercase_keeping_first
     result = dedupe_documents(docs)
     assert result == [PROSE, OTHER]
     assert result[0] is PROSE
+
+
+def test_dedupe_max_docs_guard_raises_above_limit():
+    docs = [PROSE, OTHER, PROSE]
+    with pytest.raises(ValueError, match="shard"):
+        dedupe_documents(docs, max_docs=2)
+    assert dedupe_documents(docs, max_docs=3) == [PROSE, OTHER]
+    assert dedupe_documents(docs) == [PROSE, OTHER]
 
 
 def test_dedupe_removes_near_duplicate_differing_by_one_word():

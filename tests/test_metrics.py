@@ -70,6 +70,37 @@ def test_choice_accuracy_mrr_nll_and_macro_scores():
     assert approx(r["micro_f1"], 2 / 3)
 
 
+def test_choice_macro_scores_keep_classes_with_gold_support():
+    # gold [0, 2], predictions [0, 1] over three options: option 2 has gold but is never predicted
+    r = choice_report([[0.9, 0.05, 0.05], [0.1, 0.8, 0.1]], [0, 2])
+    assert approx(r["top1_accuracy"], 0.5)
+    assert r["macro_f1"] < 1.0
+    assert approx(r["macro_f1"], 0.5)           # options 0 (F1 1) and 2 (F1 0); option 1 is predicted only
+    assert approx(r["macro_recall"], 0.5)       # options 0 and 2 have gold
+    assert approx(r["macro_precision"], 1 / 3)  # option 1 (predicted only) and option 2 count as 0
+    assert r["per_option"][2]["f1"] == 0.0
+
+
+def test_f_beta_is_zero_when_precision_and_recall_are_both_zero():
+    r = binary_report([0.7, 0.6, 0.2], [0, 0, 1])
+    assert r["precision"] == 0.0 and r["recall"] == 0.0
+    assert r["f1"] == 0.0 and r["f2"] == 0.0 and r["f0_5"] == 0.0
+    # no predicted positives: precision is undefined, so F-beta stays None
+    r = binary_report([0.1, 0.2], [1, 0])
+    assert r["precision"] is None and r["recall"] == 0.0 and r["f1"] is None
+
+
+def test_binary_confidence_follows_the_decision_threshold():
+    r = binary_report([0.6, 0.6, 0.9, 0.1], [1, 0, 1, 0], threshold=0.8)
+    assert r["decisions"] == [0, 0, 1, 0]
+    assert approx(r["mean_confidence"], (0.4 + 0.4 + 0.9 + 0.9) / 4)
+
+
+def test_balanced_accuracy_needs_both_recall_and_specificity():
+    r = binary_report([0.1, 0.2, 0.3], [0, 0, 0])   # no positives: recall undefined
+    assert r["balanced_accuracy"] is None
+
+
 def test_choice_without_labels_reports_confidence_only():
     r = choice_report([[0.6, 0.4], [0.2, 0.8]], None)
     assert r["predicted"] == [0, 1]

@@ -12,8 +12,8 @@ Three kinds of output get a report:
 Confusion-based metrics need gold labels. Without labels, a decision still reports its own
 confidence, entropy and margin, and the confusion fields show "n/a".
 
-Every metric returns None when its denominator is zero. The display prints that as "n/a"
-rather than hiding it.
+Every metric returns None when its denominator is zero, except F-beta, which is 0 when precision
+and recall are both 0. The display prints None as "n/a" rather than hiding it.
 """
 
 import math
@@ -47,7 +47,7 @@ def binary_report(probs, labels=None, threshold: float = 0.5, ece_bins: int = 10
     p = _to_list(probs)
     n = len(p)
     preds = [1 if x >= threshold else 0 for x in p]
-    confidence = [max(x, 1.0 - x) for x in p]
+    confidence = [x if a == 1 else 1.0 - x for x, a in zip(p, preds)]   # confidence in the decision made
     entropy = [-(x * math.log(x + 1e-12) + (1 - x) * math.log(1 - x + 1e-12)) / math.log(2) for x in p]
     report: Dict[str, object] = {
         "kind": "binary",
@@ -82,10 +82,10 @@ def binary_report(probs, labels=None, threshold: float = 0.5, ece_bins: int = 10
         if precision is None or recall is None:
             return None
         den = beta * beta * precision + recall
-        return None if den == 0 else (1 + beta * beta) * precision * recall / den
+        # den == 0 only when precision and recall are both 0, and F-beta is then 0 (the limit)
+        return 0.0 if den == 0 else (1 + beta * beta) * precision * recall / den
 
     mcc_den = math.sqrt((tp + fp) * (tp + fn) * (tn + fp) * (tn + fn))
-    recalls = [v for v in (recall, specificity) if v is not None]
     report.update({
         "tp": tp, "tn": tn, "fp": fp, "fn": fn,
         "accuracy": _div(tp + tn, n),
@@ -98,7 +98,7 @@ def binary_report(probs, labels=None, threshold: float = 0.5, ece_bins: int = 10
         "f1": f_beta(1.0),
         "f2": f_beta(2.0),
         "f0_5": f_beta(0.5),
-        "balanced_accuracy": sum(recalls) / len(recalls) if recalls else None,
+        "balanced_accuracy": (recall + specificity) / 2 if recall is not None and specificity is not None else None,
         "mcc": None if mcc_den == 0 else (tp * tn - fp * fn) / mcc_den,
         "youden_j": None if recall is None or specificity is None else recall + specificity - 1,
         "prevalence": _div(sum(y), n),
@@ -145,12 +145,21 @@ def expected_calibration_error(confidence: Sequence[float], correct: Sequence[in
 # --------------------------------------------------------------------------- choice decisions
 
 def choice_report(probs, gold=None, top_k: Sequence[int] = (2, 3)) -> Dict[str, object]:
-    """Report for N-way choices. ``probs`` is [items, options]. ``gold`` holds the correct index per item."""
+    """Report for N-way choices. ``probs`` is [items, options]. ``gold`` holds the correct index per item.
+
+    Per-option rule, which the macro averages follow:
+      - no gold and no predictions: precision, recall and F1 are None; the class is left out of every macro average.
+      - predictions but no gold: precision is 0 (it enters macro precision); recall and F1 are None
+        (they stay out of macro recall and macro F1).
+      - gold present: recall = TP / gold. Precision = TP / predicted, or 0 when the class is never predicted.
+        F1 is 0 when precision and recall are both 0, never None. The class enters every macro average.
+    """
     P = probs.detach().cpu() if isinstance(probs, torch.Tensor) else torch.as_tensor(probs, dtype=torch.float32)
     if P.ndim != 2:
         raise ValueError("probs must be [items, options]")
     n, K = P.shape
-    pred = P.argmax(dim=-1).tolist()
+    # same ordering as the ranks below, so top-1 accuracy and rank-1 counts always agree (MET-06)
+    pred = [int(torch.argsort(row, descending=True)[0]) for row in P]
     report: Dict[str, object] = {
         "kind": "choice",
         "items": n,
@@ -185,26 +194,33 @@ def choice_report(probs, gold=None, top_k: Sequence[int] = (2, 3)) -> Dict[str, 
     for a, b in zip(g, pred):
         matrix[a][b] += 1
     per_option = []
-    precisions, recalls = [], []
+    precisions, recalls, f1s = [], [], []
     for k in range(K):
         tp = matrix[k][k]
-        fn = sum(matrix[k]) - tp
-        fp = sum(matrix[r][k] for r in range(K)) - tp
+        gold_k = sum(matrix[k])
+        pred_k = sum(matrix[r][k] for r in range(K))
+        fn = gold_k - tp
+        fp = pred_k - tp
         tn = n - tp - fp - fn
-        p_k, r_k = _div(tp, tp + fp), _div(tp, tp + fn)
-        f1_k = None if p_k is None or r_k is None or p_k + r_k == 0 else 2 * p_k * r_k / (p_k + r_k)
+        if gold_k > 0:                                   # class has gold instances
+            p_k = tp / pred_k if pred_k else 0.0
+            r_k = tp / gold_k
+            f1_k = 0.0 if p_k + r_k == 0 else 2 * p_k * r_k / (p_k + r_k)
+        elif pred_k > 0:                                 # predicted but never gold
+            p_k, r_k, f1_k = 0.0, None, None
+        else:                                            # neither gold nor predicted
+            p_k, r_k, f1_k = None, None, None
         per_option.append({"option": k, "tp": tp, "fp": fp, "fn": fn, "tn": tn,
                            "precision": p_k, "recall": r_k, "f1": f1_k})
         if p_k is not None:
             precisions.append(p_k)
         if r_k is not None:
             recalls.append(r_k)
-    macro_p = sum(precisions) / len(precisions) if precisions else None
-    macro_r = sum(recalls) / len(recalls) if recalls else None
-    f1s = [o["f1"] for o in per_option if o["f1"] is not None]
+        if f1_k is not None:
+            f1s.append(f1_k)
     report.update({
-        "macro_precision": macro_p,
-        "macro_recall": macro_r,
+        "macro_precision": sum(precisions) / len(precisions) if precisions else None,
+        "macro_recall": sum(recalls) / len(recalls) if recalls else None,
         "macro_f1": sum(f1s) / len(f1s) if f1s else None,
         "micro_precision": _div(correct, n),   # micro TP = FP = FN = errors, so micro P = R = F1 = accuracy
         "micro_recall": _div(correct, n),

@@ -144,6 +144,8 @@ def test_generate_appends_tokens_and_stops_at_eos():
     out = model.generate(prompt, max_new_tokens=8, do_sample=False, repetition_penalty=1.0)
     assert out.shape == (1, 13)
     assert out[:, :5].tolist() == prompt.tolist()
+    # Value check: the first new token is the argmax of a full forward pass over the prompt.
+    assert int(out[0, 5]) == int(model(prompt).logits[0, -1].argmax())
     assert int(out.max()) < config.vocab_size
 
 
@@ -243,12 +245,40 @@ def test_scratch_reduction_requires_batch_size_one():
     raise AssertionError("batched scratch reduction should raise")
 
 
-def test_bad_words_are_never_generated():
+def test_scratch_rebuild_keeps_the_loop_count(monkeypatch):
+    # The cache is rebuilt after a scratch close; every loop-count decision must still be 2.
+    script = [OPEN, 5, SEP, 7, CLOSE, 9]
+    monkeypatch.setattr(modeling, "_sample", lambda logits, *args: torch.tensor([script.pop(0)]))
     model = seeded_model(tiny_config())
-    banned = [[77]]
-    out = model.generate(torch.tensor([[2, 3]]), max_new_tokens=30, do_sample=False,
-                         repetition_penalty=1.0, no_repeat_ngram_size=0, bad_word_ids=banned)
-    assert 77 not in out[0].tolist()
+    chosen = []
+    original = model._choose_loops
+
+    def recording(cache, num_loops):
+        loops = original(cache, num_loops)
+        chosen.append(loops)
+        return loops
+
+    monkeypatch.setattr(model, "_choose_loops", recording)
+    out = model.generate(torch.tensor([[3, 4]]), max_new_tokens=6, do_sample=True, num_loops=2,
+                         reduce_scratch_blocks=True, repetition_penalty=1.0, no_repeat_ngram_size=0)
+    assert out.tolist() == [[3, 4, 7, 9]]
+    assert len(chosen) >= 2 and chosen == [2] * len(chosen), chosen
+
+
+def test_bad_words_are_never_generated():
+    # Ban the token the model would otherwise pick first. Without the ban it is chosen, so a
+    # missing or broken ban shows up as the same first token coming back.
+    model = seeded_model(tiny_config(initializer_range=0.5))
+    prompt = torch.tensor([[2, 3]])
+    free = model.generate(prompt, max_new_tokens=8, do_sample=False,
+                          repetition_penalty=1.0, no_repeat_ngram_size=0)
+    banned_token = int(free[0, prompt.shape[1]])
+    out = model.generate(prompt, max_new_tokens=8, do_sample=False,
+                         repetition_penalty=1.0, no_repeat_ngram_size=0,
+                         bad_word_ids=[[banned_token]])
+    generated = out[0, prompt.shape[1]:].tolist()
+    assert generated[0] != banned_token
+    assert banned_token not in generated
 
 
 if __name__ == "__main__":

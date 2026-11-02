@@ -276,14 +276,20 @@ class InkyModel(PreTrainedModel):
         self.eval()
         prefix = context_ids if question_ids is None else torch.cat([context_ids, question_ids], dim=1)
         P = prefix.shape[1]
-        query = states = None
-        option_states = []
-        for opt in options:
-            h = self(torch.cat([prefix, opt], dim=1), return_hidden=True).hidden
-            if query is None:
-                query, states = h[:, P - 1], h[:, :P]
-            option_states.append(h[:, -1])
-        scores = self.arlo.choice_scores(query, torch.stack(option_states, dim=1), states)
+        seqs = [torch.cat([prefix, opt], dim=1)[0] for opt in options]
+        lengths = [s.shape[0] for s in seqs]
+        # One batched forward. Options are right-padded with token 0, which is always a valid id
+        # (config.pad_token_id may lie outside a small vocabulary). The model is causal, so the padding
+        # cannot change any position before it, and each option is read at its own last token.
+        batch = torch.zeros((len(seqs), max(lengths)), dtype=prefix.dtype, device=prefix.device)
+        for i, s in enumerate(seqs):
+            batch[i, :lengths[i]] = s
+        h = self(batch, return_hidden=True).hidden
+        query = h[:1, P - 1]          # the last prefix token is the same for every option
+        states = h[:1, :P]
+        last = torch.tensor(lengths, device=h.device) - 1
+        option_states = h[torch.arange(len(seqs), device=h.device), last]     # [N, D]
+        scores = self.arlo.choice_scores(query, option_states.unsqueeze(0), states)
         probs = torch.softmax(scores, dim=-1)[0]
         if not (report or display):
             return probs
@@ -383,9 +389,11 @@ class InkyModel(PreTrainedModel):
                 )
                 if len(reduced) != seq.shape[1]:
                     # The notes are gone, so the cache for the remaining text is rebuilt from scratch.
+                    # The loop depth is kept, so the text after the close uses the same depth as before.
+                    loops = cache.num_loops
                     seq = torch.tensor([reduced], dtype=seq.dtype, device=seq.device)
                     cache = InkyCache(cfg)
-                    out = self(seq, past=cache, last_only=True)
+                    out = self(seq, past=cache, num_loops=loops, last_only=True)
                     continue
             out = self(next_tok[:, None], past=cache, last_only=True)
         if not (report or display):

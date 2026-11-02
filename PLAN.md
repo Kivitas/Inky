@@ -55,12 +55,12 @@ it tells us. It assumes no training data has been chosen yet.
 | Trend | Inky today | Gap |
 | :--- | :--- | :--- |
 | Hybrid attention + cheap recurrence | Attention in every block; a small SSM highway across loops | No SSM *layer*. Candidate for a Nemotron-style hybrid core. |
-| Looped depth | Yes: 6 loops, ACT halting, FiLM per loop | Halting and loop count are untested. Per-token loop allocation is an open question. |
+| Looped depth | Yes: 6 loops, ACT halting, FiLM per loop | Halting saves no compute, because every loop runs (CORE-01). Loop count changes the output (CORE-02). Per-token loop allocation is an open question. |
 | Sparse experts | Yes: 1 shared + 8 routed, top-2 | Fine. Expert count is untested. |
 | Latent KV cache | Yes, with absorbed decoding | Cache is already small. KV quantization adds little. |
-| Muon optimiser | Yes, with EOS's update scale | Moonlight's scale fix is not applied. |
-| Low-cost inference | fp32 weights only (~190 MB) | No quantization path. Untested. |
-| Speculative decoding | No | Loops give a natural cheap drafter (see §3). |
+| Muon optimiser | Yes, with EOS's update scale | Moonlight's scale fix is behind `scale_mode`, default off. |
+| Low-cost inference | fp32 weights by default (~190 MB). Int8 and 4-bit weight quantization in `inky/quantize.py`. | Tested on the tiny config only. Not measured on a trained model. |
+| Speculative decoding | Yes, `inky/speculative.py` | Tests are weak (TEST-01). Acceptance rate not measured. Loops give a natural cheap drafter (see §3). |
 | Scratch reduction, prose controls | Yes (untrained) | Need a measurement to show they help. |
 
 ## 3. Plan, ordered by cost
@@ -134,13 +134,13 @@ machine (CPU, no training data yet).
 | :--- | :--- | :--- |
 | 1 Evaluation harness | `inky/evaluation.py` | Done, tested |
 | 2 Quantization | `inky/quantize.py` | Done, tested on the tiny config |
-| 3 Self-speculative decoding | `inky/speculative.py` | Done; output matches greedy; rejection path tested |
-| 4 Muon scale option | `inky/optim.py` (`scale_mode`) | Done, default unchanged; "moonlight" gives ~2× update size, needs LR tuning |
+| 3 Self-speculative decoding | `inky/speculative.py` | Done; output matches greedy in tests, but the tests cannot detect a broken decoder (TEST-01) |
+| 4 Muon scale option | `inky/optim.py` (`scale_mode`) | Done, default unchanged; "moonlight" gives ~4× the update size of "shape" mode, needs LR tuning |
 | 5 Training loop | `inky/train.py` | Done; smoke-tested only (3 steps) |
 | 6 Loop curriculum | `inky/train.py` (`loop_curriculum`) | Done, tested |
-| 7 Data pipeline | `inky/data.py` | Done; near-duplicate threshold 0.8 (30-word docs with one changed word are kept) |
+| 7 Data pipeline | `inky/data.py` | Done; near-duplicate threshold 0.8 (30-word docs with one changed word are kept). Known issues DATA-01 and DATA-02 (`docs/critique/data_docs.md`) |
 | 8 Ablations | not built | Needs training runs; deferred |
 | 9 Selective SSM mixer | `inky/layers.py` (`SelectiveSSMMixer`), `ssm_mixer_layers` | Done; off by default; tested |
 | 10 Distillation loss | `inky/distill.py` | Done, tested; no teacher or training yet |
 
-Test suite: 101 passing.
+Test suite: 121 passing (after the critique fixes; see docs/critique/).

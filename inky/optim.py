@@ -183,7 +183,7 @@ class HybridOptimizer:
         muon_lr: float = 0.02,
         muon_momentum: float = 0.95,
         muon_ns_steps: int = 5,
-        muon_weight_decay: float = 0.0,
+        muon_weight_decay: float = 0.1,  # decoupled decay, as in Moonlight; pass 0.0 to disable
         adamw_betas: Tuple[float, float] = (0.9, 0.95),
         adamw_weight_decay: float = 0.1,
         scale_mode: str = "shape",

@@ -96,6 +96,13 @@ def test_hybrid_steps_reduce_loss_on_a_fixed_batch():
     assert last < first - 0.2, (first, last)
 
 
+def test_muon_groups_have_decoupled_weight_decay_by_default():
+    opt = HybridOptimizer(tiny_model())
+    assert opt.muon.param_groups and all(g["weight_decay"] == 0.1 for g in opt.muon.param_groups)
+    overridden = HybridOptimizer(tiny_model(), muon_weight_decay=0.0)
+    assert all(g["weight_decay"] == 0.0 for g in overridden.muon.param_groups)
+
+
 def test_clip_returns_pre_clip_norm():
     model = tiny_model()
     opt = HybridOptimizer(model)

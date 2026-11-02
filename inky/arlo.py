@@ -62,6 +62,16 @@ class MultiHeadPointer(nn.Module):
         return scores
 
 
+def choice_loss(scores: torch.Tensor, gold: torch.Tensor) -> torch.Tensor:
+    """Cross-entropy over option scores: scores [B, N] logits, gold [B] long indices -> scalar."""
+    return F.cross_entropy(scores, gold.long())
+
+
+def binary_loss(logit: torch.Tensor, gold: torch.Tensor) -> torch.Tensor:
+    """Binary cross-entropy with logits: logit [B], gold [B] float 0/1 -> scalar."""
+    return F.binary_cross_entropy_with_logits(logit, gold.to(logit.dtype))
+
+
 class Arlo(nn.Module):
     """Latent decision slots that read the model's states and feed a Choice or Noul answer."""
 
@@ -113,3 +123,20 @@ class Arlo(nn.Module):
     def binary_logit(self, query: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
         """query [B, d], states [B, S, d] -> logit [B]."""
         return self.binary_head(self.summarise(query, states)).squeeze(-1)
+
+    def training_loss(
+        self,
+        query: torch.Tensor,
+        options: torch.Tensor,
+        states: torch.Tensor,
+        gold: torch.Tensor,
+        task: str,
+    ) -> torch.Tensor:
+        """Decision loss with gradients. task "choice": options [B, N, d], gold [B] indices.
+        task "binary": gold [B] float 0/1, options is ignored. Returns a scalar tensor.
+        Nothing here runs an optimiser step; the caller owns training."""
+        if task == "choice":
+            return choice_loss(self.choice_scores(query, options, states), gold)
+        if task == "binary":
+            return binary_loss(self.binary_logit(query, states), gold)
+        raise ValueError(f"unknown Arlo training task {task!r}; expected 'choice' or 'binary'")
