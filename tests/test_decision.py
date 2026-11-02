@@ -37,6 +37,7 @@ def tiny_config(**overrides) -> InkyConfig:
         arlo_dim=16,
         arlo_pointer_rank=8,
         arlo_slots=4,
+        pad_token_id=1,
     )
     kwargs.update(overrides)
     return InkyConfig(**kwargs)
@@ -69,6 +70,28 @@ def test_choice_is_equivariant_to_option_order():
     forward = model.decide_choice(context, opts)
     backward = model.decide_choice(context, list(reversed(opts)))
     assert torch.allclose(forward, backward.flip(0), atol=1e-5)
+
+
+def test_batched_choice_matches_one_option_at_a_time():
+    # Reference: one full forward per option, as the decision engine did before batching.
+    model = seeded_model(tiny_config())
+    context = torch.randint(2, 500, (1, 10))
+    question = torch.randint(2, 500, (1, 4))
+    opts = options(2, 5, 3)
+    prefix = torch.cat([context, question], dim=1)
+    P = prefix.shape[1]
+    with torch.no_grad():
+        query = states = None
+        option_states = []
+        for opt in opts:
+            h = model(torch.cat([prefix, opt], dim=1), return_hidden=True).hidden
+            if query is None:
+                query, states = h[:, P - 1], h[:, :P]
+            option_states.append(h[:, -1])
+        reference = torch.softmax(
+            model.arlo.choice_scores(query, torch.stack(option_states, dim=1), states), dim=-1)[0]
+    batched = model.decide_choice(context, opts, question_ids=question)
+    assert torch.allclose(batched, reference, atol=1e-5), (batched, reference)
 
 
 def test_choice_depends_on_the_context():

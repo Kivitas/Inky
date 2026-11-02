@@ -9,12 +9,20 @@ import re
 import unicodedata
 from collections import Counter
 from pathlib import Path
-from typing import Callable, Iterable, Iterator, List, Sequence, Set, Union
+from typing import Callable, Iterable, Iterator, List, Optional, Sequence, Set, Union
 
 import torch
 
 # Characters that count as ordinary prose punctuation in quality_filter.
 BASIC_PUNCTUATION: Set[str] = set(".,;:!?'\"-()")
+
+# Non-ASCII punctuation that is ordinary prose and is exempt from the symbol count in quality_filter:
+# typographic quotes and dashes, CJK sentence punctuation, and Devanagari danda.
+EXEMPT_PUNCTUATION: Set[str] = BASIC_PUNCTUATION | set(
+    "“”‘’—–…"
+    "。，、；：！？「」『』《》〈〉【】〔〕（）［］〖〗・～"
+    "।॥"
+)
 
 # Near-duplicate settings: word 5-gram Jaccard similarity at or above this value means duplicate.
 SHINGLE_SIZE = 5
@@ -37,6 +45,16 @@ def clean_text(text: str) -> str:
     return text
 
 
+def _is_symbol(ch: str) -> bool:
+    """True for Unicode punctuation (P*) and symbol (S*) characters that are not exempt prose punctuation.
+
+    Letters in any script (L*), combining marks (M*), numbers (N*) and whitespace are never symbols.
+    """
+    if ch.isspace() or ch in EXEMPT_PUNCTUATION:
+        return False
+    return unicodedata.category(ch)[0] in "PS"
+
+
 def quality_filter(
     text: str,
     min_chars: int = 200,
@@ -46,14 +64,16 @@ def quality_filter(
     """Return True to keep a document, False to reject it.
 
     Rejects text shorter than ``min_chars``. Rejects text where the share of characters that are
-    not letters, digits, whitespace or basic punctuation exceeds ``max_symbol_ratio``. Rejects text
+    punctuation or symbols (Unicode categories P* and S*, such as emoji and currency signs) exceeds
+    ``max_symbol_ratio``. Letters, combining marks, digits and whitespace in any script never count
+    as symbols, and common ASCII, typographic, CJK and Devanagari punctuation is exempt. Rejects text
     where the share of non-empty lines that appear more than once exceeds ``max_repeated_line_ratio``
     (every copy of a repeated line counts, not only the extra copies).
     """
     if len(text) < min_chars:
         return False
 
-    symbols = sum(1 for ch in text if not ch.isalnum() and not ch.isspace() and ch not in BASIC_PUNCTUATION)
+    symbols = sum(1 for ch in text if _is_symbol(ch))
     if symbols / max(len(text), 1) > max_symbol_ratio:
         return False
 
@@ -82,14 +102,24 @@ def _jaccard(a: Set[tuple], b: Set[tuple]) -> float:
     return len(a & b) / len(a | b)
 
 
-def dedupe_documents(docs: Sequence[str]) -> List[str]:
+def dedupe_documents(docs: Sequence[str], max_docs: Optional[int] = None) -> List[str]:
     """Remove duplicates, keeping the first occurrence of each. Returns the original strings.
 
     Exact duplicates are found after ``clean_text`` and lowercasing. Near-duplicates are documents
-    whose word 5-gram Jaccard similarity is at least 0.8 with a document already kept. This is
-    brute force (each candidate is compared with every kept document), which is fine for small
-    inputs but is quadratic in the number of documents.
+    whose word 5-gram Jaccard similarity is at least 0.8 with a document already kept.
+
+    Cost: this is brute force. Each candidate is compared with every kept document, so time is
+    O(n^2) in the number of kept documents n, and memory holds a shingle set for every kept document.
+    It is fine for small inputs. For a large corpus, shard it and dedupe each shard.
+
+    If ``max_docs`` is given and ``docs`` has more documents than that, raises ValueError before any
+    work is done. The check counts input documents, not kept ones.
     """
+    if max_docs is not None and len(docs) > max_docs:
+        raise ValueError(
+            f"dedupe_documents got {len(docs)} documents, above max_docs={max_docs}; "
+            "shard the corpus first and dedupe each shard"
+        )
     kept: List[str] = []
     kept_shingles: List[Set[tuple]] = []
     seen: Set[str] = set()

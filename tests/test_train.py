@@ -3,6 +3,7 @@
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -10,10 +11,39 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inky import HybridOptimizer, InkyConfig, InkyModel  # noqa: E402
-from inky.train import loop_curriculum, train, wsd_lr_scale  # noqa: E402
+from inky.train import (  # noqa: E402
+    load_training_state,
+    loop_curriculum,
+    save_training_state,
+    train,
+    wsd_lr_scale,
+)
 
 OPEN, SEP, CLOSE = 508, 509, 510
 MIN_LOOPS, MAX_LOOPS = 2, 4
+
+
+class _NaNOnCall(torch.nn.Module):
+    """Wraps a model and makes its loss NaN on one forward call (1-based ``bad_call``)."""
+
+    def __init__(self, inner, bad_call: int):
+        super().__init__()
+        self.inner = inner
+        self.config = inner.config
+        self.bad_call = bad_call
+        self.calls = 0
+
+    def forward(self, input_ids, labels=None, num_loops=None):
+        out = self.inner(input_ids=input_ids, labels=labels, num_loops=num_loops)
+        self.calls += 1
+        loss = out.loss * float("nan") if self.calls == self.bad_call else out.loss
+        return SimpleNamespace(loss=loss)
+
+    def update_moe_balance(self):
+        self.inner.update_moe_balance()
+
+    def save_pretrained(self, path):
+        self.inner.save_pretrained(path)
 
 
 def tiny_model() -> InkyModel:
@@ -147,3 +177,63 @@ def test_train_rejects_zero_steps():
     optimizer = HybridOptimizer(model, adamw_lr=3e-3, muon_lr=0.02)
     with pytest.raises(ValueError):
         train(model, optimizer, random_batches(2), steps=0, log_fn=lambda _msg: None)
+
+
+def test_non_finite_loss_is_skipped_recorded_and_not_checkpointed(tmp_path):
+    model = _NaNOnCall(tiny_model(), bad_call=2)
+    optimizer = HybridOptimizer(model.inner, adamw_lr=3e-3, muon_lr=0.02)
+
+    history = train(
+        model,
+        optimizer,
+        random_batches(2),
+        steps=3,
+        checkpoint_dir=tmp_path,
+        checkpoint_every=1,
+        log_fn=lambda _msg: None,
+    )
+
+    records = [r for r in history if r.get("kind") == "train"]
+    assert [r["skipped"] for r in records] == [False, True, False]
+    assert not math.isfinite(records[1]["loss"])
+    assert (tmp_path / "step_1").is_dir() and (tmp_path / "step_3").is_dir()
+    assert not (tmp_path / "step_2").exists()
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+
+
+def test_too_many_skipped_steps_raises():
+    model = _NaNOnCall(tiny_model(), bad_call=1)
+    optimizer = HybridOptimizer(model.inner, adamw_lr=3e-3, muon_lr=0.02)
+    with pytest.raises(RuntimeError):
+        train(
+            model, optimizer, random_batches(2), steps=2,
+            max_skipped_steps=0, log_fn=lambda _msg: None,
+        )
+
+
+def test_resume_continues_step_numbers_and_schedule(tmp_path):
+    model = tiny_model()
+    optimizer = HybridOptimizer(model, adamw_lr=3e-3, muon_lr=0.02)
+    first = train(model, optimizer, random_batches(2), steps=2, log_fn=lambda _msg: None)
+    save_training_state(tmp_path / "state", model, optimizer, 2, first)
+
+    fresh = tiny_model()
+    with torch.no_grad():
+        for p in fresh.parameters():
+            p.add_(1.0)  # make sure the reload really overwrites the weights
+    fresh_opt = HybridOptimizer(fresh, adamw_lr=3e-3, muon_lr=0.02)
+    assert load_training_state(tmp_path / "state", fresh, fresh_opt) == 2
+    assert torch.equal(fresh.embed_tokens.weight, model.embed_tokens.weight)
+
+    resumed = train(
+        fresh,
+        fresh_opt,
+        random_batches(2),
+        steps=3,
+        resume_from=tmp_path / "state",
+        log_fn=lambda _msg: None,
+    )
+    records = [r for r in resumed if r.get("kind") == "train"]
+    assert [r["step"] for r in records] == [3]
+    # The schedule is computed from the total step count passed to train(), not from the resumed run.
+    assert records[0]["lr_scale"] == wsd_lr_scale(2, 3, 0, 0.2)

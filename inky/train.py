@@ -1,11 +1,14 @@
 """Training loop for Inky: warmup-stable-decay learning rate, loop curriculum, periodic eval and checkpoints.
 
-  - wsd_lr_scale:      linear warmup, flat plateau, linear decay to zero (a multiplier on the base LRs).
-  - loop_curriculum:   recurrent loop count ramps linearly from min to max over the first part of training.
-  - train:             the optimisation loop. Steps are 1-based in the history and checkpoint names.
+  - wsd_lr_scale:         linear warmup, flat plateau, linear decay to zero (a multiplier on the base LRs).
+  - loop_curriculum:      recurrent loop count ramps linearly from min to max over the first part of training.
+  - save/load_training_state: model weights, optimiser state and the step counter, for resuming a run.
+  - train:                the optimisation loop. Steps are 1-based in the history and checkpoint names.
 """
 
 import itertools
+import json
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Union
 
@@ -70,6 +73,36 @@ def loop_curriculum(
     return int(min(max_loops, max(min_loops, loops)))
 
 
+TRAIN_STATE_FILE = "train_state.json"
+OPTIMIZER_FILE = "optimizer.pt"
+MODEL_DIR = "model"
+
+
+def save_training_state(
+    path: Union[str, Path],
+    model,
+    optimizer,
+    step: int,
+    history: List[Dict[str, Any]],
+) -> None:
+    """Write everything needed to resume: ``path/model`` (weights), ``path/optimizer.pt`` and ``path/train_state.json``."""
+    root = Path(path)
+    root.mkdir(parents=True, exist_ok=True)
+    model.save_pretrained(root / MODEL_DIR)
+    torch.save(optimizer.state_dict(), root / OPTIMIZER_FILE)
+    (root / TRAIN_STATE_FILE).write_text(json.dumps({"step": int(step), "history": history}))
+
+
+def load_training_state(path: Union[str, Path], model, optimizer) -> int:
+    """Restore weights and optimiser state saved by ``save_training_state``. Returns the saved step."""
+    root = Path(path)
+    state = json.loads((root / TRAIN_STATE_FILE).read_text())
+    fresh = type(model).from_pretrained(root / MODEL_DIR)
+    model.load_state_dict(fresh.state_dict())
+    optimizer.load_state_dict(torch.load(root / OPTIMIZER_FILE, map_location="cpu", weights_only=False))
+    return int(state["step"])
+
+
 def train(
     model,
     optimizer,
@@ -85,23 +118,42 @@ def train(
     checkpoint_dir: Optional[Union[str, Path]] = None,
     checkpoint_every: int = 0,
     log_fn: Callable[[str], Any] = print,
+    max_skipped_steps: int = 50,
+    resume_from: Optional[Union[str, Path]] = None,
 ) -> List[Dict[str, Any]]:
-    """Run ``steps`` optimiser steps and return the history.
+    """Run optimiser steps up to the total ``steps`` and return the history of the steps run.
+
+    ``steps`` is the total run length: schedules (LR, curriculum) are always computed from it. With
+    ``resume_from`` set to a directory written by ``save_training_state``, weights and optimiser state
+    are restored and the run continues from the step after the saved one, so the returned history only
+    holds the new steps.
 
     ``train_batches`` is materialised once and cycled when exhausted. Each training record is
-    ``{"kind": "train", "step", "loss", "lr_scale", "num_loops", "grad_norm"}``; ``num_loops`` is
-    None unless the loop curriculum is on. Eval records are ``{"kind": "eval", "step", "eval_nll",
-    "eval_perplexity"}``. Eval runs every ``eval_every`` steps and at the last step. Checkpoints go to
-    ``checkpoint_dir / f"step_{step}"`` every ``checkpoint_every`` steps and at the last step.
-    The model's previous train/eval mode is restored afterwards.
+    ``{"kind": "train", "step", "loss", "lr_scale", "num_loops", "grad_norm", "skipped"}``; ``num_loops``
+    is None unless the loop curriculum is on. A step whose loss is not finite skips the backward and the
+    optimiser step, is recorded with ``skipped=True`` and is not checkpointed. A non-finite gradient norm
+    is recorded as ``grad_norm`` (the step is still taken). More than ``max_skipped_steps`` skipped steps
+    raises RuntimeError. Eval records are ``{"kind": "eval", "step", "eval_nll", "eval_perplexity"}``.
+    Eval runs every ``eval_every`` steps and at the last step. Checkpoints go to
+    ``checkpoint_dir / f"step_{step}"`` every ``checkpoint_every`` steps and at the last step, as full
+    training state (see ``save_training_state``). The model's previous train/eval mode is restored afterwards.
     """
     if steps < 1:
         raise ValueError(f"steps must be >= 1, got {steps}")
+    if max_skipped_steps < 0:
+        raise ValueError(f"max_skipped_steps must be >= 0, got {max_skipped_steps}")
 
     batches = list(train_batches)
     if not batches:
         raise ValueError("train_batches is empty")
-    cycle = itertools.cycle(batches)
+
+    start_step = 1
+    if resume_from is not None:
+        start_step = load_training_state(resume_from, model, optimizer) + 1
+        if start_step > steps:
+            raise ValueError(f"resume_from is at step {start_step - 1}, which is not before steps={steps}")
+    # Skip the batches already consumed before the saved step so the data order continues.
+    cycle = itertools.islice(itertools.cycle(batches), start_step - 1, None)
 
     eval_list = None
     if eval_batches is not None and eval_every > 0:
@@ -114,11 +166,12 @@ def train(
     cfg = model.config
     device = next(model.parameters()).device
     history: List[Dict[str, Any]] = []
+    skipped_count = 0
 
     was_training = model.training
     model.train()
     try:
-        for step in range(1, steps + 1):
+        for step in range(start_step, steps + 1):
             idx = step - 1
             lr_scale = wsd_lr_scale(idx, steps, warmup_steps, decay_fraction)
             optimizer.set_lr_scale(lr_scale)
@@ -130,27 +183,55 @@ def train(
             ids = next(cycle).to(device)
             out = model(input_ids=ids, labels=ids, num_loops=num_loops)
             loss = out.loss
-            loss.backward()
-            grad_norm = optimizer.step(max_grad_norm=max_grad_norm)
-            optimizer.zero_grad()
-            model.update_moe_balance()
+            loss_value = float(loss.detach())
 
-            record = {
-                "kind": "train",
-                "step": step,
-                "loss": float(loss.detach()),
-                "lr_scale": lr_scale,
-                "num_loops": num_loops,
-                "grad_norm": grad_norm,
-            }
-            history.append(record)
+            skipped = not math.isfinite(loss_value)
+            if skipped:
+                optimizer.zero_grad()
+                skipped_count += 1
+                record = {
+                    "kind": "train",
+                    "step": step,
+                    "loss": loss_value,
+                    "lr_scale": lr_scale,
+                    "num_loops": num_loops,
+                    "grad_norm": None,
+                    "skipped": True,
+                }
+                history.append(record)
+                log_fn(f"step {step}/{steps} non-finite loss {loss_value}, step skipped ({skipped_count} so far)")
+                if skipped_count > max_skipped_steps:
+                    raise RuntimeError(
+                        f"{skipped_count} steps skipped for non-finite loss, more than max_skipped_steps="
+                        f"{max_skipped_steps}; stopping at step {step}"
+                    )
+            else:
+                loss.backward()
+                grad_norm = optimizer.step(max_grad_norm=max_grad_norm)
+                optimizer.zero_grad()
+                model.update_moe_balance()
+
+                record = {
+                    "kind": "train",
+                    "step": step,
+                    "loss": loss_value,
+                    "lr_scale": lr_scale,
+                    "num_loops": num_loops,
+                    "grad_norm": grad_norm,
+                    "skipped": False,
+                }
+                if grad_norm is not None and not math.isfinite(grad_norm):
+                    record["nonfinite_grad"] = True
+                history.append(record)
+
+                is_last = step == steps
+                if log_every > 0 and (step % log_every == 0 or is_last):
+                    log_fn(
+                        f"step {step}/{steps} loss {record['loss']:.4f} lr_scale {lr_scale:.3f} "
+                        f"num_loops {num_loops} grad_norm {grad_norm}"
+                    )
+
             is_last = step == steps
-            if log_every > 0 and (step % log_every == 0 or is_last):
-                log_fn(
-                    f"step {step}/{steps} loss {record['loss']:.4f} lr_scale {lr_scale:.3f} "
-                    f"num_loops {num_loops} grad_norm {grad_norm}"
-                )
-
             if eval_list is not None and (step % eval_every == 0 or is_last):
                 ev = evaluate(model, eval_list, num_loops=None)
                 eval_record = {
@@ -163,8 +244,13 @@ def train(
                 log_fn(f"step {step} eval nll {ev['nll']:.4f} perplexity {ev['perplexity']:.2f}")
                 model.train()
 
-            if ckpt_root is not None and checkpoint_every > 0 and (step % checkpoint_every == 0 or is_last):
-                model.save_pretrained(ckpt_root / f"step_{step}")
+            if (
+                ckpt_root is not None
+                and not skipped
+                and checkpoint_every > 0
+                and (step % checkpoint_every == 0 or is_last)
+            ):
+                save_training_state(ckpt_root / f"step_{step}", model, optimizer, step, history)
     finally:
         model.train(was_training)
 
