@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Test and tool caches
+.pytest_cache/
+
+# Weights and run outputs are never committed (the model is untrained; checkpoints are local)
+checkpoints/
+runs/
+*.safetensors
+*.bin
+*.pt
+*.pth
+
+# Data (training corpora stay out of the repo)
+data/
+*.jsonl
+
+# OS and editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/

@@ -1,0 +1,5 @@
+# Tested with torch 2.13 (CPU) and transformers 5.13.
+# CPU-only torch: pip install torch --index-url https://download.pytorch.org/whl/cpu
+torch>=2.1
+transformers>=5.0
+pytest
