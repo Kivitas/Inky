@@ -37,6 +37,7 @@ def tiny_model() -> InkyModel:
         min_recurrent_loops=2,
         loop_dropout_prob=0.0,
         max_position_embeddings=256,
+        enable_arlo=True,
     )
     return InkyModel(config)
 

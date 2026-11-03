@@ -37,6 +37,7 @@ def tiny_config(**overrides) -> InkyConfig:
         arlo_dim=16,
         arlo_pointer_rank=8,
         arlo_slots=4,
+        enable_arlo=True,
         pad_token_id=1,
     )
     kwargs.update(overrides)
@@ -87,7 +88,8 @@ def test_batched_choice_matches_one_option_at_a_time():
             h = model(torch.cat([prefix, opt], dim=1), return_hidden=True).hidden
             if query is None:
                 query, states = h[:, P - 1], h[:, :P]
-            option_states.append(h[:, -1])
+            # ARLO-03: an option is the mean of its own token states (positions P .. P + L - 1).
+            option_states.append(h[:, P:P + opt.shape[1]].mean(dim=1))
         reference = torch.softmax(
             model.arlo.choice_scores(query, torch.stack(option_states, dim=1), states), dim=-1)[0]
     batched = model.decide_choice(context, opts, question_ids=question)

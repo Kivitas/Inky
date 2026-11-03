@@ -1,12 +1,17 @@
 """Hybrid Muon + AdamW optimiser for Inky, ported from EOS (optimizers.py).
 
-Parameter partitioning:
-  - Muon:   2D weight matrices from Linear layers (attention projections, expert FFNs, router,
-            state-space highway, halting gate). Updates are orthogonalised with a quintic
+Parameter partitioning (see ``assign_parameter_groups``; deterministic, follows
+``model.named_parameters()`` order):
+  - Muon:   large 2D hidden matrices from Linear layers (attention projections, expert FFNs,
+            state-space highway, SwiGLU gates). Updates are orthogonalised with a quintic
             Newton-Schulz iteration.
   - AdamW:  everything else: the token embedding (tied with the LM head), the per-loop FiLM
             table, RMSNorm gains, biases and the damping vector. Norms, biases and 1D scalars
-            get no weight decay.
+            get no weight decay. Also routed here: tiny gating matrices, i.e. any 2D parameter
+            with a dimension below ``min_muon_dim`` (MoE router, PonderNet halting gate, Arlo
+            binary head), and any parameter with a ``router`` or ``halting`` name segment.
+            Orthogonalising a one-row or few-row matrix makes the update size independent of
+            the gradient, so these stay with AdamW.
 
 Step order per training step (strict coupling, as in EOS):
   1. loss.backward()
@@ -19,13 +24,27 @@ Then call ``model.update_moe_balance()`` once per step, outside autograd.
 Reference: Jordan, "Muon: MomentUm Orthogonalized by Newton-Schulz" (2024).
 """
 
-from typing import Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
 
 # 2D parameters that are lookup tables or per-loop tables and must stay with AdamW.
 ADAMW_ONLY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base")
+
+# Dotted-name segments of tiny gating modules: the MoE router (layers.SharedExpertMoE) and the
+# PonderNet halting gate (layers.PonderHalting, attribute ``halting``). Matched as whole
+# segments, so ``gate_proj`` (SwiGLU, state-space gate) and ``a_gate`` are not caught.
+ROUTING_NAME_SEGMENTS: Tuple[str, ...] = ("router", "halting")
+
+# 2D matrices with a dimension below this are gating/readout-sized, not hidden matrices, and go
+# to AdamW. The Inky router is (num_routed_experts, hidden) and the halting gate is (1, hidden).
+MIN_MUON_DIM: int = 16
+
+GROUP_MUON = "muon"
+GROUP_ADAMW_DECAY = "adamw_decay"
+GROUP_ADAMW_NO_DECAY = "adamw_no_decay"
+GROUP_NAMES: Tuple[str, ...] = (GROUP_MUON, GROUP_ADAMW_DECAY, GROUP_ADAMW_NO_DECAY)
 
 
 @torch.no_grad()
@@ -145,51 +164,119 @@ class Muon(torch.optim.Optimizer):
         return loss
 
 
-def split_parameters(
+def _check_min_muon_dim(min_muon_dim: int) -> int:
+    if min_muon_dim < 1:
+        raise ValueError(f"min_muon_dim must be >= 1, got {min_muon_dim}")
+    return min_muon_dim
+
+
+def _is_routing_name(name: str) -> bool:
+    return any(segment in ROUTING_NAME_SEGMENTS for segment in name.split("."))
+
+
+def _classify(
+    name: str,
+    p: nn.Parameter,
+    embedding_ids: set,
+    adamw_only_names: Sequence[str],
+    min_muon_dim: int,
+) -> str:
+    is_adamw_only = any(key in name for key in adamw_only_names)
+    is_tiny_matrix = p.ndim == 2 and min(p.shape) < min_muon_dim
+    if (
+        p.ndim == 2
+        and id(p) not in embedding_ids
+        and not is_adamw_only
+        and not is_tiny_matrix
+        and not _is_routing_name(name)
+    ):
+        return GROUP_MUON
+    if p.ndim < 2 or name.endswith(".bias"):
+        return GROUP_ADAMW_NO_DECAY
+    return GROUP_ADAMW_DECAY
+
+
+def assign_parameter_groups(
     model: nn.Module,
     adamw_only_names: Sequence[str] = ADAMW_ONLY_NAMES,
-) -> Tuple[List[nn.Parameter], List[nn.Parameter], List[nn.Parameter]]:
-    """Partitions trainable parameters into (muon, adamw_decay, adamw_no_decay)."""
+    min_muon_dim: int = MIN_MUON_DIM,
+) -> List[Tuple[str, str, nn.Parameter]]:
+    """Returns ``(name, group, param)`` for every trainable parameter.
+
+    Deterministic: the order follows ``model.named_parameters()``, so the same model
+    construction always yields the same assignment. Group labels are the ``GROUP_*`` constants.
+    """
+    _check_min_muon_dim(min_muon_dim)
     embedding_ids = set()
     for m in model.modules():
         if isinstance(m, nn.Embedding):
             embedding_ids.update(id(p) for p in m.parameters(recurse=False))
 
-    muon: List[nn.Parameter] = []
-    adamw_decay: List[nn.Parameter] = []
-    adamw_no_decay: List[nn.Parameter] = []
-
+    out: List[Tuple[str, str, nn.Parameter]] = []
     for name, p in model.named_parameters():
         if not p.requires_grad:
             continue
-        is_adamw_only = any(key in name for key in adamw_only_names)
-        if p.ndim == 2 and id(p) not in embedding_ids and not is_adamw_only:
-            muon.append(p)
-        elif p.ndim < 2 or name.endswith(".bias"):
-            adamw_no_decay.append(p)
-        else:
-            adamw_decay.append(p)
+        group = _classify(name, p, embedding_ids, adamw_only_names, min_muon_dim)
+        out.append((name, group, p))
+    return out
 
-    return muon, adamw_decay, adamw_no_decay
+
+def split_parameters(
+    model: nn.Module,
+    adamw_only_names: Sequence[str] = ADAMW_ONLY_NAMES,
+    min_muon_dim: int = MIN_MUON_DIM,
+) -> Tuple[List[nn.Parameter], List[nn.Parameter], List[nn.Parameter]]:
+    """Partitions trainable parameters into (muon, adamw_decay, adamw_no_decay).
+
+    See the module docstring and ``assign_parameter_groups`` for the rules.
+    """
+    buckets = {group: [] for group in GROUP_NAMES}
+    for _, group, p in assign_parameter_groups(model, adamw_only_names, min_muon_dim):
+        buckets[group].append(p)
+    return buckets[GROUP_MUON], buckets[GROUP_ADAMW_DECAY], buckets[GROUP_ADAMW_NO_DECAY]
+
+
+def _count_groups(groups: Sequence[dict]) -> Dict[str, int]:
+    return {
+        "tensors": sum(len(g["params"]) for g in groups),
+        "params": sum(p.numel() for g in groups for p in g["params"]),
+    }
+
+
+def format_group_counts(counts: Dict[str, Dict[str, int]]) -> str:
+    """One-line summary of ``HybridOptimizer.group_counts()`` for logs."""
+    return "  ".join(
+        f"{name}: {counts[name]['tensors']} tensors / {counts[name]['params']:,} params"
+        for name in GROUP_NAMES
+    )
 
 
 class HybridOptimizer:
-    """Muon for matrices, AdamW for the rest, stepped together with one global gradient clip."""
+    """Muon for matrices, AdamW for the rest, stepped together with one global gradient clip.
+
+    Config knobs:
+      - ``muon_lr`` (default 0.02) is UNSWEPT: it was carried over from the EOS port and has not
+        been tuned for Inky. Sweep it before relying on it, and pair any change with ``adamw_lr``
+        (the two groups are scaled together by ``set_lr_scale``).
+      - ``scale_mode``: "shape" (default) or "moonlight" update scaling (see ``muon_scale``).
+      - ``min_muon_dim``: 2D matrices with a smaller dimension go to AdamW (see ``split_parameters``).
+    """
 
     def __init__(
         self,
         model: nn.Module,
         adamw_lr: float = 6e-4,
-        muon_lr: float = 0.02,
+        muon_lr: float = 0.02,  # UNSWEPT default; see class docstring
         muon_momentum: float = 0.95,
         muon_ns_steps: int = 5,
         muon_weight_decay: float = 0.1,  # decoupled decay, as in Moonlight; pass 0.0 to disable
         adamw_betas: Tuple[float, float] = (0.9, 0.95),
         adamw_weight_decay: float = 0.1,
         scale_mode: str = "shape",
+        min_muon_dim: int = MIN_MUON_DIM,
     ):
         self.scale_mode = _check_scale_mode(scale_mode)
-        muon_params, decay, no_decay = split_parameters(model)
+        muon_params, decay, no_decay = split_parameters(model, min_muon_dim=min_muon_dim)
         if not muon_params:
             raise ValueError("no 2D matrices found for Muon")
         self.muon = Muon(
@@ -215,6 +302,18 @@ class HybridOptimizer:
     @property
     def params(self) -> List[nn.Parameter]:
         return [p for g in self.muon.param_groups + self.adamw.param_groups for p in g["params"]]
+
+    def group_counts(self) -> Dict[str, Dict[str, int]]:
+        """Tensor and parameter counts per optimiser group, keyed by the ``GROUP_*`` labels.
+
+        Read from the live optimiser, so it stays correct after ``load_state_dict``.
+        Use ``format_group_counts`` to log it.
+        """
+        return {
+            GROUP_MUON: _count_groups(self.muon.param_groups[:1]),
+            GROUP_ADAMW_DECAY: _count_groups(self.adamw.param_groups[:1]),
+            GROUP_ADAMW_NO_DECAY: _count_groups(self.adamw.param_groups[1:2]),
+        }
 
     def zero_grad(self, set_to_none: bool = True) -> None:
         self.muon.zero_grad(set_to_none=set_to_none)

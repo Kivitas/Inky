@@ -33,11 +33,11 @@ class _NaNOnCall(torch.nn.Module):
         self.bad_call = bad_call
         self.calls = 0
 
-    def forward(self, input_ids, labels=None, num_loops=None):
-        out = self.inner(input_ids=input_ids, labels=labels, num_loops=num_loops)
+    def forward(self, input_ids, labels=None, num_loops=None, **kwargs):
+        out = self.inner(input_ids=input_ids, labels=labels, num_loops=num_loops, **kwargs)
         self.calls += 1
         loss = out.loss * float("nan") if self.calls == self.bad_call else out.loss
-        return SimpleNamespace(loss=loss)
+        return SimpleNamespace(loss=loss, loss_parts=out.loss_parts)
 
     def update_moe_balance(self):
         self.inner.update_moe_balance()
@@ -88,12 +88,24 @@ def test_wsd_lr_scale_warmup_plateau_and_decay():
 
     assert values[0] == 0.0
     assert values[warmup] == 1.0
-    assert values[total - 1] == 0.0
+    # The final step still gets a nonzero rate; the decay hits zero just after it.
+    assert values[total - 1] == 0.5
+    assert wsd_lr_scale(total, total, warmup, decay_fraction=0.2) == 0.0
     assert all(0.0 <= v <= 1.0 for v in values)
     # Flat plateau between warmup and the decay window, then non-increasing decay.
     assert values[warmup:total - 2] == [1.0] * (total - 2 - warmup)
     decay = values[total - 2:]
     assert all(a >= b for a, b in zip(decay, decay[1:]))
+
+
+def test_default_warmup_is_nonzero_for_a_fresh_run():
+    model = tiny_model()
+    optimizer = HybridOptimizer(model, adamw_lr=3e-3, muon_lr=0.02)
+    history = train(model, optimizer, random_batches(2), steps=40, log_fn=lambda _msg: None)
+    records = [r for r in history if r.get("kind") == "train"]
+    # 5% of 40 steps is 2 warmup steps, so the run ramps up instead of starting at full rate.
+    assert records[0]["lr_scale"] == 0.0
+    assert records[1]["lr_scale"] == 0.5
 
 
 def test_wsd_lr_scale_stays_in_unit_interval_for_odd_inputs():
@@ -234,6 +246,7 @@ def test_resume_continues_step_numbers_and_schedule(tmp_path):
         log_fn=lambda _msg: None,
     )
     records = [r for r in resumed if r.get("kind") == "train"]
-    assert [r["step"] for r in records] == [3]
+    # The returned history is the saved history (steps 1-2) followed by the new step 3.
+    assert [r["step"] for r in records] == [1, 2, 3]
     # The schedule is computed from the total step count passed to train(), not from the resumed run.
-    assert records[0]["lr_scale"] == wsd_lr_scale(2, 3, 0, 0.2)
+    assert records[2]["lr_scale"] == wsd_lr_scale(2, 3, 0, 0.2)

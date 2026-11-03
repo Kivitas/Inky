@@ -1,8 +1,38 @@
 # Training and optimisation critique
 
+## Status (checked against the code, 2026-11-03)
+
+Checked against the working tree at commit f7299ea plus uncommitted changes. **Line numbers in the
+findings below are from an older commit and may not match the current code.** The finding text is
+kept as written. Legend: **FIXED** = the fix is in the code (a note says which part, for example opt-in). **OPEN** = the problem remains or is only partly fixed (the note says which part). **ACCEPTED-DESIGN** = a deliberate design choice, not a defect; it is documented and was not changed. **NOT-A-BUG** = checked, and the claim does not hold for the code as designed. **UNVERIFIED** = could not be checked here.
+
+The per-epoch reshuffling, RNG state in checkpoints, atomic and rotated checkpoints and the
+`scripts/train.py` entry point are now in the working tree (not yet committed). The statuses above reflect
+the working tree.
+
+Counts for this file: 12 FIXED, 3 OPEN (of 15).
+
+| ID | Severity | Status | Evidence in current code |
+| :--- | :--- | :--- | :--- |
+| TRAIN-01 | high | FIXED | Each `step_N/` holds the weights, optimiser state, step, history and `rng.pt` (RNG state). `resume_from` continues the schedule and the data order. |
+| TRAIN-02 | high | FIXED | `HybridOptimizer` defaults `muon_weight_decay` to 0.1. |
+| TRAIN-03 | high | FIXED | A non-finite loss is skipped, and so is a non-finite gradient norm (`train.py`, around lines 596-636). The run stops after `max_skipped_steps` in a row. |
+| TRAIN-04 | high | FIXED | Opt-in: `embedding_dropout` and `residual_dropout` (both default 0). `best.pt` keeps the lowest-eval-NLL weights. No early stopping. |
+| TRAIN-05 | medium | OPEN | PLAN now says about 4× (was 2×). Nothing refuses or warns about `moonlight` with `muon_lr=0.02`. |
+| TRAIN-06 | medium | FIXED | The default warmup is 5% of the steps (at least 1). |
+| TRAIN-07 | medium | FIXED | With a checkpoint directory, the last step is always saved (`train` docstring). |
+| TRAIN-08 | medium | OPEN | Partly fixed. `eval_by_depth` (opt-in) reports perplexity at each training depth. By default evaluation and generation use depth 6 while training draws 2 to 6. |
+| TRAIN-09 | medium | FIXED | Core aux is averaged over the loops (see CORE-09). |
+| TRAIN-10 | medium | FIXED | Balance counts accumulate across calls (see CORE-04). |
+| TRAIN-11 | medium | FIXED | Per-epoch reshuffling with an epoch-seeded RNG (`_batches`). |
+| TRAIN-12 | medium | FIXED | `grad_accum_steps` and `amp_dtype` (bf16 or fp16) are options, both off by default. |
+| TRAIN-13 | low | FIXED | The decay stays above zero on the final step, so the last update has a nonzero rate. |
+| TRAIN-14 | low | FIXED | Parameters in a `router` or `halting` segment are routed to AdamW. |
+| TRAIN-15 | low | OPEN | `distillation_loss` is not chunked and is not wired into `train()`. |
+
 Scope: `inky/optim.py`, `inky/train.py`, `inky/distill.py`, `inky/config.py`, and the training path of `inky/modeling.py` and `inky/layers.py`. No source files were edited and no training was run.
 
-Verification: the existing suite passes (`101 passed`). Items marked **confirmed (run)** were checked with a short script that calls the project's own functions. Items marked **confirmed (read)** were verified from the code but not executed. Items marked **read** are reasoning from the code only.
+Verification: the full suite passes (`490 passed`, 2026-11-03). Items marked **confirmed (run)** were checked with a short script that calls the project's own functions. Items marked **confirmed (read)** were verified from the code but not executed. Items marked **read** are reasoning from the code only.
 
 Ordered by importance.
 
