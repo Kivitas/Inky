@@ -1,5 +1,32 @@
 # Critique: model core
 
+## Status (checked against the code, 2026-11-03)
+
+Checked against the working tree at commit f7299ea plus uncommitted changes. **Line numbers in the
+findings below are from an older commit and may not match the current code.** The finding text is
+kept as written. Legend: **FIXED** = the fix is in the code (a note says which part, for example opt-in). **OPEN** = the problem remains or is only partly fixed (the note says which part). **ACCEPTED-DESIGN** = a deliberate design choice, not a defect; it is documented and was not changed. **NOT-A-BUG** = checked, and the claim does not hold for the code as designed. **UNVERIFIED** = could not be checked here.
+
+Counts for this file: 8 FIXED, 4 OPEN, 3 ACCEPTED-DESIGN, 1 NOT-A-BUG (of 16).
+
+| ID | Severity | Status | Evidence in current code |
+| :--- | :--- | :--- | :--- |
+| CORE-01 | high | ACCEPTED-DESIGN | Training forward runs every loop, by design (the halting weights mix all loop states). `forward_early_exit` (inference, batch size 1) skips loop work; its savings on trained weights are unmeasured. |
+| CORE-02 | high | ACCEPTED-DESIGN | Output is a halting-weighted mix of loop states, by design. The per-loop step CE (`step_ce_token_fraction`, default 0.25) trains each state, which mitigates the dependence on loop count. |
+| CORE-03 | medium | FIXED | The linear loop penalty is gone. PonderNet KL to a geometric prior (mean 3 loops), coefficient 1e-3. |
+| CORE-04 | medium | FIXED | `load_counts` accumulates over every call and is reset in `update_balance_bias`. |
+| CORE-05 | medium | ACCEPTED-DESIGN | `qk_rope_head_dim = 16` and `rope_theta = 5e5` are unchanged, by design. Not checked at 8k on trained weights. |
+| CORE-06 | medium | FIXED | `apply_rope` computes in at least fp32 and returns the input dtype (`layers.py:64-73`). |
+| CORE-07 | low | FIXED | `_absorbed_attention` computes the scores in at least fp32 (`layers.py:213-216`). |
+| CORE-08 | medium | OPEN | `lm_loss_recompute` defaults to True, so `_lm_loss` still checkpoints each chunk and the head runs twice in backward. Setting it to False removes the second pass but keeps each chunk's logits for backward. The default is unchanged. |
+| CORE-09 | low | FIXED | Core aux is divided by the loop count (`core_aux / loops`). |
+| CORE-10 | medium | OPEN | Partly fixed. Uncached passes pass `attention_mask` to the highway as `valid_mask`, so its running mean excludes pads. The MoE router z-loss still averages over pad positions (`layers.py:428`). |
+| CORE-11 | low | FIXED | The scratch rebuild passes the cache's `num_loops`. Test: `test_scratch_rebuild_keeps_the_loop_count`. |
+| CORE-12 | medium | FIXED | Chunked scan (`SelectiveSSMMixer._chunked_scan`). Measured on CPU: 1.8x faster than the token loop at 2048. At 8192 it keeps about 2 GiB of activations per SSM application, so it needs gradient checkpointing (`InkyConfig(gradient_checkpointing=True)`). |
+| CORE-13 | low | FIXED | Routed experts are dispatched with one sort and one host read of the counts per MoE call. |
+| CORE-14 | low | NOT-A-BUG | Design choice: RMSNorm on `out_proj(mem)`. No ablation has been run, so the choice is unmeasured. |
+| CORE-15 | low | OPEN | Depth draw and layer drop now use torch's RNG, so `manual_seed` controls them. No assertion for a train-mode cached forward. |
+| CORE-16 | low | OPEN | The n-gram index is incremental (fixed). `decide_choice` is one batched forward, but the prefix is still recomputed per option, with no cache. |
+
 Scope: `inky/layers.py` (all), `inky/modeling.py` (`InkyModel.forward`, `_lm_loss`, `generate`, `_sample`), `inky/config.py` defaults.
 No files under `inky/` or `tests/` were edited. Repro scripts lived in the session scratchpad and ran from the project directory with `PYTHONDONTWRITEBYTECODE=1`, so no `__pycache__` was written. The existing tests were not run.
 

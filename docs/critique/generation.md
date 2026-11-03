@@ -1,5 +1,30 @@
 # Generation and writing controls: critique
 
+## Status (checked against the code, 2026-11-03)
+
+Checked against the working tree at commit f7299ea plus uncommitted changes. **Line numbers in the
+findings below are from an older commit and may not match the current code.** The finding text is
+kept as written. Legend: **FIXED** = the fix is in the code (a note says which part, for example opt-in). **OPEN** = the problem remains or is only partly fixed (the note says which part). **ACCEPTED-DESIGN** = a deliberate design choice, not a defect; it is documented and was not changed. **NOT-A-BUG** = checked, and the claim does not hold for the code as designed. **UNVERIFIED** = could not be checked here.
+
+Counts for this file: 10 FIXED, 4 OPEN (of 14).
+
+| ID | Severity | Status | Evidence in current code |
+| :--- | :--- | :--- | :--- |
+| GEN-01 | high | FIXED | Notes are capped at 256 tokens (`DEFAULT_MAX_NOTE_TOKENS`). A block over the cap keeps its text, and an unpaired open stays as text. Measured: a stray open followed by 300 tokens of prose keeps the prose. The original repro `[1, 2, OPEN, 10, 11, 12, SEP, 13, CLOSE, 14] -> [1, 2, 13, 14]` is a well-formed block, so it is NOT-A-BUG for that input. |
+| GEN-02 | high | FIXED | The rebuild after a scratch close passes the cache's `num_loops`. |
+| GEN-03 | high | OPEN | The re-prefill cost is fixed (committed caches and forks). The speculative path is still greedy only, with no writing controls; its docstring now says so. |
+| GEN-04 | high | FIXED | Opt-in: `cache_dequantized=True` keeps a float copy and is the fast path. The default still dequantizes on every call (`quantize.py:149-167`), so default quantized decoding is slow on CPU. |
+| GEN-05 | high | FIXED | With `top_k` set (the default is 50), only the k largest logits are read (`torch.topk`). The full vocabulary is sorted only when `top_k=0` and `top_p < 1`. |
+| GEN-06 | medium | FIXED | Opt-in: `repeat_window` limits the repetition penalty to the last N tokens. The default (None) still applies it to the whole sequence, prompt included. |
+| GEN-07 | medium | FIXED | Opt-in: the same `repeat_window` limits the no-repeat rule. The default (None) still uses the whole history. |
+| GEN-08 | medium | OPEN | Single stock words are no longer hard-banned, and a soft penalty exists, but its default is 0. Phrases such as "embark on" are still hard-banned, with no narration-only scope. |
+| GEN-09 | medium | OPEN | `text_report` adds a decoded-text phrase check. Generation still bans token sequences only. |
+| GEN-10 | medium | FIXED | A scratch close no longer re-prefills the whole sequence. Only the text after the marker is recomputed (the `generate` docstring, `modeling.py:660-666`). |
+| GEN-11 | low | FIXED | `NgramBanIndex` is incremental, and the bad-word check looks only at the tail of the row. |
+| GEN-12 | low | FIXED | `no_repeat_ngram_size=1` raises `ValueError` (`modeling.py:672`). |
+| GEN-13 | low | FIXED | Opt-in: `count_prose_only=True` counts only prose toward `max_new_tokens`. The default still counts notes. |
+| GEN-14 | low | OPEN | An evaluation harness exists (`inky/evaluation.py`, `inky/metrics.py`), but there is no trained model to score the defaults on. |
+
 Scope: `inky/modeling.py` (`generate`, `_block_tokens`, `_apply_repetition_penalty`, `_sample`),
 `inky/style.py`, `inky/scratch.py`, `inky/speculative.py`, `inky/quantize.py`. No file under `inky/`
 or `tests/` was changed.

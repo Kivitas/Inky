@@ -7,7 +7,10 @@ Three kinds of output get a report:
   - choice decisions (Choice): top-k accuracy, MRR, NLL, per-option TP/FP/FN/TN, macro and
                                micro precision, recall and F1, and the K x K confusion matrix.
   - generated text:            distinct-n, repetition rate, type-token ratio, and hits on
-                               blocked phrases.
+                               blocked phrases. Length-normalised variants (MATTR, windowed
+                               distinct-n) compare across lengths; the raw ones do not.
+                               Reference baselines (shuffled, repeated) and compare_to_reference
+                               put a generated text next to a known yardstick.
 
 Confusion-based metrics need gold labels. Without labels, a decision still reports its own
 confidence, entropy and margin, and the confusion fields show "n/a".
@@ -17,8 +20,9 @@ and recall are both 0. The display prints None as "n/a" rather than hiding it.
 """
 
 import math
+import random
 from collections import Counter
-from typing import Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import torch
 
@@ -64,9 +68,13 @@ def binary_report(probs, labels=None, threshold: float = 0.5, ece_bins: int = 10
         report["labels"] = "not given: confusion metrics need gold labels"
         return report
 
-    y = [int(v) for v in _to_list(labels)]
-    if len(y) != n:
-        raise ValueError(f"got {n} probabilities but {len(y)} labels")
+    raw_labels = _to_list(labels)
+    if len(raw_labels) != n:
+        raise ValueError(f"got {n} probabilities but {len(raw_labels)} labels")
+    for i, v in enumerate(raw_labels):
+        if v not in (0, 1):   # also rejects NaN, 2, -1 and fractions
+            raise ValueError(f"binary label at item {i} is {v}; binary gold labels must be 0 (no) or 1 (yes)")
+    y = [int(v) for v in raw_labels]
     tp = sum(1 for a, b in zip(preds, y) if a == 1 and b == 1)
     tn = sum(1 for a, b in zip(preds, y) if a == 0 and b == 0)
     fp = sum(1 for a, b in zip(preds, y) if a == 1 and b == 0)
@@ -156,6 +164,8 @@ def choice_report(probs, gold=None, top_k: Sequence[int] = (2, 3)) -> Dict[str, 
     if P.ndim != 2:
         raise ValueError("probs must be [items, options]")
     n, K = P.shape
+    if K < 1:
+        raise ValueError("choice probs need at least one option per item")
     # same ordering as the ranks below, so top-1 accuracy and rank-1 counts always agree (MET-06)
     pred = [int(torch.argsort(row, descending=True)[0]) for row in P]
     report: Dict[str, object] = {
@@ -169,9 +179,17 @@ def choice_report(probs, gold=None, top_k: Sequence[int] = (2, 3)) -> Dict[str, 
         report["labels"] = "not given: accuracy and per-option metrics need gold labels"
         return report
 
-    g = [int(v) for v in _to_list(gold)]
-    if len(g) != n:
-        raise ValueError(f"got {n} items but {len(g)} gold labels")
+    raw_gold = _to_list(gold)
+    if len(raw_gold) != n:
+        raise ValueError(f"got {n} items but {len(raw_gold)} gold labels")
+    g = []
+    for i, v in enumerate(raw_gold):
+        gi = int(v) if v == v else -1   # NaN never matches, so it is reported below
+        if gi != v or not 0 <= gi < K:
+            raise ValueError(
+                f"gold label at item {i} is {v}; choices are indexed 0 to {K - 1}, so gold must be one of those"
+            )
+        g.append(gi)
     ranks = []
     for i, gi in enumerate(g):
         order = torch.argsort(P[i], descending=True).tolist()
@@ -185,7 +203,7 @@ def choice_report(probs, gold=None, top_k: Sequence[int] = (2, 3)) -> Dict[str, 
     report["nll"] = _div(-sum(math.log(max(float(P[i, g[i]]), 1e-12)) for i in range(n)), n)
     report["mean_gold_probability"] = _div(sum(float(P[i, g[i]]) for i in range(n)), n)
     onehot = torch.zeros_like(P)
-    onehot[torch.arange(n), torch.tensor(g)] = 1.0
+    onehot[torch.arange(n), torch.tensor(g, dtype=torch.long)] = 1.0
     report["brier"] = _div(float(((P - onehot) ** 2).sum(dim=-1).sum()), n)
 
     matrix = [[0] * K for _ in range(K)]
@@ -232,14 +250,67 @@ def choice_report(probs, gold=None, top_k: Sequence[int] = (2, 3)) -> Dict[str, 
 
 # --------------------------------------------------------------------------- generated text
 
+DEFAULT_WINDOW = 50
+
+
+def _distinct_k(seq: Sequence[int], k: int) -> Optional[float]:
+    grams = [tuple(seq[i:i + k]) for i in range(len(seq) - k + 1)]
+    return _div(len(set(grams)), len(grams))
+
+
+def _windowed_mean(ids: Sequence[int], window: int, fn: Callable[[Sequence[int]], Optional[float]]) -> Optional[float]:
+    """Mean of ``fn`` over every full window of ``window`` tokens, sliding one token at a time.
+
+    None when the sequence is shorter than one window, so a short text is never scored on a statistic
+    that depends on its length.
+    """
+    if window <= 0 or len(ids) < window:
+        return None
+    vals = [fn(ids[i:i + window]) for i in range(len(ids) - window + 1)]
+    vals = [v for v in vals if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _phrase_text_hits(ids: Sequence[int], decode: Callable[[List[int]], str], phrases: Sequence[str]) -> int:
+    """Case-insensitive, non-overlapping count of each phrase in the decoded text, summed over phrases."""
+    text = str(decode(list(ids))).lower()
+    total = 0
+    for phrase in phrases:
+        needle = str(phrase).lower()
+        if needle:
+            total += text.count(needle)
+    return total
+
+
 def text_report(
     token_ids,
     bad_word_ids: Optional[Sequence[Sequence[int]]] = None,
+    *,
+    window: int = DEFAULT_WINDOW,
+    decode: Optional[Callable[[List[int]], str]] = None,
+    blocked_phrases: Optional[Sequence[str]] = None,
 ) -> Dict[str, object]:
-    """Indicators for a generated sequence of token ids (the new tokens only, not the prompt)."""
+    """Indicators for a generated sequence of token ids (the new tokens only, not the prompt).
+
+    Length-normalised indicators, safe to compare across generation lengths:
+      - mattr: moving-average type-token ratio over windows of ``window`` tokens.
+      - distinct_1_windowed, distinct_2_windowed: distinct-1 and distinct-2 averaged over the same windows.
+      Each is None when the text is shorter than ``window``.
+
+    Length-dependent indicators, kept for compatibility. Compare them only at equal length:
+      - distinct_1, distinct_2, distinct_3, type_token_ratio, most_frequent_token_share.
+
+    Warning: when generation used no_repeat_ngram_size, repeated_4gram_rate is 0 by construction,
+    because the sampler forbids repeated n-grams. Do not read it as a quality signal in that case.
+
+    blocked_phrase_hits counts the positions where a blocked token-id sequence ends. The generator bans
+    those same id sequences, so this only catches a leak in the id-level ban. It does not see the same
+    words under a different tokenisation. For that, pass ``decode`` and ``blocked_phrases`` to get
+    blocked_phrase_text_hits: a case-insensitive count of the phrases in the decoded text.
+    """
     ids = [int(x) for x in _to_list(token_ids)]
     n = len(ids)
-    report: Dict[str, object] = {"kind": "text", "tokens": n}
+    report: Dict[str, object] = {"kind": "text", "tokens": n, "window": window}
     for k in (1, 2, 3):
         grams = [tuple(ids[i:i + k]) for i in range(n - k + 1)]
         report[f"distinct_{k}"] = _div(len(set(grams)), len(grams))
@@ -249,8 +320,12 @@ def text_report(
     top = Counter(ids).most_common(1)
     report["most_frequent_token_share"] = _div(top[0][1], n) if top else None
 
-    # Count the positions where a blocked entry ends in the text. This checks the output itself, not
-    # the sampler's ban rule, so a decoder that failed to block a phrase shows up here.
+    report["mattr"] = _windowed_mean(ids, window, lambda w: len(set(w)) / len(w))
+    report["distinct_1_windowed"] = _windowed_mean(ids, window, lambda w: _distinct_k(w, 1))
+    report["distinct_2_windowed"] = _windowed_mean(ids, window, lambda w: _distinct_k(w, 2))
+
+    # Count the positions where a blocked id sequence ends in the output. See the docstring for what
+    # this can and cannot detect.
     hits = 0
     if bad_word_ids:
         ends = set()
@@ -264,7 +339,62 @@ def text_report(
                     ends.add(i)
         hits = len(ends)
     report["blocked_phrase_hits"] = hits if bad_word_ids else None
+
+    if blocked_phrases and decode is None:
+        raise ValueError("blocked_phrases needs a decode callable to check the decoded text")
+    report["blocked_phrase_text_hits"] = (
+        _phrase_text_hits(ids, decode, blocked_phrases) if decode is not None and blocked_phrases else None
+    )
     return report
+
+
+def baseline_reports(
+    reference_ids,
+    *,
+    length: Optional[int] = None,
+    seed: int = 0,
+    window: int = DEFAULT_WINDOW,
+) -> Dict[str, Dict[str, object]]:
+    """Text reports for two yardsticks built from a reference sequence.
+
+      - "shuffled": the reference tokens in random order. Same unigram counts, no word order.
+      - "repeated": the reference's most frequent token repeated ``length`` times (default: the reference
+        length). A degenerate sequence that any quality measure should rank far below real text.
+    """
+    ref = [int(x) for x in _to_list(reference_ids)]
+    if not ref:
+        raise ValueError("reference_ids is empty")
+    shuffled = list(ref)
+    random.Random(seed).shuffle(shuffled)
+    top_token = Counter(ref).most_common(1)[0][0]
+    repeated = [top_token] * (len(ref) if length is None else int(length))
+    return {
+        "shuffled": text_report(shuffled, window=window),
+        "repeated": text_report(repeated, window=window),
+    }
+
+
+def compare_to_reference(
+    generated_ids,
+    reference_ids,
+    *,
+    window: int = DEFAULT_WINDOW,
+) -> Dict[str, Optional[float]]:
+    """Metric deltas, generated minus reference, for every numeric text indicator.
+
+    A delta is None when either side is None, for example when a text is shorter than the window.
+    Counts and the window size are not compared.
+    """
+    gen = text_report(generated_ids, window=window)
+    ref = text_report(reference_ids, window=window)
+    skip = {"kind", "tokens", "window"}
+    deltas: Dict[str, Optional[float]] = {}
+    for key, gval in gen.items():
+        if key in skip or isinstance(gval, str):
+            continue
+        rval = ref.get(key)
+        deltas[key] = None if gval is None or rval is None else float(gval) - float(rval)
+    return deltas
 
 
 # --------------------------------------------------------------------------- display
@@ -286,6 +416,9 @@ _LABELS = {
     "tokens": "tokens", "distinct_1": "distinct-1", "distinct_2": "distinct-2", "distinct_3": "distinct-3",
     "repeated_4gram_rate": "repeated 4-gram rate", "type_token_ratio": "type-token ratio",
     "most_frequent_token_share": "most frequent token share", "blocked_phrase_hits": "blocked phrase hits",
+    "window": "window size", "mattr": "moving-average type-token ratio (MATTR)",
+    "distinct_1_windowed": "distinct-1 (windowed)", "distinct_2_windowed": "distinct-2 (windowed)",
+    "blocked_phrase_text_hits": "blocked phrase hits (decoded text)",
 }
 
 
