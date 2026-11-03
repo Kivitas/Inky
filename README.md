@@ -40,7 +40,7 @@ tokens → embedding
            state-space memory highway (causal running mean, carried across loops)
            2 × block (latent-KV attention + shared-expert MoE), loop dropout 0.1
            damped residual update
-           ACT halting: per-token weights that sum to 1 over the loops
+           PonderNet halting: per-token weights over the loops, sum to 1
        → post layer
        → RMSNorm → tied LM head (logit soft-cap 30)
 ```
@@ -53,7 +53,7 @@ tokens → embedding
 | Recurrent core | One set of shared layers applied repeatedly. Gives depth without extra parameters. | `RecurrentCoreBlock` |
 | Step modulation | FiLM scale and shift per loop index. Starts as the identity. | `StepModulation` |
 | State-space highway | Carries a per-position memory across loops. Its causal running mean is cached for decoding. | `StateSpaceMemoryHighway` |
-| ACT halting | Sets a token's weight on later loops to zero once its halting mass reaches 0.9. Every loop still runs, so halting saves no compute. Ponder cost is a training penalty. | `EntropyGatedACTHalting` |
+| PonderNet halting | Each loop emits a stop probability; the halting distribution is pulled to a geometric prior (mean 3 loops) by a KL term, and each loop's state is trained on its own, weighted by its halting probability. Every loop still runs, so halting saves no compute yet. | PonderNet (arXiv 2107.05407, see docs/research/act.md) |
 | Chunked loss | Next-token cross-entropy and z-loss in chunks, so full 8k × 50k logits never exist at once. | `chunked_ce` |
 | Scratch reduction | The model may draft notes, then close the block. Reduction deletes the notes and keeps the text. | PENCIL (arXiv:2503.14337) |
 
@@ -94,7 +94,7 @@ anything about how a text will score on an AI detector. Detector scores are unre
 
 ```
 inky/config.py       InkyConfig (all sizes and switches, scratch ids)
-inky/layers.py       RMSNorm, RoPE, latent-KV attention, MoE, recurrent core, halting
+inky/layers.py       RMSNorm, RoPE, latent-KV attention, MoE, recurrent core, PonderNet halting
 inky/modeling.py     InkyModel, InkyCache (KV and SSM state), forward, generate
 inky/scratch.py      reduce_scratch (PENCIL reduction rule)
 inky/style.py        STOCK_PHRASES, bad-word and n-gram blocking
@@ -180,7 +180,7 @@ High-severity findings from the critique files in `docs/critique/`. Each one is 
 - DATA-02: dedupe and packing hold all data in memory and do not scale to a real corpus ([data_docs.md](docs/critique/data_docs.md)).
 - TEST-01: the speculative-decoding tests pass on a degenerate output and cannot detect a broken decoder ([data_docs.md](docs/critique/data_docs.md)).
 - TEST-02: the bad-word test cannot fail, so the ban is unverified ([data_docs.md](docs/critique/data_docs.md)).
-- CORE-01: ACT halting never exits early, so every token runs every loop and halting saves no compute ([core.md](docs/critique/core.md)).
+- CORE-01: halting never exits early, so every token runs every loop and halting saves no compute. Halting is now PonderNet, but compute is unchanged ([core.md](docs/critique/core.md), [act.md](docs/research/act.md)).
 - CORE-02: each output is a weighted mix over loop states, so changing `num_loops` changes the function, not only the depth ([core.md](docs/critique/core.md)).
 
 ## Sources for the style controls
