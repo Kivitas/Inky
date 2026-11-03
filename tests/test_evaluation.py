@@ -88,6 +88,22 @@ def test_perplexity_nll_matches_manual_cross_entropy(model):
     assert result["batches"] == 1
 
 
+def test_perplexity_ignores_padding_targets(model):
+    PAD = 3
+    ids = make_batches(n_batches=1)[0]
+    padded = torch.cat([ids, torch.full((ids.shape[0], 4), PAD, dtype=torch.long)], dim=1)
+    with torch.no_grad():
+        logits = model(padded).logits
+        targets = padded[:, 1:]
+        keep = targets != PAD
+        manual = F.cross_entropy(logits[:, :-1][keep], targets[keep], reduction="mean").item()
+    result = perplexity(model, [padded], ignore_id=PAD)
+    assert abs(result["nll"] - manual) < 1e-5
+    assert result["tokens"] == int(keep.sum())
+    # Without ignore_id the padding is scored, so the token count and NLL change.
+    assert perplexity(model, [padded])["tokens"] == padded.shape[0] * (padded.shape[1] - 1)
+
+
 def test_untrained_perplexity_is_near_uniform(model):
     result = perplexity(model, make_batches())
     assert 0.5 * VOCAB < result["perplexity"] < 2 * VOCAB

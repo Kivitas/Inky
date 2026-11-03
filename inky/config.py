@@ -2,7 +2,7 @@
 
 Inky keeps the language-model path of EOS (parameter-shared recurrent core, latent-KV
 attention, shared-expert sparse MoE, SSM memory highway, PonderNet halting) at a smaller scale.
-The Rhen decision layer is not included, because it only serves typed decision questions.
+The Rhen decision layer is ported as Arlo (inky/arlo.py) and is built when ``enable_arlo`` is set.
 
 Inky also adds PENCIL-style scratch reduction (arXiv:2503.14337): the model may draft a
 scratch block (scratch_open ... scratch_sep ... scratch_close), and the reduction step removes
