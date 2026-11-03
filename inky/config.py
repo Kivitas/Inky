@@ -44,6 +44,10 @@ class InkyConfig(PretrainedConfig):
         ponder_prior_steps: float = 3.0,   # expected loops under the prior (lambda_prior = 1 / this)
         ponder_kl_coef: float = 1e-3,      # weight of KL(halting || prior)
         ponder_step_loss_coef: float = 1.0,  # weight of the per-loop LM loss, weighted by halting probability
+        # Fraction of target positions used by the per-loop LM loss each step (1.0 = every position).
+        # The subset is drawn once per forward pass and shared by all loops, and the loss is scaled so its
+        # expectation matches the full version. Lower values save a full-vocabulary projection per loop.
+        step_ce_token_fraction: float = 0.25,
         # Shared-expert fine-grained MoE
         intermediate_size: int = 704,      # per-expert SwiGLU width
         num_shared_experts: int = 1,
@@ -59,8 +63,12 @@ class InkyConfig(PretrainedConfig):
         final_logit_softcapping: float = 30.0,
         z_loss_coef: float = 1e-4,
         gradient_checkpointing: bool = False,  # recompute block activations in backward (training)
+        # Recompute the LM head in backward for each loss chunk (CORE-08). True keeps the memory of
+        # one chunk of logits at a time, at the cost of a second head pass per step. False keeps the
+        # chunk logits for backward: one head pass, but about one fp32 copy of N x vocab per chunk.
+        lm_loss_recompute: bool = True,
         # Writing decision engine (Rhen's Choice and Noul primitives). Reads hidden states only.
-        enable_arlo: bool = True,
+        enable_arlo: bool = False,         # off by default: Arlo is not trained by train.py yet
         arlo_slots: int = 8,               # K latent decision slots
         arlo_dim: int = 128,               # slot width (Rhen rhen_hidden_dim)
         arlo_heads: int = 4,               # pointer heads
@@ -69,9 +77,20 @@ class InkyConfig(PretrainedConfig):
         eos_token_id: int = 49974,         # <|endoftext|> in EOS_Tokenizer
         pad_token_id: int = 49974,
         ssm_mixer_layers: tuple = (),      # recurrent-core layer indices that use SelectiveSSMMixer instead of attention
+        # Dropout (TRAIN-04). Both are active only in train mode and both default to 0 (no dropout).
+        # embedding_dropout drops token-embedding entries once per forward pass. residual_dropout drops
+        # each block's attention and MoE branch outputs before they are added to the residual stream.
+        embedding_dropout: float = 0.0,
+        residual_dropout: float = 0.0,
         **kwargs,
     ):
+        for name, value in (("embedding_dropout", embedding_dropout), ("residual_dropout", residual_dropout)):
+            if not 0.0 <= float(value) < 1.0:
+                raise ValueError(f"{name} must be in [0, 1), got {value}")
+        self.embedding_dropout = float(embedding_dropout)
+        self.residual_dropout = float(residual_dropout)
         self.gradient_checkpointing = gradient_checkpointing
+        self.lm_loss_recompute = bool(lm_loss_recompute)
         self.enable_arlo = enable_arlo
         self.arlo_slots = arlo_slots
         self.arlo_dim = arlo_dim
@@ -100,6 +119,9 @@ class InkyConfig(PretrainedConfig):
         self.ponder_prior_steps = ponder_prior_steps
         self.ponder_kl_coef = ponder_kl_coef
         self.ponder_step_loss_coef = ponder_step_loss_coef
+        if not 0.0 < float(step_ce_token_fraction) <= 1.0:
+            raise ValueError(f"step_ce_token_fraction must be in (0, 1], got {step_ce_token_fraction}")
+        self.step_ce_token_fraction = float(step_ce_token_fraction)
         self.intermediate_size = intermediate_size
         self.num_shared_experts = num_shared_experts
         self.num_routed_experts = num_routed_experts

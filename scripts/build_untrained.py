@@ -10,9 +10,15 @@ from pathlib import Path
 
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
-
-from inky import InkyConfig, InkyModel  # noqa: E402
+try:
+    from inky import InkyConfig, InkyModel
+except ImportError as exc:  # pragma: no cover - only hit when the package is not installed
+    sys.exit(
+        f"error: cannot import 'inky' ({exc}).\n"
+        "Install the project first from the repository root:\n"
+        "    pip install -e .\n"
+        "then re-run this script."
+    )
 
 
 def main() -> None:

@@ -1,5 +1,6 @@
+# Runtime dependencies (mirrors [project].dependencies in pyproject.toml).
 # Tested with torch 2.13 (CPU) and transformers 5.13.
 # CPU-only torch: pip install torch --index-url https://download.pytorch.org/whl/cpu
-torch>=2.1
-transformers>=5.0
-pytest
+# Development: pip install -e .[dev]  (adds pytest)
+torch>=2.13,<3
+transformers>=5.13,<6

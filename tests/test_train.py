@@ -33,11 +33,11 @@ class _NaNOnCall(torch.nn.Module):
         self.bad_call = bad_call
         self.calls = 0
 
-    def forward(self, input_ids, labels=None, num_loops=None):
-        out = self.inner(input_ids=input_ids, labels=labels, num_loops=num_loops)
+    def forward(self, input_ids, labels=None, num_loops=None, **kwargs):
+        out = self.inner(input_ids=input_ids, labels=labels, num_loops=num_loops, **kwargs)
         self.calls += 1
         loss = out.loss * float("nan") if self.calls == self.bad_call else out.loss
-        return SimpleNamespace(loss=loss)
+        return SimpleNamespace(loss=loss, loss_parts=out.loss_parts)
 
     def update_moe_balance(self):
         self.inner.update_moe_balance()
@@ -246,6 +246,7 @@ def test_resume_continues_step_numbers_and_schedule(tmp_path):
         log_fn=lambda _msg: None,
     )
     records = [r for r in resumed if r.get("kind") == "train"]
-    assert [r["step"] for r in records] == [3]
+    # The returned history is the saved history (steps 1-2) followed by the new step 3.
+    assert [r["step"] for r in records] == [1, 2, 3]
     # The schedule is computed from the total step count passed to train(), not from the resumed run.
-    assert records[0]["lr_scale"] == wsd_lr_scale(2, 3, 0, 0.2)
+    assert records[2]["lr_scale"] == wsd_lr_scale(2, 3, 0, 0.2)

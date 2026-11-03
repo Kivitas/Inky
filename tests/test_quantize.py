@@ -35,6 +35,7 @@ def tiny_config() -> InkyConfig:
         arlo_dim=16,
         arlo_pointer_rank=8,
         arlo_slots=4,
+        enable_arlo=True,
         scratch_open_id=508,
         scratch_sep_id=509,
         scratch_close_id=510,

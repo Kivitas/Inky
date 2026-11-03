@@ -112,13 +112,30 @@ class Arlo(nn.Module):
         return slots
 
     def summarise(self, query: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
-        """query [B, d] shifted by the slots' summary -> [B, d]."""
-        steer = self.out_norm(self.out_proj(self.read(states).mean(dim=1)))
+        """query [B, d] shifted by the slots' summary -> [B, d].
+
+        The slots are not averaged. Each slot is projected to the model width and weighted by its
+        match with the query (softmax over slots), so the slot that fits this query dominates. With a
+        single slot the weight is 1 and the result is the same as a plain projection of that slot.
+        """
+        slots = self.out_proj(self.read(states))                                       # [B, K, d]
+        match = torch.einsum("bd,bkd->bk", query, slots) / math.sqrt(query.shape[-1])
+        weights = torch.softmax(match, dim=-1)
+        steer = self.out_norm(torch.einsum("bk,bkd->bd", weights, slots))
         return query + steer
 
     def choice_scores(self, query: torch.Tensor, options: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
-        """query [B, d], options [B, N, d], states [B, S, d] -> option scores [B, N] (pre-softmax)."""
-        return self.pointer(self.summarise(query, states), options)
+        """query [B, d], options [B, N, d], states [B, S, d] -> option scores [B, N] (pre-softmax).
+
+        The query is shifted by the slot summary and then by an attention summary of the option set:
+        the shifted query attends over the N options, and the attended vector moves it again. So an
+        option's score depends on the other options, not only on itself. The scores are invariant to
+        the order of the options (permutation-equivariant per option).
+        """
+        shifted = self.summarise(query, states)
+        match = torch.einsum("bd,bnd->bn", shifted, options) / math.sqrt(shifted.shape[-1])
+        option_context = torch.einsum("bn,bnd->bd", torch.softmax(match, dim=-1), options)
+        return self.pointer(shifted + option_context, options)
 
     def binary_logit(self, query: torch.Tensor, states: torch.Tensor) -> torch.Tensor:
         """query [B, d], states [B, S, d] -> logit [B]."""
@@ -140,3 +157,129 @@ class Arlo(nn.Module):
         if task == "binary":
             return binary_loss(self.binary_logit(query, states), gold)
         raise ValueError(f"unknown Arlo training task {task!r}; expected 'choice' or 'binary'")
+
+
+def _ids_2d(ids) -> torch.Tensor:
+    return torch.as_tensor(ids, dtype=torch.long).reshape(1, -1)
+
+
+def option_ids(option, index: int = 0) -> torch.Tensor:
+    """One decision option as [1, L] long ids. An empty option is rejected (ARLO-03): it has no
+    token states to pool, so it cannot be scored."""
+    ids = _ids_2d(option)
+    if ids.shape[1] == 0:
+        raise ValueError(f"option {index} is empty; every decision option needs at least one token")
+    return ids
+
+
+def mean_pool_options(h: torch.Tensor, prefix_len: int, lengths) -> torch.Tensor:
+    """Mean of each option's own token states (ARLO-03).
+
+    ``h`` is [N, T, d]: row i holds the prefix (positions 0..prefix_len-1) followed by option i, which
+    occupies positions prefix_len..lengths[i]-1. Right padding after lengths[i] is excluded from the
+    mean. Returns [N, d]. Every option must have at least one token (see ``option_ids``).
+    """
+    N, T, _ = h.shape
+    pos = torch.arange(T, device=h.device).unsqueeze(0)                           # [1, T]
+    lens = torch.as_tensor(list(lengths), device=h.device).unsqueeze(1)           # [N, 1]
+    mask = ((pos >= prefix_len) & (pos < lens)).unsqueeze(-1).to(h.dtype)         # [N, T, 1]
+    return (h * mask).sum(dim=1) / mask.sum(dim=1).clamp(min=1.0)
+
+
+def _example_features(model, example: dict, task: str):
+    """Frozen-LM features for one labelled example: (query [1, d], states [1, P, d], options or None).
+
+    Mirrors decide_choice and decide_binary: the prefix is context plus optional question, each
+    option is appended to the prefix, and the options run in one right-padded batch. Each option is
+    the mean of its own token states (``mean_pool_options``). The query is the prefix's last state.
+    Callers run this under no_grad, so the language model gets no gradients.
+    """
+    context = _ids_2d(example["context"])
+    question = example.get("question")
+    prefix = context if question is None else torch.cat([context, _ids_2d(question)], dim=1)
+    P = prefix.shape[1]
+    if task == "binary":
+        h = model(prefix, return_hidden=True).hidden
+        return h[:, -1], h[:, :P], None
+    opts = [option_ids(opt, i) for i, opt in enumerate(example["options"])]
+    if not opts:
+        raise ValueError("a choice example needs at least one option")
+    seqs = [torch.cat([prefix, o], dim=1)[0] for o in opts]
+    lengths = [s.shape[0] for s in seqs]
+    batch = torch.zeros((len(seqs), max(lengths)), dtype=torch.long, device=prefix.device)
+    for i, s in enumerate(seqs):
+        batch[i, :lengths[i]] = s
+    h = model(batch, return_hidden=True).hidden
+    option_states = mean_pool_options(h, P, lengths).unsqueeze(0)                  # [1, N, d]
+    return h[:1, P - 1], h[:1, :P], option_states
+
+
+def train_arlo(
+    model,
+    batches,
+    task: str = "choice",
+    *,
+    lr: float = 1e-3,
+    weight_decay: float = 0.0,
+    epochs: int = 1,
+) -> list:
+    """Train only the Arlo decision engine on labelled decision examples.
+
+    ``batches`` is an iterable of batches; each batch is a list of examples (dicts):
+      - task "choice":  {"context": ids, "options": [ids, ...], "gold": index, "question": ids (optional)}
+      - task "binary":  {"context": ids, "gold": 0 or 1, "question": ids (optional)}
+    ``ids`` is a 1-D or [1, L] integer tensor or list. The loss is the same ``training_loss`` the
+    decision heads use (cross-entropy over options, or BCE with logits).
+
+    Every parameter of ``model`` outside ``model.arlo`` is frozen for the run (requires_grad off, and
+    the language model runs under no_grad), so only Arlo changes. The model's train/eval mode and the
+    requires_grad flags are restored afterwards, even on error. Returns the mean loss of each step.
+    """
+    arlo = getattr(model, "arlo", None)
+    if arlo is None:
+        raise RuntimeError("train_arlo needs a model built with enable_arlo=True")
+    if task not in ("choice", "binary"):
+        raise ValueError(f"unknown Arlo training task {task!r}; expected 'choice' or 'binary'")
+    batches = [list(batch) for batch in batches]
+    if not any(batches):
+        raise ValueError("train_arlo needs at least one non-empty batch")
+
+    arlo_ids = {id(p) for p in arlo.parameters()}
+    frozen = [p for p in model.parameters() if id(p) not in arlo_ids and p.requires_grad]
+    was_training = model.training
+    optimiser = torch.optim.AdamW(arlo.parameters(), lr=lr, weight_decay=weight_decay)
+    losses = []
+    try:
+        for p in frozen:
+            p.requires_grad_(False)
+        model.eval()
+        for _ in range(epochs):
+            for batch in batches:
+                if not batch:
+                    continue
+                terms = []
+                for example in batch:
+                    with torch.no_grad():
+                        query, states, options = _example_features(model, example, task)
+                    gold = int(example["gold"])
+                    if task == "choice":
+                        n = options.shape[1]
+                        if not 0 <= gold < n:
+                            raise ValueError(f"choice gold {gold} is outside the {n} options")
+                        terms.append(arlo.training_loss(
+                            query, options, states, torch.tensor([gold]), task="choice"))
+                    else:
+                        if gold not in (0, 1):
+                            raise ValueError(f"binary gold must be 0 or 1, got {gold}")
+                        terms.append(arlo.training_loss(
+                            query, query.unsqueeze(1), states, torch.tensor([float(gold)]), task="binary"))
+                loss = torch.stack(terms).mean()
+                optimiser.zero_grad()
+                loss.backward()
+                optimiser.step()
+                losses.append(float(loss.detach()))
+    finally:
+        for p in frozen:
+            p.requires_grad_(True)
+        model.train(was_training)
+    return losses

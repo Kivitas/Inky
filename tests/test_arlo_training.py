@@ -10,8 +10,8 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from inky import InkyConfig  # noqa: E402
-from inky.arlo import Arlo, binary_loss, choice_loss  # noqa: E402
+from inky import InkyConfig, InkyModel  # noqa: E402
+from inky.arlo import Arlo, binary_loss, choice_loss, train_arlo  # noqa: E402
 
 OPEN, SEP, CLOSE = 508, 509, 510
 B, N, S = 4, 3, 6
@@ -127,6 +127,72 @@ def test_adam_steps_reduce_choice_loss_on_a_fixed_batch():
         optimiser.step()
     final = float(arlo.training_loss(query, options, states, choice_gold, task="choice").detach())
     assert final < initial
+
+
+def decision_model() -> InkyModel:
+    torch.manual_seed(0)
+    cfg = tiny_config(vocab_size=512, scratch_open_id=OPEN, scratch_sep_id=SEP,
+                      scratch_close_id=CLOSE, hidden_size=64, num_routed_experts=4,
+                      num_active_routed=2, ssm_state_dim=16, max_recurrent_loops=4,
+                      min_recurrent_loops=2, loop_dropout_prob=0.0, max_position_embeddings=256,
+                      enable_arlo=True, pad_token_id=1)
+    return InkyModel(cfg)
+
+
+def decision_examples(seed: int = 7, n: int = 6):
+    gen = torch.Generator().manual_seed(seed)
+    examples = []
+    for _ in range(n):
+        context = torch.randint(2, 500, (1, 10), generator=gen)
+        options = [torch.randint(2, 500, (1, L), generator=gen) for L in (2, 3, 4)]
+        examples.append({"context": context, "options": options, "gold": int(torch.randint(0, 3, (1,), generator=gen))})
+    return examples
+
+
+def test_train_arlo_reduces_loss_and_leaves_the_language_model_unchanged():
+    model = decision_model()
+    model.train()
+    examples = decision_examples()
+    before = {n: p.detach().clone() for n, p in model.named_parameters() if not n.startswith("arlo.")}
+    arlo_before = {n: p.detach().clone() for n, p in model.named_parameters() if n.startswith("arlo.")}
+    losses = train_arlo(model, [examples], task="choice", lr=1e-2, epochs=15)
+    assert len(losses) == 15
+    assert losses[-1] < losses[0], losses
+    # Non-Arlo parameters are bit-for-bit unchanged, and Arlo parameters did move.
+    for n, p in model.named_parameters():
+        if n.startswith("arlo."):
+            continue
+        assert torch.equal(p.detach(), before[n]), n
+    assert any(not torch.equal(p.detach(), arlo_before[n])
+               for n, p in model.named_parameters() if n.startswith("arlo."))
+    # Mode and requires_grad are restored.
+    assert model.training is True
+    assert all(p.requires_grad for p in model.parameters())
+
+
+def test_train_arlo_binary_task_reduces_loss():
+    model = decision_model()
+    gen = torch.Generator().manual_seed(3)
+    examples = [{"context": torch.randint(2, 500, (1, 8), generator=gen),
+                 "gold": i % 2} for i in range(6)]
+    losses = train_arlo(model, [examples], task="binary", lr=1e-2, epochs=15)
+    assert losses[-1] < losses[0], losses
+
+
+def test_train_arlo_restores_mode_and_flags_on_error():
+    model = decision_model().eval()
+    bad = [[{"context": torch.randint(2, 500, (1, 6)), "options": [torch.randint(2, 500, (1, 2))], "gold": 4}]]
+    with pytest.raises(ValueError):
+        train_arlo(model, bad, task="choice")
+    assert model.training is False
+    assert all(p.requires_grad for p in model.parameters())
+
+
+def test_train_arlo_needs_an_enabled_engine():
+    model = decision_model()
+    model.arlo = None
+    with pytest.raises(RuntimeError):
+        train_arlo(model, [decision_examples(n=1)], task="choice")
 
 
 if __name__ == "__main__":

@@ -12,6 +12,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from inky import InkyConfig, InkyModel  # noqa: E402
 from inky.evaluation import bits_per_token, evaluate, perplexity, split_heldout  # noqa: E402
+from inky.modeling import InkyOutput  # noqa: E402
 
 VOCAB = 512
 
@@ -104,9 +105,41 @@ def test_perplexity_ignores_padding_targets(model):
     assert perplexity(model, [padded])["tokens"] == padded.shape[0] * (padded.shape[1] - 1)
 
 
-def test_untrained_perplexity_is_near_uniform(model):
-    result = perplexity(model, make_batches())
-    assert 0.5 * VOCAB < result["perplexity"] < 2 * VOCAB
+class UniformStub(torch.nn.Module):
+    """Returns all-zero logits, so every target has probability 1/V."""
+
+    def __init__(self, vocab: int = VOCAB):
+        super().__init__()
+        self.vocab = vocab
+        self.anchor = torch.nn.Parameter(torch.zeros(1))
+
+    def forward(self, input_ids, num_loops=None):
+        B, S = input_ids.shape
+        return InkyOutput(logits=self.anchor.new_zeros(B, S, self.vocab))
+
+
+def test_uniform_logits_give_perplexity_exactly_vocab():
+    result = perplexity(UniformStub(), make_batches())
+    assert abs(result["perplexity"] - VOCAB) < 1e-3
+    assert abs(result["nll"] - math.log(VOCAB)) < 1e-6
+
+
+def test_overfit_model_drops_well_below_vocab():
+    # A tiny model trained on one fixed batch must memorise it: perplexity on that batch falls far
+    # below the uniform value V. Before training it sits near V.
+    torch.manual_seed(0)
+    m = InkyModel(tiny_config())
+    batch = make_batches(n_batches=1, B=2, S=16, seed=3)
+    before = perplexity(m, batch)["perplexity"]
+    assert 0.5 * VOCAB < before < 2 * VOCAB
+    opt = torch.optim.Adam(m.parameters(), lr=1e-2)
+    m.train()
+    for _ in range(80):
+        opt.zero_grad()
+        m(batch[0], labels=batch[0]).loss.backward()
+        opt.step()
+    after = perplexity(m, batch)["perplexity"]
+    assert after < 0.05 * VOCAB, f"perplexity only fell from {before:.1f} to {after:.1f}"
 
 
 def test_perplexity_restores_train_mode_and_respects_max_batches():

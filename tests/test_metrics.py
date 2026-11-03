@@ -144,7 +144,7 @@ def tiny_model() -> InkyModel:
         hidden_size=64, num_attention_heads=4, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=16,
         q_lora_rank=32, kv_lora_rank=24, intermediate_size=96, num_routed_experts=4, num_active_routed=2,
         ssm_state_dim=16, max_recurrent_loops=4, min_recurrent_loops=2, loop_dropout_prob=0.0,
-        max_position_embeddings=256, arlo_dim=16, arlo_pointer_rank=8, arlo_slots=4,
+        max_position_embeddings=256, arlo_dim=16, arlo_pointer_rank=8, arlo_slots=4, enable_arlo=True,
     )
     return InkyModel(config).eval()
 
