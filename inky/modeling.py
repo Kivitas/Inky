@@ -52,6 +52,8 @@ class InkyOutput:
     moe_aux_loss: Optional[torch.Tensor] = None
     mean_loops: Optional[torch.Tensor] = None  # expected loop count per token (ACT)
     hidden: Optional[torch.Tensor] = None      # final hidden states, set when return_hidden=True
+    loop_applications: Optional[int] = None    # token-loop pairs actually computed (early exit only)
+    full_loop_applications: Optional[int] = None  # tokens x loops, for the same input
 
 
 class InkyModel(PreTrainedModel):
@@ -291,6 +293,98 @@ class InkyModel(PreTrainedModel):
             return InkyOutput(hidden=h, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
         logits = self._project(h[:, -1:] if last_only else h)
         return InkyOutput(logits=logits, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
+
+    @torch.no_grad()
+    def forward_early_exit(
+        self,
+        input_ids: torch.Tensor,
+        halt_threshold: Optional[float] = None,
+        num_loops: Optional[int] = None,
+        return_hidden: bool = False,
+        last_only: bool = False,
+    ) -> InkyOutput:
+        """Inference with per-token early exit (batch size 1, no cache, no training).
+
+        A token exits as soon as its cumulative halting mass reaches ``halt_threshold``. The mass not
+        yet assigned is given to its exit state, so the output stays a probability-weighted mix. With
+        ``halt_threshold=None`` no token exits early, and the output matches ``forward`` on the same
+        input (checked in tests). Exited tokens keep their state and their stored keys and values, so
+        the remaining tokens attend to them without recomputing them.
+        """
+        if input_ids.shape[0] != 1:
+            raise ValueError("early exit needs batch size 1")
+        if halt_threshold is not None and not 0.0 < halt_threshold <= 1.0:
+            raise ValueError(f"halt_threshold must be in (0, 1], got {halt_threshold}")
+        S = input_ids.shape[1]
+        if S > self.config.max_position_embeddings:
+            raise ValueError(f"sequence length {S} exceeds max_position_embeddings")
+        self.eval()
+        cfg = self.config
+        L = num_loops if num_loops is not None else cfg.max_recurrent_loops
+
+        cos, sin = self.rope(0, S)
+        h = self.embed_tokens(input_ids)
+        for layer in self.pre_layers:
+            h, _, _ = layer(h, cos, sin, None)
+
+        state = h.clone()
+        stores = [
+            (
+                torch.zeros(1, S, cfg.kv_lora_rank, device=h.device, dtype=h.dtype),
+                torch.zeros(1, 1, S, cfg.qk_rope_head_dim, device=h.device, dtype=h.dtype),
+            )
+            for _ in self.core.layers
+        ]
+        active = torch.arange(S, device=h.device)
+        surv = torch.ones(S, device=h.device, dtype=torch.float32)   # probability of not stopped yet
+        cum = torch.zeros(S, device=h.device, dtype=torch.float32)   # halting mass assigned so far
+        out = torch.zeros(1, S, cfg.hidden_size, device=h.device, dtype=torch.float32)
+        exit_loop = torch.full((S,), float(L), device=h.device)
+        ssm_mem = None
+        computed = 0
+
+        for n in range(1, L + 1):
+            if active.numel() == 0:
+                break
+            out_act, ssm_mem = self.core.forward_subset(state, n, cos, sin, active, stores, ssm_mem)
+            computed += int(active.numel())
+            lam = self.halting(out_act).squeeze(0)                    # [K]
+            if n < L:
+                w = surv[active] * lam
+                surv_new = surv[active] * (1.0 - lam)
+            else:
+                w = surv[active]                                       # the remainder on the last loop
+                surv_new = torch.zeros_like(w)
+            out[0, active] += w.unsqueeze(-1) * out_act[0].float()
+            cum[active] += w
+            surv[active] = surv_new
+            state[0, active] = out_act[0]
+
+            if n == L or halt_threshold is None:
+                exit_now = torch.full_like(active, n == L, dtype=torch.bool)
+            else:
+                exit_now = cum[active] >= halt_threshold
+            if bool(exit_now.any()):
+                ex = active[exit_now]
+                out[0, ex] += surv[ex].unsqueeze(-1) * state[0, ex].float()   # unassigned mass
+                surv[ex] = 0.0
+                exit_loop[ex] = float(n)
+            active = active[~exit_now]
+
+        hidden = out.to(h.dtype)
+        for layer in self.post_layers:
+            hidden, _, _ = layer(hidden, cos, sin, None)
+        hidden = self.norm(hidden)
+        mean_loops = exit_loop.mean()
+        common = dict(
+            mean_loops=mean_loops,
+            loop_applications=computed,
+            full_loop_applications=S * L,
+        )
+        if return_hidden:
+            return InkyOutput(hidden=hidden, **common)
+        logits = self._project(hidden[:, -1:] if last_only else hidden)
+        return InkyOutput(logits=logits, **common)
 
     # ------------------------------------------------------------------ writing decisions
 

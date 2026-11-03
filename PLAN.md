@@ -55,7 +55,7 @@ it tells us. It assumes no training data has been chosen yet.
 | Trend | Inky today | Gap |
 | :--- | :--- | :--- |
 | Hybrid attention + cheap recurrence | Attention in every block; a small SSM highway across loops | No SSM *layer*. Candidate for a Nemotron-style hybrid core. |
-| Looped depth | Yes: 6 loops, PonderNet halting, FiLM per loop | Halting saves no compute, because every loop runs (CORE-01). The per-loop loss is meant to reduce loop-count dependence (CORE-02), untested. Per-token early exit needs KV reuse, which is next. |
+| Looped depth | Yes: 6 loops, PonderNet halting, FiLM per loop | Inference early exit with KV reuse is in place (`forward_early_exit`, batch size 1, no generation cache). Output drift is large on the untrained model, so it needs measuring after training. The per-loop loss is meant to reduce loop-count dependence (CORE-02), untested. |
 | Sparse experts | Yes: 1 shared + 8 routed, top-2 | Fine. Expert count is untested. |
 | Latent KV cache | Yes, with absorbed decoding | Cache is already small. KV quantization adds little. |
 | Muon optimiser | Yes, with EOS's update scale | Moonlight's scale fix is behind `scale_mode`, default off. |
@@ -143,4 +143,4 @@ machine (CPU, no training data yet).
 | 9 Selective SSM mixer | `inky/layers.py` (`SelectiveSSMMixer`), `ssm_mixer_layers` | Done; off by default; tested |
 | 10 Distillation loss | `inky/distill.py` | Done, tested; no teacher or training yet |
 
-Test suite: 121 passing (after the critique fixes; see docs/critique/).
+Test suite: 141 passing (see docs/critique/ for the open items).

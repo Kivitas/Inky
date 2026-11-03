@@ -157,6 +157,47 @@ class MultiLatentAttention(nn.Module):
         out_c = torch.matmul(probs, c_kv.unsqueeze(1))                 # [B, H, 1, r]
         return torch.einsum("bhsr,hvr->bhsv", out_c, w_uv)             # [B, H, 1, v]
 
+    def forward_subset(
+        self,
+        x_act: torch.Tensor,
+        active: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        store: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Inference-only attention for the tokens still running (batch size 1).
+
+        ``x_act`` is [1, K, D] for the positions in ``active`` (LongTensor [K]). Queries are computed
+        only for those positions. Keys and values come from ``store``, a pair of full-length latent
+        buffers ([1, S, rank] and [1, 1, S, rope]). Active positions overwrite their latents; the rest
+        keep the latents from the last loop in which they were active (KV reuse for exited tokens).
+        """
+        _, K, _ = x_act.shape
+        H = self.num_heads
+        q = self.q_b_proj(self.q_a_norm(self.q_a_proj(x_act))).view(1, K, H, self.qk_dim).transpose(1, 2)
+        q_nope, q_pe = q.split([self.nope_dim, self.rope_dim], dim=-1)
+        q_pe = apply_rope(q_pe, cos[active], sin[active])
+
+        c, k_pe = self.kv_a_proj(x_act).split([self.kv_rank, self.rope_dim], dim=-1)
+        c = self.kv_a_norm(c)
+        k_pe = apply_rope(k_pe.unsqueeze(1), cos[active], sin[active])  # [1, 1, K, rope]
+
+        c_store, kpe_store = store
+        c_store[:, active] = c.to(c_store.dtype)
+        kpe_store[:, :, active] = k_pe.to(kpe_store.dtype)
+
+        S = c_store.shape[1]
+        kv = self.kv_b_proj(c_store).view(1, S, H, self.nope_dim + self.v_dim).transpose(1, 2)
+        k_nope, v = kv.split([self.nope_dim, self.v_dim], dim=-1)
+        k = torch.cat([k_nope, kpe_store.expand(1, H, S, self.rope_dim)], dim=-1)
+        q_full = torch.cat([q_nope, q_pe], dim=-1)
+        # Query at absolute position active[i] may attend to keys j <= active[i].
+        positions = torch.arange(S, device=x_act.device)
+        mask = positions.unsqueeze(0) <= active.unsqueeze(1)           # [K, S]
+        out = F.scaled_dot_product_attention(q_full, k, v, attn_mask=mask)
+        out = out.transpose(1, 2).reshape(1, K, H * self.v_dim)
+        return self.o_proj(out)
+
 
 class SelectiveSSMMixer(nn.Module):
     """Causal selective state-space mixer, an optional replacement for latent attention.
@@ -309,6 +350,22 @@ class InkyBlock(nn.Module):
             return out, None, aux
         return self._forward(x, cos, sin, past)
 
+    def forward_subset(
+        self,
+        x_act: torch.Tensor,
+        active: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        store: Tuple[torch.Tensor, torch.Tensor],
+    ) -> torch.Tensor:
+        """Inference-only block for the active tokens. See MultiLatentAttention.forward_subset."""
+        if not isinstance(self.attn, MultiLatentAttention):
+            raise NotImplementedError("early exit supports latent-attention blocks only")
+        attn_out = self.attn.forward_subset(self.input_norm(x_act), active, cos, sin, store)
+        x = x_act + attn_out * self.residual_scale
+        mlp_out, _ = self.mlp(self.post_norm(x))
+        return x + mlp_out * self.residual_scale
+
 
 class LoopStepModulation(nn.Module):
     """FiLM scale and shift that depend on the loop index. Starts as the identity."""
@@ -408,6 +465,33 @@ class RecurrentCore(nn.Module):
         beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(1, 1, -1)
         out = (1.0 - beta) * h_in + beta * h
         return out, mem, new_prefix, presents, aux
+
+    def forward_subset(
+        self,
+        state: torch.Tensor,
+        step: int,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        active: torch.Tensor,
+        stores: List[Tuple[torch.Tensor, torch.Tensor]],
+        prev_mem: Optional[torch.Tensor],
+    ):
+        """Inference-only loop step for the active tokens (batch size 1).
+
+        ``state`` [1, S, D] holds every token's current loop state; exited tokens keep their final
+        state. The SSM highway runs over all positions (it is cheap), and the attention blocks run
+        only on ``active``. Returns the new states of the active tokens [1, K, D] and the SSM memory.
+        """
+        x = state
+        if self.step_mod is not None:
+            x = self.step_mod(x, step)
+        x, mem, _ = self.ssm(x, prev_mem, None, 0)
+        x_act = x[:, active]
+        h_in_act = state[:, active]
+        for j, layer in enumerate(self.layers):
+            x_act = layer.forward_subset(x_act, active, cos, sin, stores[j])
+        beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(1, 1, -1)
+        return (1.0 - beta) * h_in_act + beta * x_act, mem
 
 
 class PonderHalting(nn.Module):
