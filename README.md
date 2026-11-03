@@ -27,8 +27,10 @@ Each block is a latent-KV attention layer (about 0.44 M) plus a shared-expert Mo
 expert and eight routed experts, with two routed experts active per token (about 7.3 M).
 
 Effective depth is 1 + 2 × 6 + 1 = **14 layer applications**. Training samples between 2 and 6
-loops per batch. Inference uses 6 loops unless `num_loops` is passed. Every token runs every loop, so
-halting does not reduce this cost (see Known issues).
+loops per batch. Inference uses 6 loops unless `num_loops` is passed. Training always runs every loop.
+For inference, `forward_early_exit(ids, halt_threshold=...)` lets tokens stop early (batch size 1, no
+generation cache). It cuts the token-loop work, but the output drifts from the full forward pass, so
+check it against the evaluation harness before using it (see below).
 
 ## Architecture
 
@@ -53,7 +55,7 @@ tokens → embedding
 | Recurrent core | One set of shared layers applied repeatedly. Gives depth without extra parameters. | `RecurrentCoreBlock` |
 | Step modulation | FiLM scale and shift per loop index. Starts as the identity. | `StepModulation` |
 | State-space highway | Carries a per-position memory across loops. Its causal running mean is cached for decoding. | `StateSpaceMemoryHighway` |
-| PonderNet halting | Each loop emits a stop probability; the halting distribution is pulled to a geometric prior (mean 3 loops) by a KL term, and each loop's state is trained on its own, weighted by its halting probability. Every loop still runs, so halting saves no compute yet. | PonderNet (arXiv 2107.05407, see docs/research/act.md) |
+| PonderNet halting | Each loop emits a stop probability; the halting distribution is pulled to a geometric prior (mean 3 loops) by a KL term, and each loop's state is trained on its own, weighted by its halting probability. Training runs every loop. Inference can exit early per token (`forward_early_exit`). | PonderNet (arXiv 2107.05407, see docs/research/act.md) |
 | Chunked loss | Next-token cross-entropy and z-loss in chunks, so full 8k × 50k logits never exist at once. | `chunked_ce` |
 | Scratch reduction | The model may draft notes, then close the block. Reduction deletes the notes and keeps the text. | PENCIL (arXiv:2503.14337) |
 
@@ -180,7 +182,7 @@ High-severity findings from the critique files in `docs/critique/`. Each one is 
 - DATA-02: dedupe and packing hold all data in memory and do not scale to a real corpus ([data_docs.md](docs/critique/data_docs.md)).
 - TEST-01: the speculative-decoding tests pass on a degenerate output and cannot detect a broken decoder ([data_docs.md](docs/critique/data_docs.md)).
 - TEST-02: the bad-word test cannot fail, so the ban is unverified ([data_docs.md](docs/critique/data_docs.md)).
-- CORE-01: halting never exits early, so every token runs every loop and halting saves no compute. Halting is now PonderNet, but compute is unchanged ([core.md](docs/critique/core.md), [act.md](docs/research/act.md)).
+- CORE-01: partly addressed. Inference-only early exit with stored keys and values is in `forward_early_exit`. It cuts token-loop work to about a third at threshold 0.5 on the untrained model, with a large output drift (relative 0.2 to 0.5). Training is unchanged, and the drift is unmeasured on trained weights ([core.md](docs/critique/core.md), [act.md](docs/research/act.md)).
 - CORE-02: each output is a weighted mix over loop states, so changing `num_loops` changes the function, not only the depth ([core.md](docs/critique/core.md)).
 
 ## Sources for the style controls
