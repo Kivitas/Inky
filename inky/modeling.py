@@ -50,7 +50,7 @@ class InkyOutput:
     logits: Optional[torch.Tensor] = None
     past: Optional[InkyCache] = None
     moe_aux_loss: Optional[torch.Tensor] = None
-    mean_loops: Optional[torch.Tensor] = None  # expected loop count per token (ACT)
+    mean_loops: Optional[torch.Tensor] = None  # expected loop count per token (PonderNet)
     hidden: Optional[torch.Tensor] = None      # final hidden states, set when return_hidden=True
     loop_applications: Optional[int] = None    # token-loop pairs actually computed (early exit only)
     full_loop_applications: Optional[int] = None  # tokens x loops, for the same input

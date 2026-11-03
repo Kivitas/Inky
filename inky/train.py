@@ -26,7 +26,8 @@ def wsd_lr_scale(
     """Warmup-stable-decay multiplier in [0, 1] for a 0-based ``step`` in ``[0, total_steps - 1]``.
 
     Linear warmup from 0 to 1 over ``warmup_steps`` (step 0 gives 0), flat at 1, then a linear decay
-    over the last ``decay_fraction * total_steps`` steps that reaches 0 at the final step.
+    over the last ``decay_fraction * total_steps`` steps. The decay reaches 0 just after the final step,
+    so the final update still has a nonzero rate.
     """
     if total_steps < 1:
         raise ValueError(f"total_steps must be >= 1, got {total_steps}")
@@ -40,7 +41,7 @@ def wsd_lr_scale(
 
     decay_len = int(decay_fraction * total_steps)
     if decay_len > 0:
-        remaining = max(0, total_steps - 1 - step)
+        remaining = max(0, total_steps - step)
         decay = min(1.0, remaining / decay_len)
     else:
         decay = 1.0
@@ -110,7 +111,7 @@ def train(
     steps: int,
     eval_batches: Optional[Iterable[torch.Tensor]] = None,
     eval_every: int = 0,
-    warmup_steps: int = 0,
+    warmup_steps: Optional[int] = None,
     decay_fraction: float = 0.2,
     max_grad_norm: Optional[float] = 1.0,
     use_loop_curriculum: bool = False,
@@ -123,7 +124,9 @@ def train(
 ) -> List[Dict[str, Any]]:
     """Run optimiser steps up to the total ``steps`` and return the history of the steps run.
 
-    ``steps`` is the total run length: schedules (LR, curriculum) are always computed from it. With
+    ``steps`` is the total run length: schedules (LR, curriculum) are always computed from it. When
+    ``warmup_steps`` is None it defaults to 5% of ``steps`` (at least 1), so a fresh run never starts at
+    full learning rate. With
     ``resume_from`` set to a directory written by ``save_training_state``, weights and optimiser state
     are restored and the run continues from the step after the saved one, so the returned history only
     holds the new steps.
@@ -142,6 +145,8 @@ def train(
         raise ValueError(f"steps must be >= 1, got {steps}")
     if max_skipped_steps < 0:
         raise ValueError(f"max_skipped_steps must be >= 0, got {max_skipped_steps}")
+    if warmup_steps is None:
+        warmup_steps = max(1, steps // 20)
 
     batches = list(train_batches)
     if not batches:

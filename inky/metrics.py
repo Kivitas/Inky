@@ -22,8 +22,6 @@ from typing import Dict, Iterable, List, Optional, Sequence
 
 import torch
 
-from .style import banned_by_bad_words
-
 NA = None
 
 
@@ -251,11 +249,20 @@ def text_report(
     top = Counter(ids).most_common(1)
     report["most_frequent_token_share"] = _div(top[0][1], n) if top else None
 
+    # Count the positions where a blocked entry ends in the text. This checks the output itself, not
+    # the sampler's ban rule, so a decoder that failed to block a phrase shows up here.
     hits = 0
     if bad_word_ids:
-        for i in range(n):
-            if ids[i] in banned_by_bad_words(ids[:i], bad_word_ids):
-                hits += 1
+        ends = set()
+        for seq in bad_word_ids:
+            k = len(seq)
+            if k == 0 or k > n:
+                continue
+            target = tuple(seq)
+            for i in range(k - 1, n):
+                if tuple(ids[i - k + 1:i + 1]) == target:
+                    ends.add(i)
+        hits = len(ends)
     report["blocked_phrase_hits"] = hits if bad_word_ids else None
     return report
 
