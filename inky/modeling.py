@@ -1,4 +1,4 @@
-"""Inky language model: pre layers, a looped recurrent core with ACT halting, post layers."""
+"""Inky language model: pre layers, a looped recurrent core with PonderNet halting, post layers."""
 
 import random
 from dataclasses import dataclass
@@ -13,7 +13,17 @@ from transformers import PreTrainedModel
 from .config import InkyConfig
 from .arlo import Arlo
 from .metrics import binary_report, choice_report, print_report, text_report
-from .layers import HaltingUnit, InkyBlock, KVEntry, RecurrentCore, RMSNorm, RotaryEmbedding
+from .layers import (
+    InkyBlock,
+    KVEntry,
+    PonderHalting,
+    RecurrentCore,
+    RMSNorm,
+    RotaryEmbedding,
+    geometric_halting_weights,
+    geometric_prior,
+    pondernet_kl,
+)
 from .scratch import reduce_scratch
 from .style import banned_by_bad_words, banned_by_no_repeat_ngram
 
@@ -57,12 +67,11 @@ class InkyModel(PreTrainedModel):
         self.core = RecurrentCore(config)
         self.post_layers = nn.ModuleList(InkyBlock(config) for _ in range(config.num_post_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.halting = HaltingUnit(config.hidden_size)
+        self.halting = PonderHalting(config.hidden_size, config.ponder_prior_steps)
         self.arlo = Arlo(config) if config.enable_arlo else None
         self.post_init()
-        # Start with a low halting probability so tokens use most of the loop budget at first.
-        # Set after post_init, which would otherwise reset the bias to zero.
-        nn.init.constant_(self.halting.gate.bias, -2.0)
+        # Start the halting gate at its prior. Set after post_init, which would reset the bias.
+        self.halting.reset_prior()
 
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
@@ -136,6 +145,40 @@ class InkyModel(PreTrainedModel):
         n_valid = (y != -100).sum().clamp(min=1).float()
         return ce_total / n_valid, z_total / n_valid
 
+    def _chunk_weighted_ce(self, h: torch.Tensor, y: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
+        logits = self._project(h)
+        ce = F.cross_entropy(logits, y, ignore_index=-100, reduction="none")
+        return (ce * w).sum()
+
+    def _weighted_step_ce(
+        self,
+        loop_states: Sequence[torch.Tensor],
+        weights: torch.Tensor,
+        labels: torch.Tensor,
+        chunk_size: int = 1024,
+    ) -> torch.Tensor:
+        """Next-token cross-entropy of every loop state, weighted by its halting probability.
+
+        This trains each loop's state to predict on its own, so a shorter loop budget gives a
+        usable output and not only a partly trained one. Divided by the number of valid tokens.
+        """
+        y = labels[:, 1:].reshape(-1)
+        n_valid = (y != -100).sum().clamp(min=1).float()
+        total = weights.new_zeros((), dtype=torch.float32)
+        D = self.config.hidden_size
+        for n, state in enumerate(loop_states):
+            hn = self.norm(state)[:, :-1].reshape(-1, D)
+            wn = weights[n][:, :-1].reshape(-1).float()
+            for start in range(0, hn.shape[0], chunk_size):
+                hc = hn[start:start + chunk_size]
+                yc = y[start:start + chunk_size]
+                wc = wn[start:start + chunk_size]
+                if self.training and torch.is_grad_enabled():
+                    total = total + checkpoint(self._chunk_weighted_ce, hc, yc, wc, use_reentrant=False)
+                else:
+                    total = total + self._chunk_weighted_ce(hc, yc, wc)
+        return total / n_valid
+
     # ------------------------------------------------------------------ forward
 
     def forward(
@@ -182,15 +225,13 @@ class InkyModel(PreTrainedModel):
             cache.core = [None] * loops
             cache.prefix = [None] * loops
 
-        # ACT over the recurrent loops. Every token's output is a weighted sum of the loop states,
-        # with weights that add up to 1. The loop never exits early, so cached decoding matches the
-        # full forward pass exactly.
-        thr = self.config.act_threshold
-        accum = torch.zeros(B, S, device=h.device, dtype=torch.float32)
-        halted = torch.zeros(B, S, device=h.device, dtype=torch.bool)
-        h_out = torch.zeros(B, S, self.config.hidden_size, device=h.device, dtype=torch.float32)
-        ponder = torch.zeros(B, S, device=h.device, dtype=torch.float32)
+        # PonderNet halting over the recurrent loops. Each loop emits lambda_n(t); the halting
+        # distribution p_n(t) puts stop mass on each loop, and the output is the expectation of the
+        # loop states under p. Every loop still runs, so cached decoding matches the full forward
+        # pass exactly. This version saves no compute (see README, Known issues).
         h_loop, prev_mem = h, None
+        lambdas: List[torch.Tensor] = []
+        loop_states: List[torch.Tensor] = []
 
         for step in range(1, loops + 1):
             idx = step - 1
@@ -210,24 +251,15 @@ class InkyModel(PreTrainedModel):
             prev_mem = mem
             moe_aux = moe_aux + aux
 
-            velocity = (h_next - h_loop).float().norm(dim=-1)
-            p = self.halting(h_next, velocity)
-            ponder = ponder + torch.where(halted, torch.zeros_like(accum), 1.0 - accum)
-
-            is_last = torch.zeros_like(halted)
-            if step < loops:
-                is_last = (accum + p >= thr) & ~halted
-                if step < self.config.act_min_loops:
-                    is_last = torch.zeros_like(is_last)
-                w = torch.where(is_last, 1.0 - accum, p)
-            else:
-                w = 1.0 - accum  # the final loop takes whatever probability is left
-            w = torch.where(halted, torch.zeros_like(w), w).clamp(min=0.0)
-
-            h_out = h_out + w.unsqueeze(-1) * h_next.float()
-            accum = accum + w
-            halted = halted | is_last
+            lambdas.append(self.halting(h_next))
+            loop_states.append(h_next)
             h_loop = h_next
+
+        weights = geometric_halting_weights(lambdas)                 # [L, B, S], sums to 1 over L
+        states = torch.stack(loop_states, dim=0).float()             # [L, B, S, D]
+        h_out = (weights.unsqueeze(-1) * states).sum(dim=0)          # [B, S, D]
+        loop_index = torch.arange(1, loops + 1, device=h.device, dtype=torch.float32).view(-1, 1, 1)
+        mean_loops = (weights * loop_index).sum(dim=0).mean()        # expected loops per token
 
         h = h_out.to(h.dtype)
         for i, layer in enumerate(self.post_layers):
@@ -240,11 +272,19 @@ class InkyModel(PreTrainedModel):
             cache.seq_len += S
 
         h = self.norm(h)
-        mean_loops = ponder.mean()
 
         if labels is not None:
             ce, z = self._lm_loss(h, labels)
-            loss = ce + self.config.z_loss_coef * z + moe_aux + self.config.ponder_loss_coef * mean_loops
+            step_ce = self._weighted_step_ce(loop_states, weights, labels)
+            prior = geometric_prior(loops, self.halting.prior_lambda, device=h.device)
+            kl = pondernet_kl(weights, prior)
+            loss = (
+                ce
+                + self.config.z_loss_coef * z
+                + moe_aux
+                + self.config.ponder_step_loss_coef * step_ce
+                + self.config.ponder_kl_coef * kl
+            )
             return InkyOutput(loss=loss, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
 
         if return_hidden:

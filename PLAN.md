@@ -55,7 +55,7 @@ it tells us. It assumes no training data has been chosen yet.
 | Trend | Inky today | Gap |
 | :--- | :--- | :--- |
 | Hybrid attention + cheap recurrence | Attention in every block; a small SSM highway across loops | No SSM *layer*. Candidate for a Nemotron-style hybrid core. |
-| Looped depth | Yes: 6 loops, ACT halting, FiLM per loop | Halting saves no compute, because every loop runs (CORE-01). Loop count changes the output (CORE-02). Per-token loop allocation is an open question. |
+| Looped depth | Yes: 6 loops, PonderNet halting, FiLM per loop | Halting saves no compute, because every loop runs (CORE-01). The per-loop loss is meant to reduce loop-count dependence (CORE-02), untested. Per-token early exit needs KV reuse, which is next. |
 | Sparse experts | Yes: 1 shared + 8 routed, top-2 | Fine. Expert count is untested. |
 | Latent KV cache | Yes, with absorbed decoding | Cache is already small. KV quantization adds little. |
 | Muon optimiser | Yes, with EOS's update scale | Moonlight's scale fix is behind `scale_mode`, default off. |

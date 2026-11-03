@@ -1,7 +1,7 @@
 """Configuration for Inky: a ~50M-parameter recurrent language model for creative writing.
 
 Inky keeps the language-model path of EOS (parameter-shared recurrent core, latent-KV
-attention, shared-expert sparse MoE, SSM memory highway, ACT halting) at a smaller scale.
+attention, shared-expert sparse MoE, SSM memory highway, PonderNet halting) at a smaller scale.
 The Rhen decision layer is not included, because it only serves typed decision questions.
 
 Inky also adds PENCIL-style scratch reduction (arXiv:2503.14337): the model may draft a
@@ -39,10 +39,11 @@ class InkyConfig(PretrainedConfig):
         loop_dropout_prob: float = 0.1,
         use_step_modulation: bool = True,  # FiLM scale/shift per loop step
         ssm_state_dim: int = 64,           # State-space memory highway width
-        # ACT halting (per token)
-        act_threshold: float = 0.9,
-        act_min_loops: int = 2,
-        ponder_loss_coef: float = 1e-3,
+        # PonderNet halting (per token). The stop probability at each loop is learned; the halting
+        # distribution is pulled towards a geometric prior with mean ponder_prior_steps loops.
+        ponder_prior_steps: float = 3.0,   # expected loops under the prior (lambda_prior = 1 / this)
+        ponder_kl_coef: float = 1e-3,      # weight of KL(halting || prior)
+        ponder_step_loss_coef: float = 1.0,  # weight of the per-loop LM loss, weighted by halting probability
         # Shared-expert fine-grained MoE
         intermediate_size: int = 704,      # per-expert SwiGLU width
         num_shared_experts: int = 1,
@@ -96,9 +97,9 @@ class InkyConfig(PretrainedConfig):
         self.loop_dropout_prob = loop_dropout_prob
         self.use_step_modulation = use_step_modulation
         self.ssm_state_dim = ssm_state_dim
-        self.act_threshold = act_threshold
-        self.act_min_loops = act_min_loops
-        self.ponder_loss_coef = ponder_loss_coef
+        self.ponder_prior_steps = ponder_prior_steps
+        self.ponder_kl_coef = ponder_kl_coef
+        self.ponder_step_loss_coef = ponder_step_loss_coef
         self.intermediate_size = intermediate_size
         self.num_shared_experts = num_shared_experts
         self.num_routed_experts = num_routed_experts

@@ -1,7 +1,7 @@
 """Building blocks for Inky: norms, RoPE, latent-KV attention, shared-expert MoE, recurrent core."""
 
 import math
-from typing import List, Optional, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn
@@ -410,15 +410,58 @@ class RecurrentCore(nn.Module):
         return out, mem, new_prefix, presents, aux
 
 
-class HaltingUnit(nn.Module):
-    """Per-token probability of stopping the loop, from the current loop state."""
+class PonderHalting(nn.Module):
+    """PonderNet halting: lambda_n(t) is the probability that token t stops at loop n, given the
+    loop state h_n(t). The probability of stopping exactly at loop n is
+    lambda_n * prod_{j<n} (1 - lambda_j); see ``geometric_halting_weights``.
+    """
 
-    def __init__(self, hidden_size: int):
+    def __init__(self, hidden_size: int, prior_steps: float):
         super().__init__()
+        if prior_steps < 1.0:
+            raise ValueError(f"ponder_prior_steps must be >= 1, got {prior_steps}")
         self.gate = nn.Linear(hidden_size, 1)
+        self.prior_lambda = 1.0 / prior_steps
 
-    def forward(self, h: torch.Tensor, velocity: torch.Tensor) -> torch.Tensor:
-        p = torch.sigmoid(self.gate(h).float()).squeeze(-1)
-        # Tokens that barely moved in the last loop are more likely to stop.
-        boost = torch.exp(-2.0 * velocity / math.sqrt(h.shape[-1]))
-        return torch.clamp(p + 0.25 * boost, 0.0, 1.0)
+    def reset_prior(self) -> None:
+        """Start the gate at the prior, so the initial halting distribution matches the prior.
+        Call after the model's post_init, which would otherwise reset the bias."""
+        p = self.prior_lambda
+        nn.init.constant_(self.gate.bias, math.log(p / (1.0 - p)))
+
+    def forward(self, h: torch.Tensor) -> torch.Tensor:
+        """h [B, S, D] -> lambda [B, S] in (0, 1)."""
+        return torch.sigmoid(self.gate(h).float()).squeeze(-1)
+
+
+def geometric_halting_weights(lambdas: Sequence[torch.Tensor]) -> torch.Tensor:
+    """Halting distribution over loops from per-loop stop probabilities.
+
+    ``lambdas`` holds L tensors of shape [B, S] (lambda_1 .. lambda_L). Returns [L, B, S] with
+    p_n = lambda_n * prod_{j<n}(1 - lambda_j) for n < L, and p_L = prod_{j<L}(1 - lambda_j), the
+    remainder. The weights sum to 1 over n for every token. The last lambda is not used.
+    """
+    L = len(lambdas)
+    surv = torch.ones_like(lambdas[0], dtype=torch.float32)
+    weights = []
+    for n, lam in enumerate(lambdas):
+        if n < L - 1:
+            weights.append(surv * lam)
+            surv = surv * (1.0 - lam)
+        else:
+            weights.append(surv)
+    return torch.stack(weights, dim=0)
+
+
+def geometric_prior(num_loops: int, lam: float, device=None) -> torch.Tensor:
+    """Truncated geometric prior over loops 1..L with stop probability ``lam``. Returns [L]."""
+    probs = [lam * (1.0 - lam) ** n for n in range(num_loops - 1)]
+    probs.append((1.0 - lam) ** (num_loops - 1))
+    return torch.tensor(probs, dtype=torch.float32, device=device)
+
+
+def pondernet_kl(weights: torch.Tensor, prior: torch.Tensor) -> torch.Tensor:
+    """Mean over tokens of KL(p || prior) for weights [L, B, S] and prior [L]."""
+    p = weights.clamp(min=1e-12)
+    q = prior.clamp(min=1e-12).view(-1, 1, 1)
+    return (weights * (p.log() - q.log())).sum(dim=0).mean()
