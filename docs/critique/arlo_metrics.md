@@ -1,5 +1,28 @@
 # Critique: Arlo decision maker and metrics
 
+## Status (checked against the code, 2026-11-03)
+
+Checked against the working tree at commit f7299ea plus uncommitted changes. **Line numbers in the
+findings below are from an older commit and may not match the current code.** The finding text is
+kept as written. Legend: **FIXED** = the fix is in the code (a note says which part, for example opt-in). **OPEN** = the problem remains or is only partly fixed (the note says which part). **ACCEPTED-DESIGN** = a deliberate design choice, not a defect; it is documented and was not changed. **NOT-A-BUG** = checked, and the claim does not hold for the code as designed. **UNVERIFIED** = could not be checked here.
+
+Counts for this file: 10 FIXED, 2 OPEN (of 12).
+
+| ID | Severity | Status | Evidence in current code |
+| :--- | :--- | :--- | :--- |
+| ARLO-01 | high | FIXED | `train_arlo` trains only the Arlo parameters, with the language model frozen (`arlo.py:217-284`). `enable_arlo` defaults to False. `decide_*` still does not warn when the engine is untrained, so use its output only after `train_arlo`. |
+| ARLO-02 | high | OPEN | The options run in one batched forward instead of N forwards. The prefix is still recomputed for each option, with no cache. |
+| MET-01 | high | FIXED | A class with gold counts as 0 in macro precision, recall and F1 (`choice_report`). |
+| MET-02 | high | FIXED | F-beta and per-option F1 are 0 when precision and recall are both 0. |
+| ARLO-03 | medium | OPEN | The query still comes only from the prefix (`h[:1, P - 1]`, `modeling.py:559`). `choice_scores` lets the options attend to each other, which is a partial mitigation. |
+| ARLO-04 | medium | FIXED | `summarise` weights the projected slots by their match with the query (softmax over slots), not a plain mean. |
+| ARLO-05 | medium | FIXED | `decide_choice` and `decide_binary` restore the previous train/eval mode (`was_training` in `modeling.py`). |
+| MET-03 | medium | FIXED | Confidence is computed for the decision made (`x if pred == 1 else 1 - x`). |
+| MET-04 | medium | FIXED | Balanced accuracy is None unless recall and specificity are both defined. |
+| MET-07 | medium | FIXED | `split_heldout` raises `ValueError` when the train part would be empty (`evaluation.py:47-48`). |
+| MET-05 | low | FIXED | Gold out of range, an empty choice set and binary labels other than 0 or 1 raise `ValueError` (`metrics.py:76, 168, 189`). |
+| MET-06 | low | FIXED | Top-1 uses the same argsort order as the ranks. |
+
 Scope: `inky/arlo.py`, `decide_choice` and `decide_binary` in `inky/modeling.py`, `inky/metrics.py`, `inky/evaluation.py`.
 No files under `inky/` or `tests/` were edited. Repro scripts ran from the session scratchpad with `PYTHONDONTWRITEBYTECODE=1`, so no `__pycache__` was written to the project.
 

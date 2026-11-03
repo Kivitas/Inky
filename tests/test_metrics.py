@@ -120,6 +120,14 @@ def test_text_indicators_match_hand_computation():
     assert r["blocked_phrase_hits"] == 1
 
 
+def test_blocked_phrase_hits_count_occurrences_in_the_text():
+    # Two occurrences of the blocked pair, and a lone prefix token that must not count.
+    assert text_report([7, 8, 5, 7, 8], bad_word_ids=[[7, 8]])["blocked_phrase_hits"] == 2
+    assert text_report([7, 5, 9], bad_word_ids=[[7, 8]])["blocked_phrase_hits"] == 0
+    # A one-token entry counts every occurrence.
+    assert text_report([4, 4, 1], bad_word_ids=[[4]])["blocked_phrase_hits"] == 2
+
+
 def test_format_report_displays_the_named_indicators():
     text = format_report(binary_report([0.9, 0.8, 0.3, 0.2, 0.6], [1, 0, 0, 1, 1]))
     for word in ("true positives", "true negatives", "false positives", "false negatives",
@@ -136,7 +144,7 @@ def tiny_model() -> InkyModel:
         hidden_size=64, num_attention_heads=4, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=16,
         q_lora_rank=32, kv_lora_rank=24, intermediate_size=96, num_routed_experts=4, num_active_routed=2,
         ssm_state_dim=16, max_recurrent_loops=4, min_recurrent_loops=2, loop_dropout_prob=0.0,
-        max_position_embeddings=256, arlo_dim=16, arlo_pointer_rank=8, arlo_slots=4,
+        max_position_embeddings=256, arlo_dim=16, arlo_pointer_rank=8, arlo_slots=4, enable_arlo=True,
     )
     return InkyModel(config).eval()
 

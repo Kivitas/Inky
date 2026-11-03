@@ -1,8 +1,11 @@
 # Inky: improvement plan (cost-first)
 
-Status: Inky is an untrained 50.6M-parameter model with its code and tests in place. Nothing
-about its writing quality has been measured yet. This plan orders work by cost and by how much
-it tells us. It assumes no training data has been chosen yet.
+Status: Inky is an untrained model with its code and tests in place: 50.22M parameters by default,
+50.61M with Arlo enabled. Phase 0 code is written. The Phase 1 training code (loop, curriculum, data
+pipeline, command-line entry point) is written and smoke-tested, but no training run has started: there
+is no corpus, no compute budget and no training run. Nothing about its writing quality has been measured.
+This plan orders work by cost and by how much it tells us. Open items are tracked in
+docs/critique/STATUS.md.
 
 ## 1. What the research says (as of this search)
 
@@ -60,7 +63,7 @@ it tells us. It assumes no training data has been chosen yet.
 | Latent KV cache | Yes, with absorbed decoding | Cache is already small. KV quantization adds little. |
 | Muon optimiser | Yes, with EOS's update scale | Moonlight's scale fix is behind `scale_mode`, default off. |
 | Low-cost inference | fp32 weights by default (~190 MB). Int8 and 4-bit weight quantization in `inky/quantize.py`. | Tested on the tiny config only. Not measured on a trained model. |
-| Speculative decoding | Yes, `inky/speculative.py` | Tests are weak (TEST-01). Acceptance rate not measured. Loops give a natural cheap drafter (see §3). |
+| Speculative decoding | Yes, `inky/speculative.py`, greedy only | Tests now check for varied output (TEST-01 fixed). Acceptance rate not measured. No writing controls. Loops give a natural cheap drafter (see §3). |
 | Scratch reduction, prose controls | Yes (untrained) | Need a measurement to show they help. |
 
 ## 3. Plan, ordered by cost
@@ -83,7 +86,7 @@ machine (CPU, no training data yet).
 4. **Muon update-scale option.** Add Moonlight's scale fix behind a flag, default off. *Check:* the
    existing optimiser tests pass, and the loss curve on a fixed batch is compared with and without it.
 
-### Phase 1: needs a data decision (your call)
+### Phase 1: code written, no run (needs owner input, see section 6)
 
 5. **Training loop with checkpointing and logging.** Use the hybrid optimiser, the loop-count
    sampling already in the model, and a cosine or WSD schedule. Start at short context (1,024)
@@ -124,9 +127,24 @@ machine (CPU, no training data yet).
 
 ## 6. What I need from you
 
-- A **data source** for Phase 1 (licensed or public-domain writing, and how much).
-- **Compute**: a GPU, or CPU only. This decides whether the 8k context is practical.
-- Whether to proceed through **Phase 0** now. It needs no data and no training.
+Phase 1 cannot start until these are decided:
+
+- **Corpus**: the source, its licence (licensed or public-domain writing), and its size. Nothing
+  has been chosen, so the model has no training data.
+- **Compute budget**: a GPU or CPU only, and the hours available. This decides whether the 8k
+  context is practical.
+- **Corpus**: as above, plus the text field name and whether any source needs a different
+  `min_chars` than the default of 20 (DATA-03 changed that default from 200).
+- **Tokenizer location**: the path to `EOS_Tokenizer/` (currently an external project), and
+  approval to add the three scratch special tokens (ids 50000 to 50002) to it. Until those ids exist,
+  `reduce_scratch_blocks=True` cannot be used.
+- **Licence**: the repository has no LICENSE file. The choice is yours.
+- **Framing of the style controls**: the README says detector evasion is not a validated capability.
+  Decide whether the bad-word, stock-phrase and n-gram controls stay described as detector-related
+  or are reframed as variety controls only. This is a decision for the owner; nothing has been changed.
+- **Behaviour changes to accept**: the new defaults (`min_chars` 20, `step_ce_token_fraction` 0.25,
+  256-token scratch note cap, reserved-id blocking) change what the data and decoding look like.
+  Runs made before these changes are not comparable with runs after them.
 
 ## 7. Status (code written and tested; no training run)
 
@@ -134,13 +152,14 @@ machine (CPU, no training data yet).
 | :--- | :--- | :--- |
 | 1 Evaluation harness | `inky/evaluation.py` | Done, tested |
 | 2 Quantization | `inky/quantize.py` | Done, tested on the tiny config |
-| 3 Self-speculative decoding | `inky/speculative.py` | Done; output matches greedy in tests, but the tests cannot detect a broken decoder (TEST-01) |
-| 4 Muon scale option | `inky/optim.py` (`scale_mode`) | Done, default unchanged; "moonlight" gives ~4× the update size of "shape" mode, needs LR tuning |
-| 5 Training loop | `inky/train.py` | Done; smoke-tested only (3 steps) |
+| 3 Self-speculative decoding | `inky/speculative.py` | Done, greedy only. Tests now require at least 4 distinct tokens and a rejection path (TEST-01 fixed). Acceptance rate on trained weights not measured. No writing controls (GEN-03) |
+| 4 Muon scale option | `inky/optim.py` (`scale_mode`) | Done, default "shape". "moonlight" gives about 4× the update RMS of "shape" at the default LR; it needs an AdamW-scale LR, and nothing warns about this yet (TRAIN-05) |
+| 5 Training loop | `inky/train.py`, `scripts/train.py` | Done, smoke-tested only (`--dry-run`). Resume with RNG state, skip on non-finite loss or gradient, 5% warmup, gradient accumulation, optional AMP, opt-in dropout, `best.pt`, last step always saved. No training run. Open: Moonlight LR guard (TRAIN-05), no early stopping (`docs/critique/training.md`) |
 | 6 Loop curriculum | `inky/train.py` (`loop_curriculum`) | Done, tested |
-| 7 Data pipeline | `inky/data.py` | Done; near-duplicate threshold 0.8 (30-word docs with one changed word are kept). Known issues DATA-01 and DATA-02 (`docs/critique/data_docs.md`) |
+| 7 Data pipeline | `inky/data.py` | Done: script-aware filter, streaming MinHash near-duplicate removal (`dedupe_stream`; threshold 0.8 on word 5-gram Jaccard; 30-word docs with one changed word are kept), reserved-id drop, BOM and null input handled, int32 packing, `min_chars` default 20. No open items in the data critique except the EOS default in DOC-05 |
 | 8 Ablations | not built | Needs training runs; deferred |
-| 9 Selective SSM mixer | `inky/layers.py` (`SelectiveSSMMixer`), `ssm_mixer_layers` | Done; off by default; tested |
-| 10 Distillation loss | `inky/distill.py` | Done, tested; no teacher or training yet |
+| 9 Selective SSM mixer | `inky/layers.py` (`SelectiveSSMMixer`), `ssm_mixer_layers` | Done, chunked scan; off by default; tested. Memory at 8k not measured (CORE-12) |
+| 10 Distillation loss | `inky/distill.py` | Done, tested; no teacher, not wired into training, not chunked (TRAIN-15) |
 
-Test suite: 141 passing (see docs/critique/ for the open items).
+Test suite: 490 tests collected and 490 passing (`python -B -m pytest tests -q -p no:cacheprovider`,
+2 warnings, about 5 minutes on CPU, 2026-11-03). The open items are listed in docs/critique/STATUS.md.

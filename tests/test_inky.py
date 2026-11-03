@@ -51,10 +51,19 @@ def seeded_model(config: InkyConfig) -> InkyModel:
     return model
 
 
-def test_default_config_is_about_50m_parameters():
+# Exact counts, kept here in one place (TEST-03). README: 50.22M default, 50.61M with the decision engine.
+EXPECTED_DEFAULT_PARAMS = 50_219_201
+EXPECTED_ARLO_PARAMS = 50_614_854
+
+
+def test_default_config_parameter_count_is_exact():
     model = InkyModel(InkyConfig())
-    total = model.count_parameters()["total"]
-    assert 45_000_000 <= total <= 55_000_000, total
+    assert model.count_parameters()["total"] == EXPECTED_DEFAULT_PARAMS
+
+
+def test_arlo_parameter_count_is_exact():
+    model = InkyModel(InkyConfig(enable_arlo=True))
+    assert model.count_parameters()["total"] == EXPECTED_ARLO_PARAMS
 
 
 def test_default_context_window_is_8k():
@@ -128,28 +137,55 @@ def test_context_limit_is_enforced():
     raise AssertionError("sequences longer than max_position_embeddings should raise")
 
 
-def test_act_mean_loops_is_within_bounds():
+def test_mean_loops_is_within_bounds_and_follows_the_halting_gate():
+    # TEST-03: the halting gate must move the loop count, not only stay inside [1, L].
     config = tiny_config()
     model = seeded_model(config)
     ids = torch.randint(2, 512, (2, 12))
+    L = config.max_recurrent_loops
     with torch.no_grad():
-        out = model(ids, num_loops=config.max_recurrent_loops)
-    assert 1.0 <= float(out.mean_loops) <= config.max_recurrent_loops
+        default = float(model(ids, num_loops=L).mean_loops)
+        assert 1.0 <= default <= L
+        model.halting.gate.bias.fill_(50.0)      # stop probability ~1: almost every token stops at loop 1
+        stop_early = float(model(ids, num_loops=L).mean_loops)
+        model.halting.gate.bias.fill_(-50.0)     # stop probability ~0: almost every token runs all loops
+        stop_late = float(model(ids, num_loops=L).mean_loops)
+    assert stop_early < 1.05, stop_early
+    assert stop_late > L - 0.05, stop_late
 
 
 def test_generate_appends_tokens_and_stops_at_eos():
     config = tiny_config()
     model = seeded_model(config)
     prompt = torch.randint(2, 512, (1, 5))
-    out = model.generate(prompt, max_new_tokens=8, do_sample=False, repetition_penalty=1.0)
+    kw = dict(do_sample=False, repetition_penalty=1.0)
+    out = model.generate(prompt, max_new_tokens=8, **kw)
     assert out.shape == (1, 13)
     assert out[:, :5].tolist() == prompt.tolist()
     # Value check: the first new token is the argmax of a full forward pass over the prompt.
     assert int(out[0, 5]) == int(model(prompt).logits[0, -1].argmax())
     assert int(out.max()) < config.vocab_size
+    # DOC-05: set the EOS to the token the model emits first. Generation must stop right after it.
+    eos = int(out[0, 5])
+    stopped = model.generate(prompt, max_new_tokens=8, eos_token_id=eos, **kw)
+    assert stopped.shape == (1, 6), stopped.shape
+    assert int(stopped[0, -1]) == eos
 
 
 def test_moe_balance_update_moves_bias_towards_uniform_load():
+    # TEST-03: the sign of each bias change follows (target load - observed load).
+    from inky.layers import SharedExpertMoE
+
+    moe = SharedExpertMoE(tiny_config())
+    with torch.no_grad():
+        moe.load_counts.copy_(torch.tensor([9.0, 1.0, 0.0, 0.0]))   # expert 0 overloaded, 2 and 3 idle
+    moe.update_balance_bias()
+    bias = moe.balance_bias
+    assert float(bias[0]) < 0.0                  # overloaded: pushed down
+    assert float(bias[1]) > 0.0 and float(bias[2]) > 0.0 and float(bias[3]) > 0.0   # under target: pushed up
+    assert float(moe.load_counts.sum()) == 0.0   # counts reset after the update
+
+    # Model level: a real training step moves some bias, and every bias stays finite.
     model = seeded_model(tiny_config())
     model.train()
     ids = torch.randint(2, 512, (2, 16))
@@ -166,7 +202,10 @@ def test_gradient_checkpointing_trains():
     ids = torch.randint(2, 512, (2, 16))
     loss = model(ids, labels=ids, num_loops=2).loss
     loss.backward()
-    assert all(p.grad is None or torch.isfinite(p.grad).all() for p in model.parameters())
+    # TEST-03: every parameter the loss depends on must have a gradient, and all gradients are finite.
+    missing = [name for name, p in model.named_parameters() if p.grad is None]
+    assert not missing, missing
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters())
 
 
 def test_save_and_reload_round_trip():
@@ -253,8 +292,8 @@ def test_scratch_rebuild_keeps_the_loop_count(monkeypatch):
     chosen = []
     original = model._choose_loops
 
-    def recording(cache, num_loops):
-        loops = original(cache, num_loops)
+    def recording(cache, num_loops, *args, **kwargs):
+        loops = original(cache, num_loops, *args, **kwargs)
         chosen.append(loops)
         return loops
 

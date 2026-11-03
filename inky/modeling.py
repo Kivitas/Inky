@@ -1,8 +1,7 @@
 """Inky language model: pre layers, a looped recurrent core with PonderNet halting, post layers."""
 
-import random
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 import torch
 import torch.nn as nn
@@ -11,7 +10,8 @@ from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel
 
 from .config import InkyConfig
-from .arlo import Arlo
+from .arlo import Arlo, mean_pool_options, option_ids
+from .data import DEFAULT_RESERVED_IDS
 from .metrics import binary_report, choice_report, print_report, text_report
 from .layers import (
     InkyBlock,
@@ -24,8 +24,8 @@ from .layers import (
     geometric_prior,
     pondernet_kl,
 )
-from .scratch import reduce_scratch
-from .style import banned_by_bad_words, banned_by_no_repeat_ngram
+from .scratch import DEFAULT_MAX_NOTE_TOKENS, ScratchTracker, reduce_scratch  # noqa: F401
+from .style import NgramBanIndex, banned_by_bad_words
 
 
 class InkyCache:
@@ -49,11 +49,20 @@ class InkyOutput:
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     past: Optional[InkyCache] = None
+    # MoE balance-free aux: pre and post layers summed, recurrent layers averaged over the loops run.
     moe_aux_loss: Optional[torch.Tensor] = None
-    mean_loops: Optional[torch.Tensor] = None  # expected loop count per token (ACT)
+    # Expected number of loops per token under the halting distribution, sum_n n * p_n(t), averaged over
+    # tokens. Same definition in forward and forward_early_exit (in [1, L]).
+    mean_loops: Optional[torch.Tensor] = None
     hidden: Optional[torch.Tensor] = None      # final hidden states, set when return_hidden=True
     loop_applications: Optional[int] = None    # token-loop pairs actually computed (early exit only)
     full_loop_applications: Optional[int] = None  # tokens x loops, for the same input
+    # Realised exit loop per token, averaged (early exit only). Equals L when nothing exits early.
+    # Not the same quantity as mean_loops: it is the loop a token stopped at, not the expected value.
+    mean_exit_loop: Optional[torch.Tensor] = None
+    # Set when labels are given: detached, unweighted loss terms. Total loss is
+    # ce + z_loss_coef * z_loss + moe_aux + ponder_step_loss_coef * step_ce + ponder_kl_coef * ponder_kl.
+    loss_parts: Optional[Dict[str, torch.Tensor]] = None
 
 
 class InkyModel(PreTrainedModel):
@@ -102,7 +111,12 @@ class InkyModel(PreTrainedModel):
         parts["total"] = n(self)
         return parts
 
-    def _choose_loops(self, cache: Optional[InkyCache], num_loops: Optional[int]) -> int:
+    def _choose_loops(
+        self,
+        cache: Optional[InkyCache],
+        num_loops: Optional[int],
+        generator: Optional[torch.Generator] = None,
+    ) -> int:
         if cache is not None and cache.num_loops is not None:
             if num_loops is not None and num_loops != cache.num_loops:
                 raise ValueError(
@@ -113,7 +127,11 @@ class InkyModel(PreTrainedModel):
             return int(num_loops)
         if self.training:
             # Sample a depth per batch so the shared core learns to work at any number of loops.
-            return random.randint(self.config.min_recurrent_loops, self.config.max_recurrent_loops)
+            # Drawn from torch's RNG (or ``generator``), so torch.manual_seed makes runs reproducible.
+            draw = torch.randint(
+                self.config.min_recurrent_loops, self.config.max_recurrent_loops + 1, (1,), generator=generator
+            )
+            return int(draw)
         return self.config.max_recurrent_loops
 
     def _project(self, h: torch.Tensor) -> torch.Tensor:
@@ -130,18 +148,26 @@ class InkyModel(PreTrainedModel):
         z = (torch.logsumexp(logits, dim=-1).pow(2) * valid).sum()
         return ce, z
 
+    def _run_head(self, fn, *args):
+        """Run a per-chunk loss function, recomputing it in backward when ``lm_loss_recompute`` is set.
+
+        Recomputing keeps only one chunk of logits alive (the default). Turning it off removes the
+        second head pass in backward (CORE-08) and keeps each chunk's logits for backward instead.
+        """
+        if self.training and torch.is_grad_enabled() and self.config.lm_loss_recompute:
+            return checkpoint(fn, *args, use_reentrant=False)
+        return fn(*args)
+
     def _lm_loss(self, hidden: torch.Tensor, labels: torch.Tensor, chunk_size: int = 1024):
-        """Chunked next-token cross-entropy. Full-vocabulary logits are never kept for the whole sequence."""
+        """Chunked next-token cross-entropy. Full-vocabulary logits are never kept for the whole sequence
+        when ``lm_loss_recompute`` is on (the default)."""
         h = hidden[:, :-1].reshape(-1, hidden.shape[-1])
         y = labels[:, 1:].reshape(-1)
         ce_total = hidden.new_zeros((), dtype=torch.float32)
         z_total = hidden.new_zeros((), dtype=torch.float32)
         for start in range(0, h.shape[0], chunk_size):
             hc, yc = h[start:start + chunk_size], y[start:start + chunk_size]
-            if self.training and torch.is_grad_enabled():
-                ce, z = checkpoint(self._chunk_ce, hc, yc, use_reentrant=False)
-            else:
-                ce, z = self._chunk_ce(hc, yc)
+            ce, z = self._run_head(self._chunk_ce, hc, yc)
             ce_total = ce_total + ce
             z_total = z_total + z
         n_valid = (y != -100).sum().clamp(min=1).float()
@@ -158,28 +184,48 @@ class InkyModel(PreTrainedModel):
         weights: torch.Tensor,
         labels: torch.Tensor,
         chunk_size: int = 1024,
+        generator: Optional[torch.Generator] = None,
     ) -> torch.Tensor:
         """Next-token cross-entropy of every loop state, weighted by its halting probability.
 
         This trains each loop's state to predict on its own, so a shorter loop budget gives a
         usable output and not only a partly trained one. Divided by the number of valid tokens.
+
+        The halting weights are detached here: the gate is trained by the main mixture loss and the
+        ponder KL, and this term only trains the loop states. With ``step_ce_token_fraction`` < 1, a
+        random subset of target positions (drawn once, shared by all loops) is scored. The sum is
+        rescaled by (positions / subset size), so its expectation equals the full-position value.
         """
-        y = labels[:, 1:].reshape(-1)
-        n_valid = (y != -100).sum().clamp(min=1).float()
-        total = weights.new_zeros((), dtype=torch.float32)
+        weights = weights.detach()
+        y_all = labels[:, 1:].reshape(-1)
+        n_valid = (y_all != -100).sum().clamp(min=1).float()
+        N = y_all.shape[0]
+        fraction = self.config.step_ce_token_fraction
         D = self.config.hidden_size
+        if fraction < 1.0:
+            k = max(1, min(N, round(fraction * N)))
+            sel = torch.randperm(N, generator=generator)[:k].sort().values.to(y_all.device)
+            y = y_all[sel]
+            scale = float(N) / float(k)
+        else:
+            sel = None
+            y = y_all
+            scale = 1.0
+        M = y.shape[0]
+        total = weights.new_zeros((), dtype=torch.float32)
         for n, state in enumerate(loop_states):
-            hn = self.norm(state)[:, :-1].reshape(-1, D)
+            flat = state[:, :-1].reshape(-1, D)
             wn = weights[n][:, :-1].reshape(-1).float()
-            for start in range(0, hn.shape[0], chunk_size):
+            if sel is not None:
+                flat = flat[sel]
+                wn = wn[sel]
+            hn = self.norm(flat)
+            for start in range(0, M, chunk_size):
                 hc = hn[start:start + chunk_size]
                 yc = y[start:start + chunk_size]
                 wc = wn[start:start + chunk_size]
-                if self.training and torch.is_grad_enabled():
-                    total = total + checkpoint(self._chunk_weighted_ce, hc, yc, wc, use_reentrant=False)
-                else:
-                    total = total + self._chunk_weighted_ce(hc, yc, wc)
-        return total / n_valid
+                total = total + self._run_head(self._chunk_weighted_ce, hc, yc, wc)
+        return total * (scale / n_valid)
 
     # ------------------------------------------------------------------ forward
 
@@ -192,6 +238,9 @@ class InkyModel(PreTrainedModel):
         num_loops: Optional[int] = None,
         last_only: bool = False,
         return_hidden: bool = False,
+        attention_mask: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
+        generator: Optional[torch.Generator] = None,
     ) -> InkyOutput:
         """Causal forward pass.
 
@@ -199,6 +248,19 @@ class InkyModel(PreTrainedModel):
         logits. Without labels, logits are returned; ``last_only=True`` keeps only the final position.
         Pass ``past=InkyCache(...)`` (or ``use_cache=True``) to decode incrementally. The loop count
         is fixed by the first call of a cached sequence.
+
+        Packing (uncached passes only, i.e. no ``past`` and no ``use_cache``):
+          * ``segment_ids`` [B, S] (int): tokens attend only within their own segment, and the state
+            highway's running mean restarts at each segment. Packed documents then match running each
+            document on its own.
+          * ``attention_mask`` [B, S] (bool or 0/1, True = real token): padded keys are not attended to,
+            and padding is left out of the state highway's running mean (CORE-10), so a padded row matches
+            its unpadded run at the real positions. Padded positions still produce outputs, which the
+            labels should ignore. The mean loop count (``mean_loops``) and the halting KL average over the
+            real positions only. The router's z-loss in the MoE layers still averages over every position.
+            With left padding, the last pad position predicts the first real token, so that target label
+            must also be -100 (the loss does not infer it from the mask).
+        ``generator`` (optional) drives the random loop-depth draw and the step-CE token subset.
         """
         B, S = input_ids.shape
         cache = past
@@ -210,18 +272,28 @@ class InkyModel(PreTrainedModel):
                 f"sequence length {past_len + S} exceeds max_position_embeddings "
                 f"({self.config.max_position_embeddings})"
             )
+        attn_mask = self._packing_mask(B, S, attention_mask, segment_ids, input_ids.device, cache is not None)
+        # Uncached passes only (checked in _packing_mask): padding is excluded from the highway's mean.
+        valid_mask = None
+        keep = None
+        if attention_mask is not None:
+            keep = attention_mask.to(device=input_ids.device, dtype=torch.bool)
+            valid_mask = keep
 
         cos, sin = self.rope(past_len, S)
         h = self.embed_tokens(input_ids)
+        if self.training and self.config.embedding_dropout > 0.0:
+            h = F.dropout(h, p=self.config.embedding_dropout, training=True)     # TRAIN-04
         moe_aux = h.new_zeros((), dtype=torch.float32)
 
         for i, layer in enumerate(self.pre_layers):
-            h, present, aux = layer(h, cos, sin, cache.pre[i] if cache is not None else None)
+            h, present, aux = layer(h, cos, sin, cache.pre[i] if cache is not None else None,
+                                    attn_mask=attn_mask, segment_ids=segment_ids)
             if cache is not None:
                 cache.pre[i] = present
             moe_aux = moe_aux + aux
 
-        loops = self._choose_loops(cache, num_loops)
+        loops = self._choose_loops(cache, num_loops, generator)
         if cache is not None and cache.num_loops is None:
             cache.num_loops = loops
             cache.core = [None] * loops
@@ -234,6 +306,7 @@ class InkyModel(PreTrainedModel):
         h_loop, prev_mem = h, None
         lambdas: List[torch.Tensor] = []
         loop_states: List[torch.Tensor] = []
+        core_aux = h.new_zeros((), dtype=torch.float32)   # summed over loops, averaged below
 
         for step in range(1, loops + 1):
             idx = step - 1
@@ -246,26 +319,38 @@ class InkyModel(PreTrainedModel):
                 prefix_sum=cache.prefix[idx] if cache is not None else None,
                 prev_mem=prev_mem,
                 past_len=past_len,
+                attn_mask=attn_mask,
+                segment_ids=segment_ids,
+                valid_mask=valid_mask,
             )
             if cache is not None:
                 cache.core[idx] = presents
                 cache.prefix[idx] = new_prefix
             prev_mem = mem
-            moe_aux = moe_aux + aux
+            core_aux = core_aux + aux
 
             lambdas.append(self.halting(h_next))
             loop_states.append(h_next)
             h_loop = h_next
+        # The recurrent layers run once per loop. Averaging keeps the aux at the scale of one pass, so
+        # it does not grow with the loop count. Each layer's own term is still its per-loop mean.
+        moe_aux = moe_aux + core_aux / loops
 
         weights = geometric_halting_weights(lambdas)                 # [L, B, S], sums to 1 over L
         states = torch.stack(loop_states, dim=0).float()             # [L, B, S, D]
         h_out = (weights.unsqueeze(-1) * states).sum(dim=0)          # [B, S, D]
         loop_index = torch.arange(1, loops + 1, device=h.device, dtype=torch.float32).view(-1, 1, 1)
-        mean_loops = (weights * loop_index).sum(dim=0).mean()        # expected loops per token
+        per_token_loops = (weights * loop_index).sum(dim=0)           # [B, S] expected loops per token
+        if keep is not None:
+            real = keep.to(per_token_loops.dtype)
+            mean_loops = (per_token_loops * real).sum() / real.sum().clamp(min=1.0)
+        else:
+            mean_loops = per_token_loops.mean()
 
         h = h_out.to(h.dtype)
         for i, layer in enumerate(self.post_layers):
-            h, present, aux = layer(h, cos, sin, cache.post[i] if cache is not None else None)
+            h, present, aux = layer(h, cos, sin, cache.post[i] if cache is not None else None,
+                                    attn_mask=attn_mask, segment_ids=segment_ids)
             if cache is not None:
                 cache.post[i] = present
             moe_aux = moe_aux + aux
@@ -277,9 +362,9 @@ class InkyModel(PreTrainedModel):
 
         if labels is not None:
             ce, z = self._lm_loss(h, labels)
-            step_ce = self._weighted_step_ce(loop_states, weights, labels)
+            step_ce = self._weighted_step_ce(loop_states, weights, labels, generator=generator)
             prior = geometric_prior(loops, self.halting.prior_lambda, device=h.device)
-            kl = pondernet_kl(weights, prior)
+            kl = pondernet_kl(weights, prior, mask=keep)
             loss = (
                 ce
                 + self.config.z_loss_coef * z
@@ -287,12 +372,50 @@ class InkyModel(PreTrainedModel):
                 + self.config.ponder_step_loss_coef * step_ce
                 + self.config.ponder_kl_coef * kl
             )
-            return InkyOutput(loss=loss, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
+            parts = {
+                "ce": ce.detach(),
+                "step_ce": step_ce.detach(),
+                "z_loss": z.detach(),
+                "moe_aux": moe_aux.detach(),
+                "ponder_kl": kl.detach(),
+            }
+            return InkyOutput(loss=loss, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops,
+                              loss_parts=parts)
 
         if return_hidden:
             return InkyOutput(hidden=h, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
         logits = self._project(h[:, -1:] if last_only else h)
         return InkyOutput(logits=logits, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
+
+    def _packing_mask(
+        self,
+        B: int,
+        S: int,
+        attention_mask: Optional[torch.Tensor],
+        segment_ids: Optional[torch.Tensor],
+        device: torch.device,
+        cached: bool,
+    ) -> Optional[torch.Tensor]:
+        """Validates the packing arguments and builds the key-padding mask [B, 1, S, S] (or None).
+
+        The diagonal is always allowed, so a padded query row never has every key masked (that would
+        give NaN in attention). Causality is applied by the attention itself.
+        """
+        if attention_mask is None and segment_ids is None:
+            return None
+        if cached:
+            raise ValueError(
+                "attention_mask and segment_ids need an uncached forward pass (no past, no use_cache)"
+            )
+        if segment_ids is not None and tuple(segment_ids.shape) != (B, S):
+            raise ValueError(f"segment_ids must have shape {(B, S)}, got {tuple(segment_ids.shape)}")
+        if attention_mask is None:
+            return None
+        if tuple(attention_mask.shape) != (B, S):
+            raise ValueError(f"attention_mask must have shape {(B, S)}, got {tuple(attention_mask.shape)}")
+        keep = attention_mask.to(device=device, dtype=torch.bool)
+        eye = torch.eye(S, dtype=torch.bool, device=device)
+        return keep[:, None, None, :] | eye
 
     @torch.no_grad()
     def forward_early_exit(
@@ -310,6 +433,11 @@ class InkyModel(PreTrainedModel):
         ``halt_threshold=None`` no token exits early, and the output matches ``forward`` on the same
         input (checked in tests). Exited tokens keep their state and their stored keys and values, so
         the remaining tokens attend to them without recomputing them.
+
+        Loop statistics: ``mean_loops`` is the expected loop count sum_n n * p_n(t) over the mass each
+        token actually assigned to loop n (the unassigned remainder counts at its exit loop). It is the
+        same quantity ``forward`` reports, and equals it when ``halt_threshold=None``. ``mean_exit_loop``
+        is the loop each token stopped at, averaged over tokens.
         """
         if input_ids.shape[0] != 1:
             raise ValueError("early exit needs batch size 1")
@@ -340,6 +468,7 @@ class InkyModel(PreTrainedModel):
         cum = torch.zeros(S, device=h.device, dtype=torch.float32)   # halting mass assigned so far
         out = torch.zeros(1, S, cfg.hidden_size, device=h.device, dtype=torch.float32)
         exit_loop = torch.full((S,), float(L), device=h.device)
+        expected_loops = torch.zeros(S, device=h.device, dtype=torch.float32)  # sum_n n * (mass at loop n)
         ssm_mem = None
         computed = 0
 
@@ -357,6 +486,7 @@ class InkyModel(PreTrainedModel):
                 surv_new = torch.zeros_like(w)
             out[0, active] += w.unsqueeze(-1) * out_act[0].float()
             cum[active] += w
+            expected_loops[active] += w * float(n)
             surv[active] = surv_new
             state[0, active] = out_act[0]
 
@@ -367,6 +497,7 @@ class InkyModel(PreTrainedModel):
             if bool(exit_now.any()):
                 ex = active[exit_now]
                 out[0, ex] += surv[ex].unsqueeze(-1) * state[0, ex].float()   # unassigned mass
+                expected_loops[ex] += surv[ex] * float(n)                      # ...counted at its exit loop
                 surv[ex] = 0.0
                 exit_loop[ex] = float(n)
             active = active[~exit_now]
@@ -375,9 +506,9 @@ class InkyModel(PreTrainedModel):
         for layer in self.post_layers:
             hidden, _, _ = layer(hidden, cos, sin, None)
         hidden = self.norm(hidden)
-        mean_loops = exit_loop.mean()
         common = dict(
-            mean_loops=mean_loops,
+            mean_loops=expected_loops.mean(),
+            mean_exit_loop=exit_loop.mean(),
             loop_applications=computed,
             full_loop_applications=S * L,
         )
@@ -400,30 +531,37 @@ class InkyModel(PreTrainedModel):
     ):
         """Probability of each option, from the decision engine (Rhen Choice).
 
-        ``context_ids`` is [1, S]. ``options`` is a list of [1, L_i] tensors, one per option.
-        Each option is scored after the context and the optional question. Because the model is
-        causal, the context states are the same for every option.
-        Returns a tensor of shape [N] that sums to 1.
+        ``context_ids`` is [1, S]. ``options`` is a list of [1, L_i] tensors, one per option; every option
+        needs at least one token (ValueError otherwise). Each option is scored after the context and the
+        optional question, and is represented by the mean of its own token states (padding excluded).
+        Because the model is causal, the context states are the same for every option.
+        Returns a tensor of shape [N] that sums to 1. The model's train/eval mode is restored afterwards.
         """
         if self.arlo is None:
             raise RuntimeError("decision engine is disabled (enable_arlo=False)")
+        if len(options) == 0:
+            raise ValueError("decide_choice needs at least one option")
+        opts = [option_ids(opt, i) for i, opt in enumerate(options)]
+        was_training = self.training
         self.eval()
-        prefix = context_ids if question_ids is None else torch.cat([context_ids, question_ids], dim=1)
-        P = prefix.shape[1]
-        seqs = [torch.cat([prefix, opt], dim=1)[0] for opt in options]
-        lengths = [s.shape[0] for s in seqs]
-        # One batched forward. Options are right-padded with token 0, which is always a valid id
-        # (config.pad_token_id may lie outside a small vocabulary). The model is causal, so the padding
-        # cannot change any position before it, and each option is read at its own last token.
-        batch = torch.zeros((len(seqs), max(lengths)), dtype=prefix.dtype, device=prefix.device)
-        for i, s in enumerate(seqs):
-            batch[i, :lengths[i]] = s
-        h = self(batch, return_hidden=True).hidden
-        query = h[:1, P - 1]          # the last prefix token is the same for every option
-        states = h[:1, :P]
-        last = torch.tensor(lengths, device=h.device) - 1
-        option_states = h[torch.arange(len(seqs), device=h.device), last]     # [N, D]
-        scores = self.arlo.choice_scores(query, option_states.unsqueeze(0), states)
+        try:
+            prefix = context_ids if question_ids is None else torch.cat([context_ids, question_ids], dim=1)
+            P = prefix.shape[1]
+            seqs = [torch.cat([prefix, o.to(prefix.device)], dim=1)[0] for o in opts]
+            lengths = [s.shape[0] for s in seqs]
+            # One batched forward. Options are right-padded with token 0, which is always a valid id
+            # (config.pad_token_id may lie outside a small vocabulary). The model is causal, so the padding
+            # cannot change any position before it, and each option's mean covers only its own tokens.
+            batch = torch.zeros((len(seqs), max(lengths)), dtype=torch.long, device=prefix.device)
+            for i, s in enumerate(seqs):
+                batch[i, :lengths[i]] = s
+            h = self(batch, return_hidden=True).hidden
+            query = h[:1, P - 1]          # the last prefix token is the same for every option
+            states = h[:1, :P]
+            option_states = mean_pool_options(h, P, lengths)                  # [N, D]
+            scores = self.arlo.choice_scores(query, option_states.unsqueeze(0), states)
+        finally:
+            self.train(was_training)
         probs = torch.softmax(scores, dim=-1)[0]
         if not (report or display):
             return probs
@@ -445,14 +583,18 @@ class InkyModel(PreTrainedModel):
         """Probability that the answer is yes, from the decision engine (Rhen Noul). Returns a scalar.
 
         With ``report=True`` or ``display=True`` the output is also summarised by ``binary_report``.
-        Pass ``gold`` (0 or 1) to get the confusion metrics.
+        Pass ``gold`` (0 or 1) to get the confusion metrics. The model's train/eval mode is restored afterwards.
         """
         if self.arlo is None:
             raise RuntimeError("decision engine is disabled (enable_arlo=False)")
+        was_training = self.training
         self.eval()
-        prefix = context_ids if question_ids is None else torch.cat([context_ids, question_ids], dim=1)
-        h = self(prefix, return_hidden=True).hidden
-        p = torch.sigmoid(self.arlo.binary_logit(h[:, -1], h))[0]
+        try:
+            prefix = context_ids if question_ids is None else torch.cat([context_ids, question_ids], dim=1)
+            h = self(prefix, return_hidden=True).hidden
+            p = torch.sigmoid(self.arlo.binary_logit(h[:, -1], h))[0]
+        finally:
+            self.train(was_training)
         if not (report or display):
             return p
         rep = binary_report(p.unsqueeze(0), None if gold is None else [gold])
@@ -488,47 +630,139 @@ class InkyModel(PreTrainedModel):
         reduce_scratch_blocks: bool = False,
         report: bool = False,
         display: bool = False,
+        stock_word_penalty: float = 0.0,
+        soft_penalty_ids: Optional[Sequence[int]] = None,
+        repeat_window: Optional[int] = None,
+        count_prose_only: bool = False,
+        scratch_max_note_tokens: Optional[int] = DEFAULT_MAX_NOTE_TOKENS,
+        blocked_token_ids: Optional[Sequence[int]] = None,
     ):
         """Sample a continuation.
 
+        ``blocked_token_ids`` are never emitted (set to -inf). None (the default) blocks the reserved
+        special ids of the tokenizer, ``DEFAULT_RESERVED_IDS`` (49974 to 50002), minus the scratch ids,
+        which generation uses through ``reduce_scratch_blocks``, and minus the configured EOS id, which
+        must stay allowed (DATA-05). Pass an explicit list to block other ids, or ``[]`` to block nothing.
+        The EOS id (``eos_token_id``, when given) and the configured ``config.eos_token_id`` are never
+        blocked, even if they are in the list. Ids outside the vocabulary are ignored.
         ``bad_word_ids`` blocks token sequences (see ``style.build_bad_word_ids``).
-        ``no_repeat_ngram_size`` blocks any repeated n-gram (0 turns it off).
+        ``no_repeat_ngram_size`` blocks any repeated n-gram (0 turns it off; 1 is rejected, because it
+        would ban every token already seen).
+        ``repeat_window`` (default None = the whole history) limits the repetition penalty and the
+        no-repeat rule to the last ``repeat_window`` tokens, prompt included.
+        ``stock_word_penalty`` (default 0) subtracts this value from the logit of every id in
+        ``soft_penalty_ids`` (see ``style.soft_penalty_token_ids``). It is a soft preference, not a ban.
         ``reduce_scratch_blocks`` applies PENCIL-style reduction: when the model closes a scratch
-        block, the notes are removed from the sequence and the cache is rebuilt. It needs batch
-        size 1. Tokens in the prompt are never removed.
+        block, the notes are removed from the sequence. It needs batch size 1. Tokens in the prompt
+        are never removed. Notes longer than ``scratch_max_note_tokens`` (None = no cap) are not
+        treated as notes. Structurally invalid markers (a separator with no open block, a close with
+        no separator) are masked out. After a close, the cache is rolled back to the block's open
+        marker and only the text after it is recomputed, so no full re-prefill happens.
+        ``count_prose_only`` (needs ``reduce_scratch_blocks`` to differ) counts only prose tokens
+        against ``max_new_tokens``, so notes do not use up the budget. A note still open at the stop
+        point is kept in the output.
+
+        Each batch row keeps an incremental no-repeat n-gram index, updated with every new token, so
+        the decode loop does not rebuild it from the whole sequence at each step.
         """
         self.eval()
         cfg = self.config
         if reduce_scratch_blocks and input_ids.shape[0] != 1:
             raise ValueError("scratch reduction needs batch size 1")
+        if no_repeat_ngram_size == 1:
+            raise ValueError(
+                "no_repeat_ngram_size=1 would ban every token already seen; use 0 to turn the rule off "
+                "or a value >= 2"
+            )
+        if no_repeat_ngram_size < 0:
+            raise ValueError(f"no_repeat_ngram_size must be >= 0, got {no_repeat_ngram_size}")
+        if repeat_window is not None and repeat_window < 1:
+            raise ValueError(f"repeat_window must be None or >= 1, got {repeat_window}")
+        if scratch_max_note_tokens is not None and scratch_max_note_tokens < 0:
+            raise ValueError(f"scratch_max_note_tokens must be None or >= 0, got {scratch_max_note_tokens}")
+        if stock_word_penalty < 0:
+            raise ValueError(f"stock_word_penalty must be >= 0, got {stock_word_penalty}")
+        penalty_mask = None
+        if stock_word_penalty > 0:
+            ids_list = sorted({int(t) for t in (soft_penalty_ids or ())})
+            if not ids_list:
+                raise ValueError("stock_word_penalty > 0 needs soft_penalty_ids")
+            if ids_list[0] < 0 or ids_list[-1] >= cfg.vocab_size:
+                raise ValueError("soft_penalty_ids must be token ids inside the vocabulary")
+            penalty_mask = torch.zeros(cfg.vocab_size, dtype=torch.float32, device=input_ids.device)
+            penalty_mask[ids_list] = 1.0
+
+        blocked = _blocked_ids(cfg, blocked_token_ids, eos_token_id)
         prompt_len = input_ids.shape[1]
         cache = InkyCache(cfg)
         seq = input_ids
+        # Per-row token history (Python ints). Appended to once per new token; never re-listed.
+        history: List[List[int]] = [row.tolist() for row in input_ids]
+        ngram = (
+            [_make_ngram_index(no_repeat_ngram_size, row, repeat_window) for row in history]
+            if no_repeat_ngram_size else None
+        )
+        tail_len = max((len(s) - 1 for s in bad_word_ids), default=0) if bad_word_ids else 0
+        scratch = (
+            ScratchTracker(cfg.scratch_open_id, cfg.scratch_sep_id, cfg.scratch_close_id,
+                           scratch_max_note_tokens, prefix=history[0])
+            if reduce_scratch_blocks else None
+        )
+        # Before each open marker: the cache state and the logits that predicted the marker's position.
+        # Keyed by the marker's index in seq. Used to roll back the cache when its block closes.
+        snapshots: Dict[int, Tuple[dict, InkyOutput]] = {}
         out = self(seq, past=cache, num_loops=num_loops, last_only=True)
-        for _ in range(max_new_tokens):
+        steps = 0
+        while True:
+            if count_prose_only and scratch is not None:
+                if scratch.prose_count(prompt_len) >= max_new_tokens:
+                    break
+            elif steps >= max_new_tokens:
+                break
+            steps += 1
             if cache.seq_len >= cfg.max_position_embeddings:
                 break
-            logits = _apply_repetition_penalty(out.logits[:, -1, :], seq, repetition_penalty)
-            logits = _block_tokens(logits, seq, no_repeat_ngram_size, bad_word_ids)
+            logits = _apply_repetition_penalty(out.logits[:, -1, :], seq, repetition_penalty, repeat_window)
+            if penalty_mask is not None:
+                logits = logits - stock_word_penalty * penalty_mask
+            logits = _block_tokens(logits, ngram, history, tail_len, bad_word_ids)
+            logits = _mask_ids(logits, blocked)
+            if scratch is not None:
+                logits = _mask_ids(logits, scratch.banned_markers())
             if do_sample:
                 next_tok = _sample(logits, temperature, top_k, top_p)
             else:
                 next_tok = logits.argmax(dim=-1)
+            new_tokens = next_tok.tolist()
+            if scratch is not None and new_tokens[0] == cfg.scratch_open_id:
+                # cache.seq_len == seq.shape[1] here, so this is the state before the marker is fed.
+                snapshots[seq.shape[1]] = (_cache_snapshot(cache), out)
             seq = torch.cat([seq, next_tok[:, None]], dim=1)
+            for b, token in enumerate(new_tokens):
+                history[b].append(token)
+                if ngram is not None:
+                    ngram[b].update(token)
             if eos_token_id is not None and bool((next_tok == eos_token_id).all()):
                 break
-            if reduce_scratch_blocks and int(next_tok[0]) == cfg.scratch_close_id:
-                reduced = reduce_scratch(
-                    seq[0].tolist(), cfg.scratch_open_id, cfg.scratch_sep_id, cfg.scratch_close_id, start=prompt_len
-                )
-                if len(reduced) != seq.shape[1]:
-                    # The notes are gone, so the cache for the remaining text is rebuilt from scratch.
-                    # The loop depth is kept, so the text after the close uses the same depth as before.
-                    loops = cache.num_loops
-                    seq = torch.tensor([reduced], dtype=seq.dtype, device=seq.device)
-                    cache = InkyCache(cfg)
-                    out = self(seq, past=cache, num_loops=loops, last_only=True)
+            if scratch is not None:
+                cut = scratch.feed(new_tokens[0])
+                if cut is not None:
+                    # Notes were removed from index `cut` onward. Everything before it is unchanged,
+                    # so the cache is rolled back to the block's open marker and only the text after
+                    # it is recomputed (the loop count is part of the cache and is kept).
+                    snap, out_before = snapshots.pop(cut)
+                    snapshots = {k: v for k, v in snapshots.items() if k in scratch.open_positions()}
+                    _cache_restore(cache, snap)
+                    seq = torch.tensor([scratch.out], dtype=seq.dtype, device=seq.device)
+                    history[0] = list(scratch.out)
+                    if ngram is not None:
+                        ngram[0] = _make_ngram_index(no_repeat_ngram_size, scratch.out, repeat_window)
+                    if seq.shape[1] > cut:
+                        out = self(seq[:, cut:], past=cache, last_only=True)
+                    else:
+                        out = out_before
                     continue
+                snapshots = {k: v for k, v in snapshots.items() if k in scratch.open_positions()}
             out = self(next_tok[:, None], past=cache, last_only=True)
         if not (report or display):
             return seq
@@ -538,45 +772,184 @@ class InkyModel(PreTrainedModel):
         return seq, rep
 
 
-def _block_tokens(
-    logits: torch.Tensor,
-    seq: torch.Tensor,
-    no_repeat_ngram_size: int,
-    bad_word_ids: Optional[Sequence[Sequence[int]]],
-) -> torch.Tensor:
-    if not no_repeat_ngram_size and not bad_word_ids:
+def _cache_snapshot(cache: InkyCache) -> dict:
+    """Shallow copy of the cache state. The forward pass replaces entries and never edits them in place."""
+    return {
+        "pre": list(cache.pre),
+        "post": list(cache.post),
+        "core": list(cache.core),
+        "prefix": list(cache.prefix),
+        "seq_len": cache.seq_len,
+    }
+
+
+def _cache_restore(cache: InkyCache, snap: dict) -> None:
+    cache.pre = list(snap["pre"])
+    cache.post = list(snap["post"])
+    cache.core = list(snap["core"])
+    cache.prefix = list(snap["prefix"])
+    cache.seq_len = snap["seq_len"]
+
+
+def _blocked_ids(cfg: InkyConfig, explicit, eos_token_id: Optional[int]) -> List[int]:
+    """Sorted token ids that generate must never emit (DATA-05).
+
+    Default (``explicit`` None): the reserved special ids minus the scratch ids and minus the configured
+    EOS id. An explicit list replaces the default. The EOS id (``eos_token_id`` and ``cfg.eos_token_id``)
+    is always removed from the result, so the stop token stays allowed. Ids outside the vocabulary are
+    dropped, since they cannot be indexed.
+    """
+    scratch = {cfg.scratch_open_id, cfg.scratch_sep_id, cfg.scratch_close_id}
+    if explicit is None:
+        ids = set(DEFAULT_RESERVED_IDS) - scratch - {cfg.eos_token_id}
+    else:
+        ids = {int(t) for t in explicit}
+    ids.discard(cfg.eos_token_id)
+    if eos_token_id is not None:
+        ids.discard(int(eos_token_id))
+    return sorted(t for t in ids if 0 <= t < cfg.vocab_size)
+
+
+def _mask_ids(logits: torch.Tensor, ids) -> torch.Tensor:
+    """Sets the given token ids to -inf (returns a copy; ``logits`` is not modified)."""
+    if not ids:
         return logits
     logits = logits.clone()
-    for b in range(seq.shape[0]):
-        ids = seq[b].tolist()
-        banned = banned_by_no_repeat_ngram(ids, no_repeat_ngram_size)
+    logits[:, sorted(ids)] = float("-inf")
+    return logits
+
+
+class _WindowedNgramIndex:
+    """No-repeat index that counts only n-grams lying fully inside the last ``window`` tokens.
+
+    Same answers as ``NgramBanIndex`` when the window covers the whole sequence. Grams that leave
+    the window are removed as new tokens arrive, so the index stays O(window) in size.
+    """
+
+    def __init__(self, n: int, ids: Iterable[int] = (), window: Optional[int] = None):
+        if window is not None and window < 1:
+            raise ValueError(f"window must be None or >= 1, got {window}")
+        self.n = n
+        self.window = window
+        self._seq: List[int] = []
+        # (n-1)-token prefix -> {next token: number of windowed occurrences}
+        self._next: Dict[Tuple[int, ...], Dict[int, int]] = {}
+        for token in ids:
+            self.update(token)
+
+    def __len__(self) -> int:
+        return len(self._seq)
+
+    def _gram_at(self, start: int) -> Tuple[Tuple[int, ...], int]:
+        n = self.n
+        return tuple(self._seq[start:start + n - 1]), self._seq[start + n - 1]
+
+    def _add(self, start: int) -> None:
+        key, nxt = self._gram_at(start)
+        counts = self._next.setdefault(key, {})
+        counts[nxt] = counts.get(nxt, 0) + 1
+
+    def _remove(self, start: int) -> None:
+        key, nxt = self._gram_at(start)
+        counts = self._next[key]
+        counts[nxt] -= 1
+        if counts[nxt] == 0:
+            del counts[nxt]
+        if not counts:
+            del self._next[key]
+
+    def update(self, token: int) -> None:
+        self._seq.append(token)
+        n, w, L = self.n, self.window, len(self._seq)
+        if n < 2 or (w is not None and w < n):
+            return
+        if L >= n:
+            self._add(L - n)                     # the gram that this token completes
+        if w is not None and L - w - 1 >= 0:
+            self._remove(L - w - 1)              # the gram that has just left the window
+
+    def banned(self) -> Set[int]:
+        n = self.n
+        if n <= 0 or len(self._seq) < n:
+            return set()
+        if n == 1:
+            return set(self._seq if self.window is None else self._seq[-self.window:])
+        tail = tuple(self._seq[-(n - 1):])
+        return set(self._next.get(tail, {}).keys())
+
+
+def _make_ngram_index(n: int, ids: Iterable[int], window: Optional[int]):
+    if window is None:
+        return NgramBanIndex(n, ids)
+    return _WindowedNgramIndex(n, ids, window)
+
+
+def _block_tokens(
+    logits: torch.Tensor,
+    ngram: Optional[List[NgramBanIndex]],
+    history: List[List[int]],
+    tail_len: int,
+    bad_word_ids: Optional[Sequence[Sequence[int]]],
+) -> torch.Tensor:
+    """Sets banned next tokens to -inf. ``ngram[b]`` is row b's incremental no-repeat index (None if off).
+
+    Bad-word sequences only look at the last ``tail_len`` tokens of a row (the longest prefix they need),
+    so the row history is sliced to that tail rather than scanned in full.
+    """
+    if ngram is None and not bad_word_ids:
+        return logits
+    logits = logits.clone()
+    for b in range(logits.shape[0]):
+        banned = ngram[b].banned() if ngram is not None else set()
         if bad_word_ids:
-            banned |= banned_by_bad_words(ids, bad_word_ids)
+            tail = history[b][-tail_len:] if tail_len > 0 else []
+            banned |= banned_by_bad_words(tail, bad_word_ids)
         if banned:
             logits[b, sorted(banned)] = float("-inf")
     return logits
 
 
-def _apply_repetition_penalty(logits: torch.Tensor, seq: torch.Tensor, penalty: float) -> torch.Tensor:
+def _apply_repetition_penalty(
+    logits: torch.Tensor, seq: torch.Tensor, penalty: float, window: Optional[int] = None
+) -> torch.Tensor:
+    """Penalises every token seen in ``seq`` (or only the last ``window`` tokens when given)."""
     if penalty == 1.0:
         return logits
-    picked = torch.gather(logits, 1, seq)
+    ctx = seq if window is None else seq[:, -window:]
+    picked = torch.gather(logits, 1, ctx)
     picked = torch.where(picked < 0, picked * penalty, picked / penalty)
-    return logits.scatter(1, seq, picked)
+    return logits.scatter(1, ctx, picked)
 
 
-def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
+def _candidate_distribution(
+    logits: torch.Tensor, temperature: float, top_k: int, top_p: float
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Kept candidates and their probabilities: ``(indices [B, K], probs [B, K])``.
+
+    With ``top_k`` set, only the k largest logits are read (torch.topk), and top-p works inside
+    those k values, so the full vocabulary is never sorted (GEN-05). Without ``top_k`` and with
+    ``top_p < 1``, the full vocabulary is sorted as before. Ties at the k-th logit keep exactly k
+    tokens here, where the old mask kept every tie.
+    """
     logits = logits / max(temperature, 1e-5)
-    if top_k and top_k > 0:
-        kth = torch.topk(logits, min(top_k, logits.size(-1)))[0][..., -1, None]
-        logits = logits.masked_fill(logits < kth, float("-inf"))
+    V = logits.size(-1)
+    if top_k and 0 < top_k < V:
+        vals, idx = torch.topk(logits, top_k, dim=-1)          # sorted, largest first
+    elif top_p < 1.0:
+        vals, idx = torch.sort(logits, descending=True, dim=-1)
+    else:
+        vals = logits
+        idx = torch.arange(V, device=logits.device).unsqueeze(0).expand(logits.shape[0], V)
     if top_p < 1.0:
-        sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
-        cum = torch.softmax(sorted_logits, dim=-1).cumsum(dim=-1)
+        cum = torch.softmax(vals, dim=-1).cumsum(dim=-1)
         remove = cum > top_p
         remove[..., 1:] = remove[..., :-1].clone()
         remove[..., 0] = False
-        sorted_logits = sorted_logits.masked_fill(remove, float("-inf"))
-        logits = torch.full_like(logits, float("-inf")).scatter(-1, sorted_idx, sorted_logits)
-    probs = torch.softmax(logits, dim=-1)
-    return torch.multinomial(probs, num_samples=1).squeeze(-1)
+        vals = vals.masked_fill(remove, float("-inf"))
+    return idx, torch.softmax(vals, dim=-1)
+
+
+def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
+    idx, probs = _candidate_distribution(logits, temperature, top_k, top_p)
+    pick = torch.multinomial(probs, num_samples=1)
+    return idx.gather(-1, pick).squeeze(-1)

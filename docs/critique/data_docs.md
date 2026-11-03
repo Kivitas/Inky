@@ -1,5 +1,31 @@
 # Critique: data pipeline, config, docs and tests
 
+## Status (checked against the code, 2026-11-03)
+
+Checked against the working tree at commit f7299ea plus uncommitted changes. **Line numbers in the
+findings below are from an older commit and may not match the current code.** The finding text is
+kept as written. Legend: **FIXED** = the fix is in the code (a note says which part, for example opt-in). **OPEN** = the problem remains or is only partly fixed (the note says which part). **ACCEPTED-DESIGN** = a deliberate design choice, not a defect; it is documented and was not changed. **NOT-A-BUG** = checked, and the claim does not hold for the code as designed. **UNVERIFIED** = could not be checked here.
+
+Counts for this file: 14 FIXED, 1 OPEN (of 15).
+
+| ID | Severity | Status | Evidence in current code |
+| :--- | :--- | :--- | :--- |
+| DATA-01 | high | FIXED | The symbol count uses Unicode P* and S* categories. CJK, Thai and Devanagari letters and marks are not symbols. Tests in `tests/test_data_fixes.py`. |
+| DATA-02 | high | FIXED | MinHash LSH and int32 packing. `prepare_corpus` uses `dedupe_stream`, which makes the same keep decision as `dedupe_documents` on the same input. `dedupe_documents` still holds a shingle set per kept document and is meant for shards. |
+| TEST-01 | high | FIXED | `assert_varied` requires at least 4 distinct tokens; the rejection path has its own test. |
+| TEST-02 | high | FIXED | The test takes the token the model would pick without a ban, then asserts the ban removes it. |
+| DOC-01 | high | FIXED | README describes `inky/train.py` as a smoke-tested loop. |
+| DATA-03 | medium | FIXED | Default `min_chars` is 20 (`DEFAULT_MIN_CHARS`), with a script-aware length for Han, kana and Thai. Behaviour change: texts between 20 and 200 characters, which were rejected before, now pass. |
+| DOC-02 | medium | FIXED | README now gives 50.22M (default) and 50.61M (Arlo) and a Files list that matches the tree. |
+| DOC-03 | medium | FIXED | PLAN section 2 rows for quantization and speculative decoding match section 7. |
+| DOC-04 | medium | FIXED | README and PLAN say the controls are not measured. |
+| DOC-05 | medium | OPEN | `generate` still defaults `eos_token_id` to None, so it does not stop at the configured EOS. The EOS test does not set one. |
+| DOC-06 | medium | FIXED | The loop count is kept across the scratch rebuild (see CORE-11). |
+| DATA-04 | medium | FIXED | `iter_jsonl` opens files with `utf-8-sig` (a BOM is accepted) and skips `null` text. Whitespace-only text is rejected by `quality_filter`. |
+| DATA-05 | medium | FIXED | `generate` blocks the reserved special ids by default (`blocked_token_ids` changes the list). The README documents this. |
+| DATA-06 | medium | FIXED | Opt-in: `segment_ids` gives a block-diagonal attention mask and a segment-restarted highway, and `pack_sequences_with_segments` returns document ids. The default `prepare_corpus` path does not pass segments. |
+| TEST-03 | low | FIXED | The gradient test requires a gradient for every non-Arlo parameter. The parameter count is checked exactly (`EXPECTED_DEFAULT_PARAMS`, `EXPECTED_ARLO_PARAMS`), not against a band. The balance-bias test checks the sign of each change. The ACT bounds test was not re-reviewed. |
+
 Scope: `inky/data.py`, `inky/config.py`, `README.md`, `PLAN.md`, `tests/`, plus the EOS tokenizer at
 `C:\Users\Sirisha Rajana\Desktop\New folder\EOS LLM\EOS_Tokenizer` (read only). Where a finding came from
 running code, the measurement is given. Nothing under `inky/`, `tests/`, `README.md` or `PLAN.md` was edited.

@@ -155,7 +155,9 @@ def test_iter_jsonl_skips_blank_lines_and_missing_fields(tmp_path):
         encoding="utf-8",
     )
     assert list(iter_jsonl(path)) == ["first", "héllo", "third"]
-    assert list(iter_jsonl(str(path), field="other")) == [1]
+    # a non-string value in the requested field is rejected with its line number (DATA-04)
+    with pytest.raises(ValueError, match="line 3"):
+        list(iter_jsonl(str(path), field="other"))
 
 
 def test_prepare_corpus_filters_dedupes_encodes_and_packs():
@@ -177,3 +179,10 @@ def test_prepare_corpus_returns_empty_tensor_when_everything_is_filtered():
     packed = prepare_corpus(["short"], lambda s: [1] * len(s), seq_len=8, eos_id=0)
     assert packed.shape == (0, 8)
 
+
+
+def test_thirty_word_documents_with_one_changed_word_are_both_kept():
+    # PLAN.md: 30-word documents with one changed word are kept (word 5-gram Jaccard is about 0.68 < 0.8).
+    base = " ".join(f"word{i}" for i in range(30))
+    changed = base.replace("word15", "other15")
+    assert len(dedupe_documents([base, changed])) == 2
