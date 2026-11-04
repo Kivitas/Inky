@@ -30,6 +30,13 @@ class InkyConfig(PretrainedConfig):
         v_head_dim: int = 64,
         q_lora_rank: int = 192,
         kv_lora_rank: int = 128,
+        # Opt-in per-head RMSNorm on the query and key parts (nope and rope) before the dot product.
+        # False keeps the architecture and parameter count unchanged. Cost when True: the key norm is
+        # nonlinear, so the absorbed cached-decode path can no longer score against the latent cache
+        # directly. It up-projects the WHOLE latent cache to per-head k_nope ([B, H, T, nope]) every
+        # decode step, which costs O(T * H * nope * kv_rank) per step and a transient [B, H, T, nope]
+        # tensor. That removes most of the decode-time benefit of absorption for long contexts.
+        qk_norm: bool = False,
         # Recurrent depth: pre layers -> recurrent core (shared over loops) -> post layers
         num_pre_layers: int = 1,
         num_recurrent_layers: int = 2,
@@ -55,6 +62,10 @@ class InkyConfig(PretrainedConfig):
         num_active_routed: int = 2,
         router_z_loss_coef: float = 1e-3,
         balance_rate: float = 1e-3,        # aux-loss-free congestion-bias rate
+        # MoE dispatch: on a non-CPU device, batches of at most this many tokens run every routed expert
+        # on every token (sync-free, no host read of expert counts; ~num_routed/top_k times the routed
+        # compute). Larger batches (training, prefill) use the grouped path. 0 disables the dense path.
+        moe_dense_max_tokens: int = 64,
         # Context and numerics
         max_position_embeddings: int = 8192,
         rope_theta: float = 500000.0,
@@ -76,7 +87,7 @@ class InkyConfig(PretrainedConfig):
         arlo_refine_steps: int = 2,        # slot refinement passes (gated update)
         eos_token_id: int = 49974,         # <|endoftext|> in EOS_Tokenizer
         pad_token_id: int = 49974,
-        ssm_mixer_layers: tuple = (),      # recurrent-core layer indices that use SelectiveSSMMixer instead of attention
+        ssm_mixer_layers: tuple = (),      # recurrent-core layer indices using SelectiveSSMMixer, not attention
         # Dropout (TRAIN-04). Both are active only in train mode and both default to 0 (no dropout).
         # embedding_dropout drops token-embedding entries once per forward pass. residual_dropout drops
         # each block's attention and MoE branch outputs before they are added to the residual stream.
@@ -108,6 +119,7 @@ class InkyConfig(PretrainedConfig):
         self.v_head_dim = v_head_dim
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.qk_norm = bool(qk_norm)
         self.num_pre_layers = num_pre_layers
         self.num_recurrent_layers = num_recurrent_layers
         self.num_post_layers = num_post_layers
@@ -128,6 +140,9 @@ class InkyConfig(PretrainedConfig):
         self.num_active_routed = num_active_routed
         self.router_z_loss_coef = router_z_loss_coef
         self.balance_rate = balance_rate
+        if int(moe_dense_max_tokens) < 0:
+            raise ValueError(f"moe_dense_max_tokens must be >= 0, got {moe_dense_max_tokens}")
+        self.moe_dense_max_tokens = int(moe_dense_max_tokens)
         self.max_position_embeddings = max_position_embeddings
         self.rope_theta = rope_theta
         self.rms_norm_eps = rms_norm_eps

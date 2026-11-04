@@ -5,7 +5,7 @@ window, meant to run locally.
 
 **Status: untrained.** This repository contains the model code, a training loop with a command-line
 entry point (smoke-tested, including `--dry-run`, never run on a real corpus), decoding controls, an
-evaluation harness, and 490 tests. There is no training corpus, no trained weights, no baseline
+evaluation harness, and over 518 tests. There is no training corpus, no trained weights, no baseline
 comparison, and no measured quality. Nothing here is a claim about how Inky writes.
 
 Inky takes its language-model path from the EOS project (`Desktop/New folder/EOS LLM`) and scales
@@ -14,18 +14,21 @@ maker ported from the Choice and Noul primitives in Rhen. Arlo reads hidden stat
 "which option" or "yes or no" questions. It does not generate text, and it is not part of the
 language-model path. It is off by default (`enable_arlo=False`). `train_arlo` can fit its
 parameters on labelled examples with the language model frozen, but no trained decision
-checkpoint exists, so its answers are untrained. The other Rhen primitives (Score, Range, Extract,
+checkpoint exists, so its answers are untrained. `decide_*` warns while the engine is untrained;
+`train_arlo` clears the warning, and so does `model.mark_arlo_trained()` after you load trained
+Arlo weights. The other Rhen primitives (Score, Range, Extract,
 Cascade) and its calibration layers are not ported.
 
 ## Install
 
 ```bash
-pip install -e .[dev]        # runtime dependencies plus pytest; run from the repository root
+pip install -e .[dev]        # runtime dependencies plus pytest and ruff; run from the repository root
 ```
 
 `pyproject.toml` pins `torch>=2.13,<3` and `transformers>=5.13,<6`. For a CPU-only PyTorch, install
 it first from the PyTorch CPU index (`pip install torch --index-url https://download.pytorch.org/whl/cpu`).
-`requirements.txt` lists the same runtime dependencies.
+`requirements.txt` lists the same runtime dependencies. The dev extras pin `ruff>=0.17,<0.18`; CI
+runs `python -m ruff check .` and the tests on Ubuntu and Windows (Python 3.12 and 3.13).
 
 ## Parameter budget
 
@@ -75,6 +78,15 @@ tokens → embedding
 | Per-loop loss | Each loop's state is also trained to predict the next token, weighted by its halting probability (`step_ce_token_fraction`, default 0.25). | new in Inky |
 | Chunked loss | Next-token cross-entropy and z-loss in chunks, so full 8k × 50k logits never exist at once. | `chunked_ce` |
 | Scratch reduction | The model may draft notes, then close the block. Reduction deletes the notes and keeps the text. | PENCIL (arXiv:2503.14337) |
+
+Two config switches change the attention and MoE cost profile:
+
+- `qk_norm` (opt-in, default `False`): RMS-normalises queries and keys. Decoding up-projects the
+  cached latent on every step when it is on, so it costs more per token than the default absorbed
+  decode path. It is untested on trained weights.
+- `moe_dense_max_tokens` (default 64): the sync-free dense MoE dispatch is used only for small token
+  counts (at most this many) on non-CPU devices. Larger batches use the grouped path. CPU always uses
+  the grouped path.
 
 Inference can also exit early per token with `forward_early_exit(ids, halt_threshold=...)`. It is
 batch size 1, has no training path, and its speed and output drift are unmeasured on trained weights.
@@ -144,6 +156,11 @@ Flags worth knowing:
   every training depth.
 - `--embedding-dropout` and `--residual-dropout` (both default 0). Residual dropout applies to each
   block application, so when enabled the shared core drops the same blocks at every loop.
+- `--early-stop-patience N` and `--early-stop-min-delta D` (opt-in, both off by default): stop after
+  N consecutive evals without an eval-NLL improvement of more than D. This needs `--eval-every` and
+  held-out batches. `best.pt` is unaffected.
+- `train` warns when `scale_mode="moonlight"` is combined with a Muon LR that looks like the
+  shape-mode default (0.02), since Moonlight scaling expects AdamW-sized learning rates (TRAIN-05).
 - `--min-chars` (default 20), `--ckpt-every`, `--keep-last`, `--resume`, `--max-skipped-steps`.
 - `--warmup-steps` defaults to 5% of `--steps`.
 
@@ -168,6 +185,7 @@ Other training code:
 ```bash
 pip install -e .[dev]
 python -m pytest tests -q
+python -m ruff check .                  # lint, also run in CI
 python scripts/build_untrained.py --out checkpoints/inky-50m-init
 ```
 
@@ -198,11 +216,17 @@ out = model.generate(
     temperature=0.8,
     top_p=0.95,
     bad_word_ids=build_bad_word_ids(encode),
-    eos_token_id=config.eos_token_id,       # stop at <|endoftext|>
+    # eos_token_id defaults to config.eos_token_id, so generation already stops at <|endoftext|>.
+    # Pass eos_token_id=None to never stop at EOS.
     reduce_scratch_blocks=True,             # batch size 1; needs the scratch ids in the tokenizer
 )
 print(tokenizer.decode(out[0, prompt_ids.shape[1]:].tolist()))
 ```
+
+Evaluation: `evaluate(model, batches)` scores at the model's maximum depth by default. With
+`train_draw=True` it also reports `train_draw_depths`, `nll_train_draw` and `perplexity_train_draw`:
+the mean over the integer depths from the minimum to the maximum training depth, which is what a
+training batch sees on average. The extra scoring passes cost time, so the flag is off by default.
 
 ## Measured on CPU (8 threads, fp32, untrained)
 
@@ -239,7 +263,7 @@ inky/quantize.py        int8 and int4 weight-only quantization (inference)
 inky/speculative.py     self-speculative greedy decoding (no writing controls)
 scripts/build_untrained.py   build the model, print the budget, optionally save it
 scripts/train.py        command-line training entry point (--dry-run available)
-tests/                  pytest suite (run with `python -m pytest tests -q`; 490 tests collected)
+tests/                  pytest suite (run with `python -m pytest tests -q`; over 518 tests)
 docs/critique/          critique findings and their status (STATUS.md is the index)
 docs/research/          research notes (ACT / PonderNet, training)
 ```
@@ -258,6 +282,12 @@ docs/research/          research notes (ACT / PonderNet, training)
   batch size 1 in practice.
 - **Training at 8k is expensive.** Train at shorter lengths first, then extend. Gradient
   checkpointing is available via `InkyConfig(gradient_checkpointing=True)`.
+
+## Review and plan
+
+- [docs/REVIEW.md](docs/REVIEW.md): engineering review, findings, and prioritised next steps.
+- [docs/TRAINING_PLAN.md](docs/TRAINING_PLAN.md): training plan, token-budget guideline, corpus
+  options, stages and ablation table. This is a plan, not a result.
 
 ## Known issues
 
@@ -285,6 +315,14 @@ Behaviour changes from the recent fixes (these change results compared with earl
   blocks them by default.
 - **Top-k sampling ties.** Ties at the k-th logit keep exactly k candidates.
 - **`no_repeat_ngram_size=1` raises** instead of silently banning every seen token.
+- **`generate` stops at EOS by default.** The default `eos_token_id` now means
+  `config.eos_token_id` (DOC-05). Before, it never stopped unless you passed an id. Pass
+  `eos_token_id=None` to keep the old never-stop behaviour. Speculative decoding follows the same
+  rule.
+- **MoE dispatch.** The sync-free dense path is used only up to `moe_dense_max_tokens` (default 64)
+  tokens on non-CPU devices; larger inputs use the grouped path.
+- **Evaluation.** `evaluate(train_draw=True)` also reports `nll_train_draw` and
+  `perplexity_train_draw`.
 - **Arlo is off by default** and `decide_*` restores the train/eval mode it found.
 - **Residual dropout** (when enabled) applies on every loop, so the shared core drops the same
   blocks at each application.
@@ -303,11 +341,14 @@ Model and decoding (from `docs/critique/`):
   6 per batch, while evaluation and generation use 6 (TRAIN-08). `eval_by_depth` is opt-in.
 - **The output is a halting-weighted mixture of loop states,** so `num_loops` changes the function,
   not only the depth (CORE-02, accepted design).
-- **Arlo.** `decide_*` does not warn when the engine is untrained (ARLO-01). Its query comes only from
-  the prefix (ARLO-03), and each option's prefix is recomputed rather than cached (ARLO-02).
+- **Arlo.** Its query comes only from the prefix (ARLO-03), and each option's prefix is recomputed
+  rather than cached (ARLO-02). The untrained warning (ARLO-01) is fixed: `decide_*` warns until
+  `train_arlo` runs or `mark_arlo_trained()` is called.
 - **Position encoding.** RoPE uses 16 dimensions with base 5e5 at 8k (CORE-05, accepted design).
-- **Training gaps.** No early stopping (TRAIN-04). The Moonlight scale option has no warning about its
-  learning rate (TRAIN-05). `distillation_loss` is not chunked and not wired into training (TRAIN-15).
+- **Training gaps.** `distillation_loss` is not chunked and not wired into training (TRAIN-15).
+  Fixed in this change set: early stopping is available but opt-in (`early_stop_patience`,
+  `early_stop_min_delta`; TRAIN-04), and the Moonlight scale option warns about a shape-mode learning
+  rate (TRAIN-05).
 - **fp16 AMP is untested** here (no CUDA).
 - **Dedupe is probabilistic.** A near-duplicate pair at similarity 0.8 can be missed (about 1e-7 per
   pair), but no non-duplicate is dropped.

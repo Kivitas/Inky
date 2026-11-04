@@ -3,11 +3,12 @@
 import sys
 from pathlib import Path
 
-import torch
 import torch.nn as nn
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from test_optim import tiny_model  # noqa: E402
 
 from inky import HybridOptimizer, split_parameters  # noqa: E402
 from inky.optim import (  # noqa: E402
@@ -18,7 +19,6 @@ from inky.optim import (  # noqa: E402
     assign_parameter_groups,
     format_group_counts,
 )
-from test_optim import tiny_model  # noqa: E402
 
 
 def _group_of(model, name_fragment: str):

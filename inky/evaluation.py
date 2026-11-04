@@ -3,6 +3,8 @@
   - split_heldout:        deterministic shuffle and split of a list of sequences.
   - perplexity:           mean next-token negative log likelihood and perplexity over batches.
   - evaluate:             perplexity plus the token-weighted mean PonderNet loop count, from the same pass.
+                          With ``train_draw=True`` it also reports ``nll_train_draw``, the mean of the per-depth NLLs
+                          over the integer depths the training loop draws from (TRAIN-08).
   - perplexity_by_loops:  perplexity at several recurrent loop counts over the same batches.
   - early_exit_drift:     NLL of forward_early_exit against the full forward, one sequence at a time.
   - bits_per_token:       convert a nat-based NLL to bits.
@@ -196,20 +198,39 @@ def evaluate(
     batches: Iterable[torch.Tensor],
     num_loops: Optional[int] = None,
     ignore_id: Optional[int] = None,
+    *,
+    train_draw: bool = False,
 ) -> Dict[str, float]:
     """``perplexity`` plus ``mean_loops``, the mean expected PonderNet loop count over all evaluated positions.
 
     Both numbers come from the same forward pass per batch. ``mean_loops`` is weighted by batch size
     times sequence length, so larger batches count in proportion. ``ignore_id`` works as in ``perplexity``.
+
+    The default scores at ``num_loops`` (None = the model's maximum depth). With ``train_draw=True`` the result
+    also has ``train_draw_depths`` (the integers ``min_recurrent_loops..max_recurrent_loops``), ``nll_train_draw``
+    and ``perplexity_train_draw``. ``nll_train_draw`` is the mean over those depths of the NLL measured at each
+    depth (``perplexity_by_loops``), so it is the expected NLL of a model run at a depth drawn uniformly as in
+    training; it is the NLL of a real mixture of runs, not an interpolation. ``perplexity_train_draw`` is its
+    exponential. The batches are materialised once so they can be scanned for every depth. The default output
+    is unchanged.
     """
+    if train_draw:
+        batches = list(batches)
     r = _run(model, batches, None, num_loops, ignore_id)
-    return {
+    out = {
         "nll": r["nll"],
         "perplexity": math.exp(r["nll"]),
         "tokens": r["tokens"],
         "batches": r["batches"],
         "mean_loops": r["mean_loops"],
     }
+    if train_draw:
+        cfg = model.config
+        depths = list(range(cfg.min_recurrent_loops, cfg.max_recurrent_loops + 1))
+        by_depth = perplexity_by_loops(model, batches, depths, ignore_id=ignore_id)
+        nll = sum(by_depth[d]["nll"] for d in depths) / len(depths)
+        out.update(train_draw_depths=depths, nll_train_draw=nll, perplexity_train_draw=math.exp(nll))
+    return out
 
 
 def perplexity_by_loops(

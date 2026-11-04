@@ -17,9 +17,13 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from inky import InkyConfig, InkyModel, NgramBanIndex  # noqa: E402
-from inky import modeling  # noqa: E402
-from inky.modeling import _WindowedNgramIndex, _apply_repetition_penalty  # noqa: E402
+from inky import (  # noqa: E402
+    InkyConfig,
+    InkyModel,
+    NgramBanIndex,
+    modeling,
+)
+from inky.modeling import _apply_repetition_penalty, _WindowedNgramIndex  # noqa: E402
 from inky.scratch import ScratchTracker, reduce_scratch  # noqa: E402
 
 OPEN, SEP, CLOSE = 508, 509, 510
@@ -470,7 +474,8 @@ def test_core08_flag_is_respected_by_the_step_loss():
 
 if __name__ == "__main__":
     tests = [value for name, value in list(globals().items())
-             if name.startswith("test_") and "monkeypatch" not in value.__code__.co_varnames[:value.__code__.co_argcount]]
+             if name.startswith("test_")
+             and "monkeypatch" not in value.__code__.co_varnames[:value.__code__.co_argcount]]
     for test in tests:
         test()
         print(f"ok  {test.__name__}")

@@ -24,7 +24,6 @@ confidence feedback. Those either serve non-writing tasks or depend on calibrati
 """
 
 import math
-from typing import Optional
 
 import torch
 import torch.nn as nn
@@ -277,6 +276,9 @@ def train_arlo(
                 optimiser.zero_grad()
                 loss.backward()
                 optimiser.step()
+                mark = getattr(model, "mark_arlo_trained", None)
+                if mark is not None:
+                    mark()          # ARLO-01: survives from_pretrained / deepcopy, unlike a gradient hook
                 losses.append(float(loss.detach()))
     finally:
         for p in frozen:

@@ -16,7 +16,19 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=9.0,<10",
+    "ruff>=0.17,<0.18",
 ]
 
 [tool.setuptools.packages.find]
 include = ["inky*"]
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+extend-exclude = [".omc", "docs"]
+
+[tool.ruff.lint]
+# Conservative rule set: pyflakes, pycodestyle errors, isort, bugbear.
+select = ["E", "F", "I", "B"]
+# B905 (zip without strict=) would touch every zip() call in inky/ for little gain.
+ignore = ["B905"]

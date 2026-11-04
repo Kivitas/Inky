@@ -1,6 +1,8 @@
-"""Tests for inky/data.py using in-memory strings and tmp_path files. Run with: python -m pytest tests/test_data.py -q"""
+"""Tests for inky/data.py using in-memory strings and tmp_path files.
 
-import json
+Run with: python -m pytest tests/test_data.py -q
+"""
+
 import sys
 from pathlib import Path
 

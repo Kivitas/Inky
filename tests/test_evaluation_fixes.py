@@ -13,8 +13,11 @@ import torch.nn.functional as F
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from inky import evaluation  # noqa: E402
-from inky import InkyConfig, InkyModel  # noqa: E402
+from inky import (  # noqa: E402
+    InkyConfig,
+    InkyModel,
+    evaluation,
+)
 from inky.evaluation import early_exit_drift, evaluate, perplexity, perplexity_by_loops  # noqa: E402
 from inky.modeling import InkyOutput  # noqa: E402
 

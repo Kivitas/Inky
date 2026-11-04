@@ -29,7 +29,11 @@ def quiet(_msg):
 def make_model(min_loops: int = 2, max_loops: int = 4, zero_aux: bool = True) -> InkyModel:
     """A tiny model. ``zero_aux`` removes the auxiliary loss terms, so the loss is a plain per-token mean."""
     torch.manual_seed(0)
-    extra = dict(z_loss_coef=0.0, router_z_loss_coef=0.0, ponder_step_loss_coef=0.0, ponder_kl_coef=0.0) if zero_aux else {}
+    extra = (
+        dict(z_loss_coef=0.0, router_z_loss_coef=0.0, ponder_step_loss_coef=0.0, ponder_kl_coef=0.0)
+        if zero_aux
+        else {}
+    )
     config = InkyConfig(
         vocab_size=512,
         scratch_open_id=OPEN,

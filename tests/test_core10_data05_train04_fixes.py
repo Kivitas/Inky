@@ -13,8 +13,11 @@ import torch
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from inky import InkyConfig, InkyModel  # noqa: E402
-from inky import modeling  # noqa: E402
+from inky import (  # noqa: E402
+    InkyConfig,
+    InkyModel,
+    modeling,
+)
 from inky.data import DEFAULT_RESERVED_IDS, FIRST_SPECIAL_ID  # noqa: E402
 from inky.layers import pondernet_kl  # noqa: E402
 

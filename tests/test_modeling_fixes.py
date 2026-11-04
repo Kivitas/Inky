@@ -17,8 +17,13 @@ import torch.nn.functional as F
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import inky  # noqa: E402
-from inky import InkyConfig, InkyModel, NgramBanIndex, soft_penalty_token_ids  # noqa: E402
-from inky import modeling  # noqa: E402
+from inky import (  # noqa: E402
+    InkyConfig,
+    InkyModel,
+    NgramBanIndex,
+    modeling,
+    soft_penalty_token_ids,
+)
 from inky.layers import SharedExpertMoE  # noqa: E402
 from inky.modeling import InkyCache  # noqa: E402
 from inky.style import banned_by_bad_words, banned_by_no_repeat_ngram  # noqa: E402

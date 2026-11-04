@@ -1,8 +1,7 @@
 """Inky: a ~50M-parameter recurrent language model for creative writing (untrained)."""
 
-from .config import InkyConfig
 from .arlo import Arlo
-from .modeling import InkyCache, InkyModel, InkyOutput
+from .config import InkyConfig
 from .data import doc_boundary_mask, pack_sequences_with_segments
 from .evaluation import early_exit_drift, perplexity_by_loops
 from .metrics import (
@@ -14,6 +13,7 @@ from .metrics import (
     print_report,
     text_report,
 )
+from .modeling import InkyCache, InkyModel, InkyOutput
 from .optim import (
     HybridOptimizer,
     Muon,

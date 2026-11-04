@@ -7,8 +7,11 @@ import torch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from inky import InkyConfig, InkyModel  # noqa: E402
-from inky import modeling  # noqa: E402
+from inky import (  # noqa: E402
+    InkyConfig,
+    InkyModel,
+    modeling,
+)
 from inky.scratch import reduce_scratch  # noqa: E402
 from inky.style import banned_by_bad_words, banned_by_no_repeat_ngram, build_bad_word_ids  # noqa: E402
 
