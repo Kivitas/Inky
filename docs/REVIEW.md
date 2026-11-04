@@ -1,15 +1,15 @@
 # Engineering review
 
-Scope: the Inky repository as of the current `main` (commit 7a69fc1). This is a review of the code,
+Scope: the Inky repository as of the current working tree on `main` (last commit 711efeb, plus uncommitted changes). This is a review of the code,
 the evidence, and the open decisions. It makes no claim about writing quality, because no model has
 been trained or scored.
 
 ## Summary
 
 Inky is a ~50M-parameter recurrent language model with an 8k window. The code is complete enough to
-build, run and test (over 518 tests), and the training loop has been smoke-tested with `--dry-run` only.
-The main gap is evidence: there is no corpus, no trained weights, no dense baseline and no measured
-quality. Most design choices are therefore unvalidated, and the next work should test them rather
+build, run and test (680 tests collected), and the training loop has been smoke-tested with `--dry-run` only.
+The main gap is evidence: there is no corpus, no trained weights, no baseline run (the dense switch
+exists but was never trained) and no measured quality. Most design choices are therefore unvalidated, and the next work should test them rather
 than add to them.
 
 ## Findings
@@ -23,20 +23,20 @@ than add to them.
 
 ### Decode speed
 
-- Decode was measured at 131-185 ms per token on CPU (8 threads, fp32, untrained). This is a stale
-  measurement from an earlier commit and has not been repeated.
-- The two likely causes are the per-token re-concatenation of the latent cache in
-  `MultiLatentAttention.forward` (the cache concat), which copies the whole cache on every step, and
-  a host sync in `SharedExpertMoE._dispatch_routed`, which stalls the device once per token.
-- The MoE dispatch change is now in (see "Done in this change set"). The cache concat is unchanged,
-  and neither has been profiled on the current code.
+- Decode was measured at 131-185 ms per token on CPU (8 threads, fp32, untrained) at an earlier
+  commit. That table is stale and has not been measured again since; do not quote it.
+- Two suspected causes were the per-token re-concatenation of the latent cache and a host sync in the
+  MoE dispatch. Both changes are now in (see "Done in this change set"). The growable `LatentKV` cache
+  measured only about 88 against about 92 ms per token on CPU at 2,000 tokens of context, so the cache
+  concat was not the main cost. The remaining cost has not been profiled.
 
 ### Architecture choices that need evidence
 
 - **Halting.** PonderNet halting (arXiv 2107.05407, 2021) is used to weight loop outputs. Newer
   Mixture-of-Recursions routing (arXiv 2507.10524) saves training compute by routing tokens through
-  fewer recursion steps. Inky has not compared the two, and PonderNet's KL term and geometric prior
-  add training complexity.
+  fewer recursion steps. Inky now implements it as opt-in `routing_mode="mor"`, but it is untrained
+  and unmeasured, and the two have not been compared. PonderNet's KL term and geometric prior add
+  training complexity.
 - **MoE at this size.** Work reported in arXiv 2605.11689 (found via web search, not independently
   verified) suggests MoE is doubtful below about 20M
   active parameters under short training budgets. Inky sits near that scale, and whether it falls
@@ -45,26 +45,32 @@ than add to them.
 - **Muon.** Per-matrix Newton-Schulz orthogonalisation adds per-step cost. A NeurIPS 2026 benchmark
   (neurips.cc/virtual/2026/161439; found via web search, not independently verified) reports that it can lose on wall-clock time at tiny scale. Inky
   uses the hybrid Muon and AdamW optimiser ported from EOS without a comparison against AdamW alone.
+  An optional batched Newton-Schulz step (`--muon-batched`) now exists; its speed-up is unmeasured.
 - **QK-norm and gated attention.** IMU-1 (arXiv 2602.02522; found via web search, not independently
   verified) reports these as stabilisers. Inky now has an opt-in `qk_norm` flag (default off, so no
-  default behaviour changed) and still has no gated attention. QK-norm is untested on trained
+  default behaviour changed), with `qk_norm_mode` `"head"` or `"latent"` (the latent mode keeps the
+  cached decode path absorbed), and still has no gated attention. QK-norm is untested on trained
   weights.
 - **Highway.** The state-space memory highway is a causal running mean carried across loops. It has
-  not been ablated, so its contribution is unknown.
+  not been ablated, so its contribution is unknown. `use_highway=False` (50,165,505 parameters) and the
+  `no_highway` variant in `scripts/ablate.py` exist for the test.
 - **Depth mismatch.** Training draws 2 to 6 loops per batch, while inference uses 6 by default. The
   model is therefore evaluated at a depth it was only partly trained for, unless `eval_by_depth` is
   used.
 
 ### Process and project gaps
 
-- **No baseline.** Nothing has been scored against a dense model of the same size or a published
-  reference, so no claim of improvement is possible yet.
+- **No baseline run.** `use_moe=False` builds a dense variant (30,742,721 parameters, which matches
+  the MoE's active feed-forward width, not its total), but nothing has been trained or scored against
+  it or a published reference, so no claim of improvement is possible yet.
+- **No CUDA testing.** Everything was run on CPU. `--amp fp16`, `--compile` and the MoE dense dispatch
+  path on a device have never run on a GPU.
 - **No corpus.** Training needs a licensed or public-domain corpus. None is in the repository.
 - **No post-training stage.** There is no instruction or style tuning, and no preference data.
-- **No LICENSE.** The licence choice is the owner's decision. The repository cannot be reused
-  until it is made.
-- **No distributed training and no `torch.compile`.** Training runs on a single device without
-  compilation, which limits throughput.
+- **Licence: resolved.** A `LICENSE` file is present: proprietary, all rights reserved, private
+  repository.
+- **No distributed training.** DDP is not implemented, so training runs on a single device. A
+  `--compile` flag now exists (falls back to eager on failure); it is untested on CUDA and unmeasured.
 - **Lint and CI** now run in CI on Ubuntu and Windows (see below). Nothing else about the pipeline
   is validated, because no training run exists.
 
@@ -72,25 +78,47 @@ than add to them.
 
 1. **Dense baseline first.** Train a dense model of matched total and active size on the same tokens
    and evaluation. Every later claim depends on this.
-2. **Decode speed.** Preallocate the attention cache instead of re-concatenating it (the MoE dispatch
-   sync is already reduced; see below). Re-measure on the current commit at 1k, 4k and 8k context.
-3. **Ablations.** MoE against dense at matched active parameters; vocabulary 16-32k against 50k; the
-   highway on and off. Each needs a held-out perplexity and the same token budget.
-4. **QK-norm.** The `qk_norm` flag exists (off by default). Test it against the default on the same
-   token budget, and note that decode costs more per token with it on.
-5. **Mixture-of-Recursions-style routing.** Compare against PonderNet on training compute and
-   held-out loss before adopting it.
-6. **LICENSE.** Owner decision. Required before any outside use.
-7. **Reproducibility.** Lint and CI are done; pin the data manifest and seeds for each ablation so
-   that results can be reproduced.
+2. **Decode speed.** The cache is now growable and the MoE dispatch sync is reduced (see below).
+   Re-measure with `scripts/bench.py` on the current commit at 1k, 4k and 8k context, then profile
+   what is left.
+3. **Ablations.** `scripts/ablate.py` has the variants (`dense`, `no_highway`, `qk_norm`,
+   `qk_norm_latent`, `vocab16k`, `vocab32k`, `fixed_depth`, ...). None has been run on a real corpus.
+   The vocabulary reduction is a config choice (`--set vocab_size=...`), not yet ablated. Each run
+   needs a held-out perplexity and the same token budget.
+4. **QK-norm.** Test `qk_norm` (head) and `qk_norm_latent` against the default on the same token
+   budget; head mode costs more per token in decode.
+5. **Mixture-of-Recursions routing.** `routing_mode="mor"` exists. Compare it against PonderNet on
+   training compute and held-out loss before adopting it. Known limits: no `ssm_mixer_layers`, no
+   `halt_threshold` early exit, host reads in the gather path may graph-break under `torch.compile`,
+   attention pads to the busiest row.
+6. **Reproducibility.** Lint and CI are done; pin the data manifest and seeds for each ablation so
+   that results can be reproduced. Multi-device (DDP) training is not implemented.
 
 ## Done in this change set
 
 These changes are in the working tree (not yet committed). They are code changes only; none has been
 measured on trained weights.
 
-- `qk_norm` config flag (opt-in, default off). Decode up-projects the latent cache each step when it
-  is on, so it costs more per token.
+Done in the latest round:
+
+- **Growable decode cache** (`LatentKV` in `inky/layers.py`): no per-token `torch.cat`. Measured
+  about 88 against about 92 ms per token on CPU at 2,000 tokens, so a small gain only.
+- **Latent QK-norm** (`qk_norm_mode="latent"`): keeps absorbed cached decode with `qk_norm` on.
+- **Dense baseline switch** (`use_moe=False`, `dense_intermediate_size`) and **highway switch**
+  (`use_highway=False`). Parameter counts: default 50,219,201; no highway 50,165,505; dense
+  30,742,721; dense and no highway 30,689,025. Nothing has been trained with them.
+- **Mixture-of-Recursions routing** (`routing_mode="mor"`, `mor_*` fields): token-choice causal depth
+  router, active tokens only per loop, stale-KV reuse. Untrained and unmeasured.
+- **Batched Muon** (`--muon-batched`) and **`--compile`** (falls back to eager).
+- **Training CLI**: `--set`, `--config-json`, resume refuses a changed config,
+  `--tokenizer-vocab-check`, `tokens_per_sec` / `tokens_seen` logging.
+- **Scripts**: `scripts/bench.py`, `scripts/ablate.py`, `scripts/sample.py`.
+- **LICENSE**: proprietary, all rights reserved, private repository.
+
+Earlier in this change set:
+
+- `qk_norm` config flag (opt-in, default off). In `"head"` mode decode up-projects the latent cache
+  each step, so it costs more per token.
 - MoE dispatch: the sync-free dense path is used only for small token counts on non-CPU devices
   (`moe_dense_max_tokens`, default 64); the grouped path is used otherwise. Decode speed on the new
   path has not been re-measured.
@@ -103,6 +131,8 @@ measured on trained weights.
   the same rule.
 - Arlo untrained warning (ARLO-01), cleared by `train_arlo` or `mark_arlo_trained()`.
 - Ruff lint in CI, with an Ubuntu and Windows matrix.
+
+Still not done: no corpus, no trained weights, no baseline or ablation run, no CUDA testing, no DDP.
 
 See also `docs/TRAINING_PLAN.md` for the planned training stages and ablation table, and the
 [critique status index](critique/STATUS.md) for the open findings.

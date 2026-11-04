@@ -19,12 +19,14 @@ first token of a document from the end of the previous one.
 """
 
 import contextlib
+import functools
 import json
 import math
 import os
 import random
 import re
 import shutil
+import time
 import warnings
 from collections.abc import Sequence as SequenceABC
 from pathlib import Path
@@ -403,12 +405,55 @@ def _fmt(x: Optional[float]) -> str:
     return "-" if x is None else f"{x:.4f}"
 
 
+def _fmt_rate(x: Optional[float]) -> str:
+    return "-" if x is None else f"{x:,.0f}"
+
+
+def _fmt_count(x: Optional[int]) -> str:
+    return "-" if x is None else f"{int(x):,}"
+
+
+def _rate(tokens: int, t0: float, device: torch.device) -> float:
+    """Tokens per second since ``t0`` (synchronises CUDA first so asynchronous work is counted)."""
+    if device.type == "cuda":
+        torch.cuda.synchronize(device)
+    return tokens / max(time.perf_counter() - t0, 1e-9)
+
+
+def _micro_step(forward, ids, docs, num_loops, *, gen, device, amp_dtype, grad_accum_steps, scaler):
+    """Forward and (if finite) backward for one micro-batch. Returns ``(out, loss_value, did_backward)``."""
+    labels = ids.clone()
+    segment_ids = None
+    if docs is not None:
+        segment_ids = docs.to(device)
+        boundary = doc_boundary_mask(segment_ids)
+        labels[:, 1:] = labels[:, 1:].masked_fill(boundary, IGNORE_INDEX)
+    with _autocast(device, amp_dtype):
+        out = forward(
+            input_ids=ids,
+            labels=labels,
+            num_loops=num_loops,
+            segment_ids=segment_ids,
+            generator=gen,
+        )
+    value = float(out.loss.detach())
+    if not math.isfinite(value):
+        return out, value, False
+    scaled = out.loss / grad_accum_steps
+    if scaler is not None:
+        scaler.scale(scaled).backward()
+    else:
+        scaled.backward()
+    return out, value, True
+
+
 def _train_line(step: int, steps: int, rec: Dict[str, Any]) -> str:
     return (
         f"step {step}/{steps} loss {rec['loss']:.4f} "
         f"[ce {_fmt(rec['ce'])} (eval-comparable NLL) step_ce {_fmt(rec['step_ce'])} "
         f"z_loss {_fmt(rec['z_loss'])} moe_aux {_fmt(rec['moe_aux'])} ponder_kl {_fmt(rec['ponder_kl'])}] "
-        f"lr_scale {rec['lr_scale']:.3f} num_loops {rec['num_loops']} grad_norm {_fmt(rec['grad_norm'])}"
+        f"lr_scale {rec['lr_scale']:.3f} num_loops {rec['num_loops']} grad_norm {_fmt(rec['grad_norm'])} "
+        f"tok/s {_fmt_rate(rec.get('tokens_per_sec'))} tokens_seen {_fmt_count(rec.get('tokens_seen'))}"
     )
 
 
@@ -437,6 +482,8 @@ def train(
     eval_by_depth: bool = False,
     early_stop_patience: Optional[int] = None,
     early_stop_min_delta: float = 0.0,
+    compile_model: bool = False,
+    extra_config: Optional[Dict[str, Any]] = None,
 ) -> List[Dict[str, Any]]:
     """Run optimiser steps up to the total ``steps`` and return the history of the whole run.
 
@@ -503,6 +550,15 @@ def train(
     ``steps``, so an early stop happens at a higher learning rate than a full run would end at. The count is
     rebuilt from the eval NLLs in the history on resume (it does not rely on ``is_best``, which older histories lack).
 
+    ``compile_model`` (default False) runs the training forward and backward through ``torch.compile``. Eval,
+    checkpoints and ``update_moe_balance`` keep using the eager model. If compiling fails, at wrapping time or
+    on the first step (compilation is lazy), a warning is issued, the RNG state is rewound and the run continues
+    eager. ``extra_config`` (a JSON-able dict) is merged into ``train_config.json``, for example the config
+    overrides a launcher applied.
+
+    Each training record also carries ``"tokens_per_sec"`` (tokens consumed by that step over its wall time) and
+    ``"tokens_seen"`` (cumulative tokens drawn so far, including skipped steps and any resumed history).
+
     The model's previous train/eval mode is restored afterwards.
     """
     if steps < 1:
@@ -568,6 +624,9 @@ def train(
     if amp_dtype == "fp16" and device.type != "cuda":
         raise ValueError("amp_dtype='fp16' needs a CUDA model; use 'bf16' for mixed precision on CPU")
     scaler = torch.amp.GradScaler("cuda") if amp_dtype == "fp16" else None
+    micro_step = functools.partial(
+        _micro_step, gen=gen, device=device, amp_dtype=amp_dtype, grad_accum_steps=grad_accum_steps, scaler=scaler
+    )
     depth_counts = list(range(cfg.min_recurrent_loops, cfg.max_recurrent_loops + 1))
     train_config = {
         "steps": steps,
@@ -582,8 +641,11 @@ def train(
         "eval_by_depth": eval_by_depth,
         "early_stop_patience": early_stop_patience,
         "early_stop_min_delta": early_stop_min_delta,
+        "compile_model": bool(compile_model),
         "model_config": cfg.to_dict(),
     }
+    if extra_config:
+        train_config.update({k: v for k, v in extra_config.items() if k not in train_config})
 
     if hasattr(optimizer, "group_counts"):
         log_fn("optimizer groups: " + format_group_counts(optimizer.group_counts()))
@@ -599,6 +661,22 @@ def train(
     )
     consecutive_skips = 0
     total_skipped = 0
+    tokens_seen = 0
+    for rec in reversed(history):
+        if rec.get("kind") == "train" and rec.get("tokens_seen") is not None:
+            tokens_seen = int(rec["tokens_seen"])
+            break
+
+    compiled = None
+    compile_verified = False
+    if compile_model:
+        try:
+            compiled = torch.compile(model)
+        except Exception as exc:  # noqa: BLE001 - any compile setup failure falls back to eager
+            warnings.warn(f"torch.compile failed ({exc!r}); continuing in eager mode", RuntimeWarning, stacklevel=2)
+            log_fn(f"torch.compile unavailable ({type(exc).__name__}); training in eager mode")
+            compiled = None
+    fwd = compiled if compiled is not None else model
     evals_since_best, patience_ref = _patience_state(history, early_stop_min_delta)
     stopped_early = False
 
@@ -621,36 +699,39 @@ def train(
             losses: List[float] = []
             part_sums: Dict[str, float] = {}
             skip_reason = None
+            step_tokens = 0
+            step_t0 = time.perf_counter()
+
             for ids, docs in micro:
                 ids = ids.to(device)
-                labels = ids.clone()
-                segment_ids = None
-                if docs is not None:
-                    segment_ids = docs.to(device)
-                    boundary = doc_boundary_mask(segment_ids)
-                    labels[:, 1:] = labels[:, 1:].masked_fill(boundary, IGNORE_INDEX)
-
-                with _autocast(device, amp_dtype):
-                    out = model(
-                        input_ids=ids,
-                        labels=labels,
-                        num_loops=num_loops,
-                        segment_ids=segment_ids,
-                        generator=gen,
-                    )
-                loss_value = float(out.loss.detach())
+                step_tokens += int(ids.numel())
+                if fwd is not model and not compile_verified:
+                    rng_before = _capture_rng(gen)
+                    try:
+                        out, loss_value, did_backward = micro_step(fwd, ids, docs, num_loops)
+                    except Exception as exc:  # noqa: BLE001 - compilation is lazy, so it can fail here
+                        warnings.warn(
+                            f"torch.compile failed on the first step ({exc!r}); continuing in eager mode",
+                            RuntimeWarning,
+                            stacklevel=2,
+                        )
+                        log_fn(f"torch.compile failed ({type(exc).__name__}); training in eager mode")
+                        fwd = model
+                        optimizer.zero_grad()
+                        _restore_rng(rng_before, gen)
+                        out, loss_value, did_backward = micro_step(fwd, ids, docs, num_loops)
+                    else:
+                        compile_verified = did_backward
+                else:
+                    out, loss_value, did_backward = micro_step(fwd, ids, docs, num_loops)
                 losses.append(loss_value)
                 for k, v in (getattr(out, "loss_parts", None) or {}).items():
                     part_sums[k] = part_sums.get(k, 0.0) + float(v)
-                if not math.isfinite(loss_value):
+                if not did_backward:
                     skip_reason = "nonfinite_loss"
                     break
-                scaled = out.loss / grad_accum_steps
-                if scaler is not None:
-                    scaler.scale(scaled).backward()
-                else:
-                    scaled.backward()
 
+            tokens_seen += step_tokens
             n_done = len(losses)
             loss_value = sum(losses) / n_done
             parts = {k: v / n_done for k, v in part_sums.items()}
@@ -664,6 +745,8 @@ def train(
                 "grad_norm": None,
                 "skipped": False,
                 "skip_reason": None,
+                "tokens_per_sec": None,
+                "tokens_seen": tokens_seen,
             }
             grad_norm = None
             unscaled = False
@@ -682,7 +765,7 @@ def train(
                 optimizer.zero_grad()
                 if unscaled:
                     scaler.update()  # lowers the loss scale after an fp16 overflow
-                record.update(skipped=True, grad_norm=grad_norm)
+                record.update(skipped=True, grad_norm=grad_norm, tokens_per_sec=_rate(step_tokens, step_t0, device))
                 consecutive_skips += 1
                 total_skipped += 1
                 history.append(record)
@@ -709,6 +792,7 @@ def train(
                 model.update_moe_balance()
                 consecutive_skips = 0
                 record["grad_norm"] = grad_norm
+                record["tokens_per_sec"] = _rate(step_tokens, step_t0, device)
                 history.append(record)
                 if log_every > 0 and (step % log_every == 0 or is_last):
                     log_fn(_train_line(step, steps, record))

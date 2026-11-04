@@ -30,8 +30,8 @@ Fixed by opt-in only (the default is unchanged): GEN-04 (`cache_dequantized`), G
 (`repeat_window`), GEN-13 (`count_prose_only`), TRAIN-04 (dropout and early stopping, both off by default). CORE-08 is
 listed as OPEN because its default (`lm_loss_recompute=True`) still runs the second head pass.
 
-Tests: over 518 collected (the final count and pass result will be refreshed at the end of this change
-set; the earlier 490-test run on 2026-11-03 predates the latest fixes).
+Tests: 680 collected and 680 passed (`python -B -m pytest tests -q -p no:cacheprovider`, 21 warnings,
+about 4 minutes on CPU, 2026-11-04).
 
 Passing tests show that the code runs. They do not show that the open items are fixed.
 
@@ -57,6 +57,8 @@ Passing tests show that the code runs. They do not show that the open items are 
   now also reports the mean over integer depths, `nll_train_draw`). `distillation_loss` is neither
   chunked nor wired in (TRAIN-15). Fixed in this change set: the Moonlight LR warning (TRAIN-05) and
   opt-in early stopping (TRAIN-04).
+- **Licence.** Resolved: a `LICENSE` file (proprietary, all rights reserved, private repository) is present.
+  The README Known issues item "No LICENSE file" is closed.
 - **Docs and tests.** No open items. DOC-05 (default EOS stop in `generate`) is fixed; it is a
   behaviour change, listed below.
 

@@ -11,16 +11,32 @@ Corpus: .jsonl files are read with --text-field (default "text"); any other file
 The tokenizer is external to this repository. It is loaded lazily with transformers.AutoTokenizer from
 --tokenizer-path, and it must agree with InkyConfig.vocab_size.
 
+Config overrides (any InkyConfig field, so ablation variants launch from the command line):
+    --set use_moe=False --set vocab_size=32003 --set qk_norm=True      (repeatable; values are Python literals)
+    --config-json variant.json                                         (a JSON object of the same keys)
+--set wins over --config-json, which wins over the dropout flags. Unknown keys are rejected. If vocab_size is
+overridden without the scratch ids, they follow it as vocab_size-3, -2, -1 (they must sit after the tokenizer
+ids). The config used is saved in train_config.json (model_config and config_overrides), and --resume reuses the
+checkpoint's config: an override that differs from it is an error, never a silent change.
+
+--compile wraps the training forward in torch.compile and falls back to eager (with a warning) if that fails.
+--muon-batched runs Newton-Schulz once per matrix shape instead of once per matrix (same results, faster).
+
 --dry-run needs neither a corpus nor a tokenizer. It builds a tiny config, generates a random-character
 corpus with a character-level encoder, and runs the same prepare_corpus and train steps for a few steps.
 """
 
 import argparse
+import ast
+import difflib
+import inspect
+import json
 import math
 import random
+import shutil
 import sys
 from pathlib import Path
-from typing import Iterable, Iterator, List, Optional
+from typing import Any, Dict, Iterable, Iterator, List, Optional
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -71,6 +87,139 @@ def _fail(message: str) -> None:
     sys.exit(f"error: {message}")
 
 
+class ConfigOverrideError(ValueError):
+    """A --set / --config-json problem, reported through the argument parser."""
+
+
+SCRATCH_ID_KEYS = ("scratch_open_id", "scratch_sep_id", "scratch_close_id")
+_LITERAL_WORDS = {"true": True, "false": False, "none": None, "null": None}
+
+
+def config_fields() -> Dict[str, Any]:
+    """Every InkyConfig constructor field with its default, read from the signature so new fields just work."""
+    params = inspect.signature(InkyConfig.__init__).parameters
+    return {
+        name: param.default
+        for name, param in params.items()
+        if name != "self" and param.kind not in (param.VAR_KEYWORD, param.VAR_POSITIONAL)
+    }
+
+
+def _coerce_override(key: str, value: Any, default: Any) -> Any:
+    """Check ``value`` against the type of the field's default (when it has one) and return it, normalised."""
+    if default is None or default is inspect.Parameter.empty:
+        return value
+    if isinstance(default, bool):
+        if not isinstance(value, bool):
+            raise ConfigOverrideError(f"{key} expects a bool (True or False), got {value!r}")
+    elif isinstance(default, int):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ConfigOverrideError(f"{key} expects an int, got {value!r}")
+    elif isinstance(default, float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise ConfigOverrideError(f"{key} expects a number, got {value!r}")
+        value = float(value)
+    elif isinstance(default, str):
+        if not isinstance(value, str):
+            raise ConfigOverrideError(f"{key} expects a string, got {value!r}")
+    elif isinstance(default, (tuple, list)):
+        if not isinstance(value, (tuple, list)):
+            raise ConfigOverrideError(f"{key} expects a list or tuple, got {value!r}")
+        value = type(default)(value)
+    return value
+
+
+def validate_overrides(raw: Dict[str, Any], source: str) -> Dict[str, Any]:
+    """Reject unknown keys and wrongly typed values; return the normalised overrides."""
+    fields = config_fields()
+    out: Dict[str, Any] = {}
+    for key, value in raw.items():
+        if key not in fields:
+            near = difflib.get_close_matches(key, list(fields), n=3, cutoff=0.6)
+            hint = f" Did you mean {', '.join(near)}?" if near else ""
+            raise ConfigOverrideError(f"{source}: unknown InkyConfig field {key!r}.{hint}")
+        try:
+            out[key] = _coerce_override(key, value, fields[key])
+        except ConfigOverrideError as exc:
+            raise ConfigOverrideError(f"{source}: {exc}") from None
+    return out
+
+
+def parse_set_items(items: Iterable[str]) -> Dict[str, Any]:
+    """Parse ``key=value`` strings. Values go through ast.literal_eval (true/false/none are also accepted)."""
+    raw: Dict[str, Any] = {}
+    for item in items:
+        key, sep, text = item.partition("=")
+        key = key.strip()
+        if not sep or not key:
+            raise ConfigOverrideError(f"--set expects key=value, got {item!r}")
+        lowered = text.strip().lower()
+        if lowered in _LITERAL_WORDS:
+            value = _LITERAL_WORDS[lowered]
+        else:
+            try:
+                value = ast.literal_eval(text.strip())
+            except (ValueError, SyntaxError):
+                if isinstance(config_fields().get(key), str):
+                    value = text.strip()      # string-valued field: a bare word such as mor is fine
+                else:
+                    raise ConfigOverrideError(
+                        f"--set {key}: cannot read {text!r} as a Python literal (strings need quotes)"
+                    ) from None
+        raw[key] = value
+    return validate_overrides(raw, "--set")
+
+
+def load_config_json(path: Path) -> Dict[str, Any]:
+    """Read a JSON object of config overrides. A ``model_config`` object (a train_config.json) is unwrapped."""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise ConfigOverrideError(f"--config-json: cannot read {str(path)!r}: {exc}") from None
+    if not isinstance(data, dict):
+        raise ConfigOverrideError(f"--config-json: {str(path)!r} must hold a JSON object")
+    if "model_config" in data and "model_config" not in config_fields() and isinstance(data["model_config"], dict):
+        data = data["model_config"]
+    return validate_overrides(data, f"--config-json {path}")
+
+
+def derive_scratch_ids(overrides: Dict[str, Any]) -> Dict[str, Any]:
+    """Overrides plus scratch ids following ``vocab_size`` (its last three ids) when it is set and they are not."""
+    out = dict(overrides)
+    if "vocab_size" in out and not any(k in out for k in SCRATCH_ID_KEYS):
+        v = int(out["vocab_size"])
+        out.update(scratch_open_id=v - 3, scratch_sep_id=v - 2, scratch_close_id=v - 1)
+    return out
+
+
+def check_tokenizer_vocab(config: InkyConfig, tokenizer_size: int, mode: str = "error") -> List[str]:
+    """Problems between the tokenizer and the config's vocabulary layout. Mode "error" exits on any."""
+    n = tokenizer_size
+    problems: List[str] = []
+    if config.vocab_size != n + 3:
+        problems.append(
+            f"tokenizer has {n} ids but InkyConfig.vocab_size is {config.vocab_size}; vocab_size must be the "
+            f"tokenizer size plus 3 scratch ids = {n + 3}. The scratch ids must be appended after the tokenizer ids. "
+            f"Fix: pass --set vocab_size={n + 3} (the scratch ids then default to {n}, {n + 1}, {n + 2})."
+        )
+    bad = [f"{k}={getattr(config, k)}" for k in SCRATCH_ID_KEYS if not n <= getattr(config, k) < config.vocab_size]
+    if bad:
+        problems.append(
+            f"scratch ids must be appended after the tokenizer ids (>= {n}) and below vocab_size "
+            f"({config.vocab_size}); got {', '.join(bad)}, which collide with real tokens."
+        )
+    if problems and mode == "error":
+        _fail(" ".join(problems) + " (--tokenizer-vocab-check warn or off skips this check)")
+    return problems
+
+
+def compile_supported_for_dry_run() -> bool:
+    """torch.compile on CPU needs a C++ compiler and is not usable on Windows here, so --dry-run skips it there."""
+    if sys.platform == "win32":
+        return False
+    return any(shutil.which(cc) for cc in ("g++", "gcc", "clang", "cc"))
+
+
 def _load_tokenizer(path: str):
     """Load the external tokenizer. transformers is imported here so that --dry-run never needs it."""
     try:
@@ -103,11 +252,52 @@ def _dry_run_texts(seed: int, n_docs: int = 40) -> Iterable[str]:
         yield "".join(rng.choice(alphabet) for _ in range(length)).strip()
 
 
+def _config_kwargs(args) -> Dict[str, Any]:
+    """Dropout flags, then --config-json / --set overrides (later wins), with scratch ids following vocab_size."""
+    kwargs = dict(embedding_dropout=args.embedding_dropout, residual_dropout=args.residual_dropout)
+    kwargs.update(derive_scratch_ids(getattr(args, "config_overrides", {})))
+    return kwargs
+
+
+def _make_config(args) -> InkyConfig:
+    kwargs = _config_kwargs(args)
+    try:
+        return dry_run_config(**kwargs) if args.dry_run else InkyConfig(**kwargs)
+    except (TypeError, ValueError, AssertionError) as exc:
+        _fail(f"invalid config: {exc}")
+
+
+def _resume_config(args, requested: InkyConfig) -> InkyConfig:
+    """The config of the checkpoint being resumed. Explicit overrides that disagree with it are an error."""
+    model_dir = Path(args.resume) / "model"
+    try:
+        saved = InkyConfig.from_pretrained(model_dir)
+    except Exception as exc:  # noqa: BLE001 - any unreadable checkpoint config is reported with its path
+        _fail(f"cannot read the checkpoint config in {model_dir}: {exc}")
+    explicit = dict(getattr(args, "config_overrides", {}))
+    for key in ("embedding_dropout", "residual_dropout"):
+        if getattr(args, key) != 0.0:
+            explicit.setdefault(key, getattr(args, key))
+    diffs = [
+        f"{key}: checkpoint {getattr(saved, key, None)!r} vs requested {getattr(requested, key, None)!r}"
+        for key in explicit
+        if getattr(saved, key, None) != getattr(requested, key, None)
+    ]
+    if diffs:
+        _fail(
+            "--resume would change the model config ("
+            + "; ".join(diffs)
+            + "). Drop those overrides to continue with the checkpoint's config, or start a new run."
+        )
+    return saved
+
+
 def _build_setup(args):
     """Return ``(config, texts, encode, eos_id)`` for a real run or for the dry run."""
-    dropout = dict(embedding_dropout=args.embedding_dropout, residual_dropout=args.residual_dropout)
+    config = _make_config(args)
+    if args.resume is not None:
+        config = _resume_config(args, config)
     if args.dry_run:
-        config = dry_run_config(**dropout)
         encode = lambda text: [3 + ord(c) % (config.vocab_size - 4) for c in text]  # noqa: E731
         return config, _dry_run_texts(args.seed), encode, config.eos_token_id
 
@@ -116,9 +306,10 @@ def _build_setup(args):
     if not args.tokenizer_path:
         _fail("--tokenizer-path is required (or use --dry-run)")
     tokenizer = _load_tokenizer(args.tokenizer_path)
-    config = InkyConfig(**dropout)
-    if len(tokenizer) > config.vocab_size:
-        _fail(f"tokenizer has {len(tokenizer)} tokens but InkyConfig.vocab_size is {config.vocab_size}")
+    if args.tokenizer_vocab_check != "off":
+        problems = check_tokenizer_vocab(config, len(tokenizer), args.tokenizer_vocab_check)
+        for problem in problems:
+            print(f"warning: {problem}")
     texts = _iter_corpus_texts(args.corpus, args.text_field)
     encode = lambda text: tokenizer.encode(text, add_special_tokens=False)  # noqa: E731
     return config, texts, encode, config.eos_token_id
@@ -181,6 +372,18 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--residual-dropout", type=float, default=0.0,
                         help="dropout on each block's branch outputs before the residual add, train mode only, "
                              "in [0, 1) (default 0 = off)")
+    parser.add_argument("--set", dest="set_items", action="append", default=[], metavar="KEY=VALUE",
+                        help="override an InkyConfig field, e.g. --set use_moe=False --set vocab_size=32003 "
+                             "(repeatable; the value is a Python literal)")
+    parser.add_argument("--config-json", type=Path, default=None, metavar="PATH",
+                        help="JSON object of InkyConfig overrides (--set wins over it)")
+    parser.add_argument("--tokenizer-vocab-check", choices=["error", "warn", "off"], default="error",
+                        help="when the tokenizer size + 3 scratch ids differs from config.vocab_size: exit (default), "
+                             "warn, or skip the check")
+    parser.add_argument("--compile", action="store_true",
+                        help="torch.compile the training forward; falls back to eager with a warning on failure")
+    parser.add_argument("--muon-batched", action="store_true",
+                        help="batch the Muon Newton-Schulz step over same-shape matrices (same results, faster)")
     args = parser.parse_args(argv)
 
     if args.out_dir is None:
@@ -209,6 +412,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     if not (math.isfinite(args.early_stop_min_delta) and args.early_stop_min_delta >= 0):
         parser.error("--early-stop-min-delta must be a finite number >= 0")
     args.amp_dtype = None if args.amp == "none" else args.amp
+    try:
+        overrides = load_config_json(args.config_json) if args.config_json is not None else {}
+        overrides.update(parse_set_items(args.set_items))
+    except ConfigOverrideError as exc:
+        parser.error(str(exc))
+    args.config_overrides = overrides
     return args
 
 
@@ -239,7 +448,19 @@ def main(argv: Optional[List[str]] = None) -> None:
     torch.manual_seed(args.seed)
     model = InkyModel(config).to(device)
     print(f"model: {model.count_parameters()['total'] / 1e6:.2f} M parameters on {device}")
-    optimizer = HybridOptimizer(model, adamw_lr=args.lr, muon_lr=args.muon_lr)
+    optimizer = HybridOptimizer(model, adamw_lr=args.lr, muon_lr=args.muon_lr, muon_batched=args.muon_batched)
+
+    compile_model = args.compile
+    if compile_model and args.dry_run and not compile_supported_for_dry_run():
+        print("--compile skipped for --dry-run: torch.compile is not usable here (needs a C++ compiler, not Windows)")
+        compile_model = False
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    run_config = {
+        "model_config": config.to_dict(),
+        "config_overrides": dict(args.config_overrides),
+        "resumed_from": str(args.resume) if args.resume is not None else None,
+    }
+    (args.out_dir / "train_config.json").write_text(json.dumps(run_config, indent=2, sort_keys=True, default=str))
 
     history = train(
         model,
@@ -265,6 +486,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         eval_by_depth=args.eval_by_depth,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
+        compile_model=compile_model,
+        extra_config={"config_overrides": dict(args.config_overrides), "muon_batched": args.muon_batched},
     )
 
     train_records = [r for r in history if r.get("kind") == "train"]

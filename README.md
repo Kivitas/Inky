@@ -5,7 +5,7 @@ window, meant to run locally.
 
 **Status: untrained.** This repository contains the model code, a training loop with a command-line
 entry point (smoke-tested, including `--dry-run`, never run on a real corpus), decoding controls, an
-evaluation harness, and over 518 tests. There is no training corpus, no trained weights, no baseline
+evaluation harness, tooling scripts (`train`, `bench`, `ablate`, `sample`), and 680 tests. There is no training corpus, no trained weights, no baseline
 comparison, and no measured quality. Nothing here is a claim about how Inky writes.
 
 Inky takes its language-model path from the EOS project (`Desktop/New folder/EOS LLM`) and scales
@@ -18,6 +18,9 @@ checkpoint exists, so its answers are untrained. `decide_*` warns while the engi
 `train_arlo` clears the warning, and so does `model.mark_arlo_trained()` after you load trained
 Arlo weights. The other Rhen primitives (Score, Range, Extract,
 Cascade) and its calibration layers are not ported.
+
+**Licence:** proprietary, all rights reserved (see `LICENSE`). This is a private repository; access
+does not grant any right to use, copy, modify or distribute it.
 
 ## Install
 
@@ -79,17 +82,62 @@ tokens → embedding
 | Chunked loss | Next-token cross-entropy and z-loss in chunks, so full 8k × 50k logits never exist at once. | `chunked_ce` |
 | Scratch reduction | The model may draft notes, then close the block. Reduction deletes the notes and keeps the text. | PENCIL (arXiv:2503.14337) |
 
-Two config switches change the attention and MoE cost profile:
+Config switches that change the attention, MoE and routing profile (all defaults keep the
+50,219,201-parameter architecture above):
 
-- `qk_norm` (opt-in, default `False`): RMS-normalises queries and keys. Decoding up-projects the
-  cached latent on every step when it is on, so it costs more per token than the default absorbed
-  decode path. It is untested on trained weights.
+- `qk_norm` (opt-in, default `False`) and `qk_norm_mode` (`"head"` default, or `"latent"`):
+  RMS-normalises queries and keys. With `"head"`, the key norm blocks absorption, so decoding
+  up-projects the whole cached latent on every step and costs more per token. With `"latent"`, there
+  is no `k_nope` norm (the latent is already RMS-normed) and `q_nope`, `q_pe` and `k_pe` are normed,
+  so the key up-projection can still be folded into the query and cached decode matches the full
+  path. `qk_norm_mode` is ignored when `qk_norm` is off. Both are untested on trained weights.
+- `use_moe` (default `True`): `False` replaces every MoE feed-forward with one dense SwiGLU of width
+  `dense_intermediate_size`. `None` (default) means (shared + top-k routed) × `intermediate_size`
+  = 2,112, the MoE's active feed-forward width per token (router not counted).
+- `use_highway` (default `True`): `False` does not build the state-space highway at all.
+- Parameter counts with the switches off (from `model.count_parameters()`): no highway 50,165,505;
+  dense 30,742,721; dense and no highway 30,689,025. The dense variant is smaller than the MoE
+  default because it matches active, not total, feed-forward parameters. These are ablation
+  switches; no variant has been trained or compared.
 - `moe_dense_max_tokens` (default 64): the sync-free dense MoE dispatch is used only for small token
   counts (at most this many) on non-CPU devices. Larger batches use the grouped path. CPU always uses
   the grouped path.
 
 Inference can also exit early per token with `forward_early_exit(ids, halt_threshold=...)`. It is
 batch size 1, has no training path, and its speed and output drift are unmeasured on trained weights.
+
+### Mixture-of-Recursions routing (`routing_mode="mor"`)
+
+`routing_mode` is `"ponder"` (default, the PonderNet path above) or `"mor"` (opt-in, Mixture-of-Recursions,
+arXiv 2507.10524, token-choice variant). Fields: `mor_router_hidden` (default `None`: one linear
+layer; an int gives an MLP), `mor_capacity_aux_coef` (default 0.01), `mor_gate_scale` (default
+`True`), `mor_temperature` (default 1.0), `mor_target_depth` (default `None`, meaning
+`ponder_prior_steps`, clipped into the loop range), `mor_sample_depth` (default `True`) and
+`mor_gather` (default `True`). With `"mor"` the default config has 50,220,741 parameters (the router
+replaces the halting unit).
+
+Semantics:
+
+- A causal router reads each token's own state (after the pre layers) and picks a depth between
+  `min_recurrent_loops` and `max_recurrent_loops`. It sees no later token, so cached decoding can
+  route the new token.
+- Training samples the depth with Gumbel-max (`mor_sample_depth=True`); eval takes the argmax. The gate
+  is the router probability of the chosen depth, which scales an active token's update
+  (`mor_gate_scale`) and carries the router's gradient.
+- In loop n only the tokens with depth >= n run (attention queries, key/value projections and the MoE
+  work on the active rows only). An exited token keeps its state and its last latents, which later
+  loops reuse as stale keys and values. The output is each token's state after its last active loop.
+  `num_loops` is a cap on depth.
+- Loss = `ce + z_loss_coef * z + moe_aux + mor_capacity_aux_coef * (E[depth] - target)^2`. The
+  PonderNet halting gate, its KL and the per-loop CE are not used.
+
+Limits: `ssm_mixer_layers` is rejected with `"mor"`; early exit with `halt_threshold` is not
+supported (a token exits at its router depth); the gather path reads counts on the host, which may
+graph-break under `torch.compile`; attention pads queries to the busiest row of each batch.
+`mor_gather=False` is a masked reference path with the same results at full compute.
+
+**Untrained and unmeasured.** MoR has not been trained, timed or compared with PonderNet. Nothing here
+claims it matches PonderNet quality or saves wall-clock time.
 
 ### Scratch reduction (PENCIL)
 
@@ -162,6 +210,23 @@ Flags worth knowing:
 - `train` warns when `scale_mode="moonlight"` is combined with a Muon LR that looks like the
   shape-mode default (0.02), since Moonlight scaling expects AdamW-sized learning rates (TRAIN-05).
 - `--min-chars` (default 20), `--ckpt-every`, `--keep-last`, `--resume`, `--max-skipped-steps`.
+- `--set KEY=VALUE` (repeatable, any `InkyConfig` field, value is a Python literal) and
+  `--config-json PATH` (a JSON object of the same keys) launch ablation variants, for example
+  `--set use_moe=False --set vocab_size=32003`. `--set` wins over `--config-json`, which wins over the
+  dropout flags. Unknown keys are rejected. If `vocab_size` is overridden without the scratch ids,
+  they become `vocab_size-3`, `-2`, `-1`. The overrides and the full config go to `train_config.json`.
+- `--resume` reuses the checkpoint's config. An override that differs from it is an error, never a
+  silent change.
+- `--tokenizer-vocab-check {error,warn,off}` (default `error`): `config.vocab_size` must equal the
+  tokenizer size + 3 scratch ids, with the scratch ids at or above the tokenizer size. A mismatch exits
+  (or warns, or is skipped). The fix it prints is `--set vocab_size=<n+3>`.
+- `--muon-batched` runs Newton-Schulz once per matrix shape instead of once per matrix. It gives the
+  same results to float tolerance and the same state-dict format; its speed-up is not measured here.
+- `--compile` wraps the training forward in `torch.compile`. If compilation fails it warns and
+  falls back to eager. `--dry-run` skips it on Windows (it needs a C++ compiler there). It has not
+  been run on CUDA, and its speed-up is unmeasured.
+- Training records carry `tokens_per_sec` and `tokens_seen` (cumulative, including skipped steps and
+  resumed history); the log line prints both.
 - `--warmup-steps` defaults to 5% of `--steps`.
 
 Pipeline: `data.prepare_corpus` (clean, quality filter, streaming near-duplicate removal, drop of
@@ -170,7 +235,7 @@ documents that contain a reserved id, encode, pack), then `inky.train.train`. Ch
 `train_config.json`). `best.pt` holds the lowest-eval-NLL weights. Only the newest `--keep-last`
 step directories are kept.
 
-Training is not run anywhere in this repository. The dry run uses random characters and a
+Training is not run anywhere in this repository (and nothing has been tested on CUDA). The dry run uses random characters and a
 character-level encoder, and it only checks that the code runs.
 
 Other training code:
@@ -184,10 +249,48 @@ Other training code:
 
 ```bash
 pip install -e .[dev]
-python -m pytest tests -q
+python -m pytest tests -q               # 680 tests collected
 python -m ruff check .                  # lint, also run in CI
 python scripts/build_untrained.py --out checkpoints/inky-50m-init
 ```
+
+### Tooling scripts
+
+```bash
+# Decode and prefill timing (median over repeats; untrained weights, timing only)
+python scripts/bench.py --context-lengths 256,1024,4096 --threads 8 --repeats 5 --json bench.json
+python scripts/bench.py --tiny --context-lengths 16,32 --decode-tokens 4 --repeats 1   # seconds on a CPU
+
+# Ablation runner for the table in docs/TRAINING_PLAN.md
+python scripts/ablate.py --list-variants
+python scripts/ablate.py --synthetic --tiny --steps 20 --out-dir runs/ablate
+python scripts/ablate.py --corpus data/*.jsonl --tokenizer-path path/to/tokenizer.json --steps 500 \
+    --variants baseline,dense,no_highway,qk_norm --out-dir runs/ablate
+
+# Generate from a checkpoint with the prose controls
+python scripts/sample.py --dry-run
+python scripts/sample.py --checkpoint runs/inky/checkpoints/step_500 --tokenizer-path tokenizer.json \
+    --prompt "The lighthouse keeper said" --max-new-tokens 120 --temperature 0.8 --top-p 0.95 \
+    --repetition-penalty 1.1 --no-repeat-ngram-size 4 --bad-words "tapestry,delve" --default-bad-words
+```
+
+- `scripts/bench.py`: times one cached prefill and `--decode-tokens` cached decode steps at each
+  `--context-lengths` entry (default 256,1024), median of `--repeats`. Takes `--set KEY=VALUE`,
+  `--num-loops`, `--threads`, `--batch-size`, `--tiny`, `--device`, `--json`. Peak memory is the CUDA
+  peak on a GPU; on CPU it is the peak resident set of the process, which never decreases.
+- `scripts/ablate.py`: variants are `baseline`, `dense`, `no_highway`, `qk_norm`, `qk_norm_latent`,
+  `vocab16k`, `vocab32k`, `fewer_loops`, `fixed_depth`, `more_experts`, `mor` (`--list-variants`). Each trains
+  on the same windows and seed and is scored on the same held-out windows; the output is a markdown
+  table plus JSON (`--out-dir`, `--json`, `--markdown`). `--synthetic` uses a seeded random-token
+  corpus (no files; it only checks the plumbing). A variant the config or data cannot support is
+  listed as skipped, never run with a key ignored. The optimiser, halting and scratch rows are not
+  config toggles and are out of scope. No real ablation has been run.
+- `scripts/sample.py`: `--checkpoint` accepts a `save_pretrained` dir, a `step_N` dir, `best.pt`, or a
+  checkpoints dir (`best.pt` wins, else the newest step). `--tokenizer-path` is a tokenizers JSON file
+  or a directory holding `tokenizer.json`. Flags: `--prompt`, `--max-new-tokens`, `--temperature`,
+  `--top-p`, `--top-k`, `--repetition-penalty`, `--no-repeat-ngram-size`, `--repeat-window`,
+  `--bad-words`, `--default-bad-words`, `--reduce-scratch-blocks`, `--num-loops`, `--greedy`,
+  `--seed`, `--device`, `--dry-run`. An untrained model writes noise.
 
 The tokenizer is not in this repository. It is the `EOS_Tokenizer/` folder of the EOS project
 (50,000 ids; `<|endoftext|>` is id 49974). Inky's scratch markers need three more ids, 50000 to 50002,
@@ -228,16 +331,19 @@ Evaluation: `evaluate(model, batches)` scores at the model's maximum depth by de
 the mean over the integer depths from the minimum to the maximum training depth, which is what a
 training batch sees on average. The extra scoring passes cost time, so the flag is off by default.
 
-## Measured on CPU (8 threads, fp32, untrained)
+## Decode speed (CPU)
 
-| Context | Prefill | Decode per token |
-| :--- | ---: | ---: |
-| 1,024 | 2.3 s | 131 ms |
-| 4,096 | 11.6 s | 169 ms |
-| 8,186 | 25.0 s | 185 ms |
+The latent-KV decode cache is a growable buffer (`LatentKV` in `inky/layers.py`): a decode step
+writes the new latents into spare capacity (geometric growth, up to `max_position_embeddings`)
+instead of calling `torch.cat` on the whole cache every token. Forks and snapshots copy on their
+first append, so shared buffers are never overwritten. A measurement on CPU at 2,000 tokens of context
+gave about 88 ms per token with the growable cache against about 92 ms before, so the change is small,
+not a large speed-up.
 
-These figures are from an earlier commit and have not been re-measured. They describe one machine
-and say nothing about quality.
+The earlier table (131 / 169 / 185 ms per token at 1,024 / 4,096 / 8,186 tokens, with 2.3 to 25 s
+of prefill) came from an older commit. It is stale and has not been measured again since. Re-measure
+with `scripts/bench.py` before quoting any speed. Every timing describes one machine and untrained
+weights, and says nothing about quality.
 
 The chunked selective-SSM scan (off by default) was measured at 1.8× faster than the token loop at
 2048 tokens. At 8192 it keeps about 2 GiB of activations per SSM application, so it needs gradient
@@ -248,12 +354,12 @@ checkpointing.
 ```
 inky/__init__.py        public exports
 inky/config.py          InkyConfig (sizes, switches, dropout, scratch ids, Arlo settings)
-inky/layers.py          RMSNorm, RoPE, latent-KV attention, MoE, recurrent core, highway, selective SSM mixer, PonderNet halting
+inky/layers.py          RMSNorm, RoPE, latent-KV attention (growable LatentKV cache), MoE, recurrent core, highway, selective SSM mixer, PonderNet halting, MoR router
 inky/modeling.py        InkyModel, InkyCache, forward, forward_early_exit, decide_*, generate
 inky/scratch.py         reduce_scratch (PENCIL reduction rule, note cap)
 inky/style.py           stock phrases, bad-word and n-gram blocking, soft penalties
 inky/arlo.py            Arlo (latent slots, pointer heads, decision losses, train_arlo) for Choice and Noul
-inky/optim.py           Muon + AdamW hybrid optimiser (ported from EOS), parameter routing
+inky/optim.py           Muon + AdamW hybrid optimiser (ported from EOS), parameter routing, optional batched Newton-Schulz
 inky/train.py           training loop: WSD schedule, loop curriculum, grad accumulation, AMP option, eval, skip on non-finite loss, atomic checkpoints, resume
 inky/data.py            text cleaning, quality filter, streaming MinHash near-duplicate removal, reserved-id drop, packing
 inky/distill.py         distillation loss (not wired into training)
@@ -263,7 +369,11 @@ inky/quantize.py        int8 and int4 weight-only quantization (inference)
 inky/speculative.py     self-speculative greedy decoding (no writing controls)
 scripts/build_untrained.py   build the model, print the budget, optionally save it
 scripts/train.py        command-line training entry point (--dry-run available)
-tests/                  pytest suite (run with `python -m pytest tests -q`; over 518 tests)
+scripts/bench.py        prefill and per-token decode timing
+scripts/ablate.py       ablation runner (named variants, --synthetic mode)
+scripts/sample.py       text generation from a checkpoint with the prose controls
+LICENSE                 proprietary, all rights reserved
+tests/                  pytest suite (run with `python -m pytest tests -q`; 680 tests collected)
 docs/critique/          critique findings and their status (STATUS.md is the index)
 docs/research/          research notes (ACT / PonderNet, training)
 ```
@@ -274,6 +384,10 @@ docs/research/          research notes (ACT / PonderNet, training)
   is made or measured.
 - **No corpus, no trained weights, no baseline.** A training run needs a licensed or public-domain
   corpus and a compute budget. The project has neither yet.
+- **No CUDA testing, no distributed training.** Nothing has been run on CUDA. Multi-GPU training (DDP)
+  is not implemented.
+- **Ablation switches and MoR are untrained.** `use_moe`, `use_highway`, `qk_norm_mode`,
+  `routing_mode="mor"` and the `scripts/ablate.py` variants exist, but none has been trained or compared.
 - **Scratch needs training.** The reduction mechanism is in place, but the model does not know
   when to use the scratch markers.
 - **Batching.** `forward` accepts an `attention_mask` for uncached passes, and `segment_ids` for
@@ -299,8 +413,11 @@ Project-level:
 - **No trained weights and no training data.** No quality, perplexity or preference result exists.
 - **No baseline comparison and no evaluation run.** The harness exists, but nothing has been scored
   against a reference model (GEN-14).
-- **No LICENSE file.** The licence choice is the owner's to make.
+- **Licence.** A `LICENSE` file is present: proprietary, all rights reserved, private repository.
+  (The earlier "no LICENSE file" item is resolved.)
 - **The tokenizer is external.** It lives in the EOS project, and the three scratch ids must be added.
+- **Decode speed is unmeasured on the current commit.** The growable cache measured about 88 against
+  about 92 ms per token at 2,000 tokens of context on CPU. The older 131-185 ms table is stale.
 - **Early-exit saving is unmeasured.** `forward_early_exit` cuts loop work on the untrained model
   (about a third at threshold 0.5), with a large output drift. The training forward runs every loop
   by design (CORE-01, accepted design).
@@ -319,6 +436,9 @@ Behaviour changes from the recent fixes (these change results compared with earl
   `config.eos_token_id` (DOC-05). Before, it never stopped unless you passed an id. Pass
   `eos_token_id=None` to keep the old never-stop behaviour. Speculative decoding follows the same
   rule.
+- **Vocabulary size is a config choice.** `vocab_size` defaults to 50,003 (the embedding is 38% of the
+  parameters). A 16k or 32k vocabulary is available through `--set` or `scripts/ablate.py`, but no
+  ablation has been run. The training CLI refuses a tokenizer whose size + 3 differs from `vocab_size`.
 - **MoE dispatch.** The sync-free dense path is used only up to `moe_dense_max_tokens` (default 64)
   tokens on non-CPU devices; larger inputs use the grouped path.
 - **Evaluation.** `evaluate(train_draw=True)` also reports `nll_train_draw` and
