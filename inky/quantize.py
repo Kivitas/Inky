@@ -169,7 +169,10 @@ class QuantLinear(nn.Module):
         return self._forward_fused(x, b)
 
     def extra_repr(self) -> str:
-        return f"in_features={self.in_features}, out_features={self.out_features}, bits={self.bits}, group_size={self.group_size}"
+        return (
+            f"in_features={self.in_features}, out_features={self.out_features}, "
+            f"bits={self.bits}, group_size={self.group_size}"
+        )
 
 
 def quantize_model(

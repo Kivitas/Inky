@@ -16,6 +16,7 @@ corpus with a character-level encoder, and runs the same prepare_corpus and trai
 """
 
 import argparse
+import math
 import random
 import sys
 from pathlib import Path
@@ -131,10 +132,26 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--tokenizer-path", help="directory or name readable by transformers.AutoTokenizer")
     parser.add_argument("--out-dir", type=Path, default=None, help="run directory (checkpoints go under it)")
     parser.add_argument("--steps", type=int, default=1000, help="total optimiser steps")
-    parser.add_argument("--batch-size", type=int, default=None, help="sequences per micro-batch (default 8, dry run 2)")
-    parser.add_argument("--grad-accum", type=int, default=1, help="micro-batches per optimiser step (effective batch = batch-size * grad-accum)")
-    parser.add_argument("--amp", choices=["none", "bf16", "fp16"], default="none", help="mixed precision for the forward pass (fp16 needs CUDA)")
-    parser.add_argument("--eval-by-depth", action="store_true", help="at each eval, also log perplexity at every loop count in the training range")
+    parser.add_argument(
+        "--batch-size", type=int, default=None, help="sequences per micro-batch (default 8, dry run 2)"
+    )
+    parser.add_argument(
+        "--grad-accum",
+        type=int,
+        default=1,
+        help="micro-batches per optimiser step (effective batch = batch-size * grad-accum)",
+    )
+    parser.add_argument(
+        "--amp",
+        choices=["none", "bf16", "fp16"],
+        default="none",
+        help="mixed precision for the forward pass (fp16 needs CUDA)",
+    )
+    parser.add_argument(
+        "--eval-by-depth",
+        action="store_true",
+        help="at each eval, also log perplexity at every loop count in the training range",
+    )
     parser.add_argument("--seq-len", type=int, default=None, help="tokens per window (default 1024, dry run 32)")
     parser.add_argument("--lr", type=float, default=3e-3, help="AdamW learning rate (base, before warmup/decay)")
     parser.add_argument("--muon-lr", type=float, default=0.02, help="Muon learning rate (base)")
@@ -145,8 +162,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-skipped-steps", type=int, default=50, help="consecutive skipped steps before abort")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=0, help="eval every N steps (0 = no eval)")
+    parser.add_argument("--early-stop-patience", type=int, default=None,
+                        help="stop after N consecutive evals without a new best eval NLL (needs --eval-every > 0; "
+                             "default off)")
+    parser.add_argument("--early-stop-min-delta", type=float, default=0.0,
+                        help="an eval counts as an improvement only if its NLL is below the best by more than this "
+                             "(default 0.0)")
     parser.add_argument("--eval-fraction", type=float, default=0.02, help="share of windows held out for eval")
-    parser.add_argument("--ckpt-every", type=int, default=0, help="checkpoint every N steps (the last step is always saved)")
+    parser.add_argument(
+        "--ckpt-every", type=int, default=0, help="checkpoint every N steps (the last step is always saved)"
+    )
     parser.add_argument("--keep-last", type=int, default=3, help="checkpoints to keep (0 keeps all)")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--min-chars", type=int, default=200, help="quality filter: minimum document length")
@@ -176,6 +201,13 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error("--steps must be >= 1")
     if args.grad_accum < 1:
         parser.error("--grad-accum must be >= 1")
+    if args.early_stop_patience is not None:
+        if args.early_stop_patience < 1:
+            parser.error("--early-stop-patience must be >= 1")
+        if args.eval_every <= 0:
+            parser.error("--early-stop-patience needs --eval-every > 0")
+    if not (math.isfinite(args.early_stop_min_delta) and args.early_stop_min_delta >= 0):
+        parser.error("--early-stop-min-delta must be a finite number >= 0")
     args.amp_dtype = None if args.amp == "none" else args.amp
     return args
 
@@ -231,6 +263,8 @@ def main(argv: Optional[List[str]] = None) -> None:
         grad_accum_steps=args.grad_accum,
         amp_dtype=args.amp_dtype,
         eval_by_depth=args.eval_by_depth,
+        early_stop_patience=args.early_stop_patience,
+        early_stop_min_delta=args.early_stop_min_delta,
     )
 
     train_records = [r for r in history if r.get("kind") == "train"]

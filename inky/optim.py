@@ -24,7 +24,7 @@ Then call ``model.update_moe_balance()`` once per step, outside autograd.
 Reference: Jordan, "Muon: MomentUm Orthogonalized by Newton-Schulz" (2024).
 """
 
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 
 import torch
 import torch.nn as nn

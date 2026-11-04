@@ -6,7 +6,7 @@ Checked against the working tree at commit f7299ea plus uncommitted changes. **L
 findings below are from an older commit and may not match the current code.** The finding text is
 kept as written. Legend: **FIXED** = the fix is in the code (a note says which part, for example opt-in). **OPEN** = the problem remains or is only partly fixed (the note says which part). **ACCEPTED-DESIGN** = a deliberate design choice, not a defect; it is documented and was not changed. **NOT-A-BUG** = checked, and the claim does not hold for the code as designed. **UNVERIFIED** = could not be checked here.
 
-Counts for this file: 14 FIXED, 1 OPEN (of 15).
+Counts for this file: 15 FIXED, 0 OPEN (of 15).
 
 | ID | Severity | Status | Evidence in current code |
 | :--- | :--- | :--- | :--- |
@@ -19,7 +19,7 @@ Counts for this file: 14 FIXED, 1 OPEN (of 15).
 | DOC-02 | medium | FIXED | README now gives 50.22M (default) and 50.61M (Arlo) and a Files list that matches the tree. |
 | DOC-03 | medium | FIXED | PLAN section 2 rows for quantization and speculative decoding match section 7. |
 | DOC-04 | medium | FIXED | README and PLAN say the controls are not measured. |
-| DOC-05 | medium | OPEN | `generate` still defaults `eos_token_id` to None, so it does not stop at the configured EOS. The EOS test does not set one. |
+| DOC-05 | medium | FIXED | Behaviour change: the default `eos_token_id` of `generate` now means "use `config.eos_token_id`", so generation stops at the configured EOS. An explicit `eos_token_id=None` means never stop at EOS. Speculative decoding follows the same rule. |
 | DOC-06 | medium | FIXED | The loop count is kept across the scratch rebuild (see CORE-11). |
 | DATA-04 | medium | FIXED | `iter_jsonl` opens files with `utf-8-sig` (a BOM is accepted) and skips `null` text. Whitespace-only text is rejected by `quality_filter`. |
 | DATA-05 | medium | FIXED | `generate` blocks the reserved special ids by default (`blocked_token_ids` changes the list). The README documents this. |

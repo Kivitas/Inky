@@ -118,7 +118,7 @@ def test_adam_steps_reduce_choice_loss_on_a_fixed_batch():
     query, options, states, choice_gold, _ = random_batch()
     optimiser = torch.optim.Adam(arlo.parameters(), lr=1e-2)
     initial = None
-    for step in range(20):
+    for _ in range(20):
         optimiser.zero_grad()
         loss = arlo.training_loss(query, options, states, choice_gold, task="choice")
         if initial is None:

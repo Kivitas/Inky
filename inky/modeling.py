@@ -1,7 +1,8 @@
 """Inky language model: pre layers, a looped recurrent core with PonderNet halting, post layers."""
 
+import warnings
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 import torch.nn as nn
@@ -9,10 +10,9 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers import PreTrainedModel
 
-from .config import InkyConfig
 from .arlo import Arlo, mean_pool_options, option_ids
+from .config import InkyConfig
 from .data import DEFAULT_RESERVED_IDS
-from .metrics import binary_report, choice_report, print_report, text_report
 from .layers import (
     InkyBlock,
     KVEntry,
@@ -24,8 +24,13 @@ from .layers import (
     geometric_prior,
     pondernet_kl,
 )
+from .metrics import binary_report, choice_report, print_report, text_report
 from .scratch import DEFAULT_MAX_NOTE_TOKENS, ScratchTracker, reduce_scratch  # noqa: F401
 from .style import NgramBanIndex, banned_by_bad_words
+
+# Default for ``eos_token_id`` in generate / self_speculative_generate: use ``config.eos_token_id``.
+# An explicit None means "never stop at EOS"; an int means "stop at this id".
+_USE_CONFIG_EOS = object()
 
 
 class InkyCache:
@@ -83,6 +88,39 @@ class InkyModel(PreTrainedModel):
         self.post_init()
         # Start the halting gate at its prior. Set after post_init, which would reset the bias.
         self.halting.reset_prior()
+        # ARLO-01: the decision engine is an untrained prior until train_arlo has run. A gradient hook on
+        # each Arlo parameter sets the flag on the first backward pass (train_arlo does one per step), so
+        # arlo.py does not need to change. The flag is not saved with the weights (see ``arlo_trained``).
+        self._arlo_trained = False
+        if self.arlo is not None:
+            for p in self.arlo.parameters():
+                p.register_post_accumulate_grad_hook(self._on_arlo_grad)
+
+    def _on_arlo_grad(self, param: torch.Tensor) -> None:
+        self._arlo_trained = True
+
+    @property
+    def arlo_trained(self) -> bool:
+        """True once the Arlo parameters have received a gradient in this process (train_arlo does this).
+
+        Not saved with the weights: a model reloaded from a checkpoint reports False until its decision
+        engine is trained again (or ``mark_arlo_trained`` is called after loading trained weights).
+        """
+        return bool(self._arlo_trained)
+
+    def mark_arlo_trained(self) -> None:
+        """Declare the decision engine trained, e.g. after loading weights trained elsewhere."""
+        self._arlo_trained = True
+
+    def _warn_if_arlo_untrained(self) -> None:
+        if not self._arlo_trained:
+            warnings.warn(
+                "decision engine (Arlo) has not been trained in this process; its outputs are an untrained "
+                "prior. Run inky.arlo.train_arlo first, or call mark_arlo_trained() if the weights were trained "
+                "elsewhere (ARLO-01).",
+                UserWarning,
+                stacklevel=4,     # helper -> decide_* -> torch.no_grad wrapper -> caller
+            )
 
     def _init_weights(self, module: nn.Module) -> None:
         std = self.config.initializer_range
@@ -539,6 +577,7 @@ class InkyModel(PreTrainedModel):
         """
         if self.arlo is None:
             raise RuntimeError("decision engine is disabled (enable_arlo=False)")
+        self._warn_if_arlo_untrained()
         if len(options) == 0:
             raise ValueError("decide_choice needs at least one option")
         opts = [option_ids(opt, i) for i, opt in enumerate(options)]
@@ -587,6 +626,7 @@ class InkyModel(PreTrainedModel):
         """
         if self.arlo is None:
             raise RuntimeError("decision engine is disabled (enable_arlo=False)")
+        self._warn_if_arlo_untrained()
         was_training = self.training
         self.eval()
         try:
@@ -623,7 +663,7 @@ class InkyModel(PreTrainedModel):
         top_k: int = 50,
         top_p: float = 0.95,
         repetition_penalty: float = 1.1,
-        eos_token_id: Optional[int] = None,
+        eos_token_id: Union[int, None, object] = _USE_CONFIG_EOS,
         num_loops: Optional[int] = None,
         no_repeat_ngram_size: int = 4,
         bad_word_ids: Optional[Sequence[Sequence[int]]] = None,
@@ -645,6 +685,8 @@ class InkyModel(PreTrainedModel):
         must stay allowed (DATA-05). Pass an explicit list to block other ids, or ``[]`` to block nothing.
         The EOS id (``eos_token_id``, when given) and the configured ``config.eos_token_id`` are never
         blocked, even if they are in the list. Ids outside the vocabulary are ignored.
+        ``eos_token_id`` stops generation once every row emits it: left at its default it is
+        ``config.eos_token_id`` (DOC-05), an int overrides it, and an explicit ``None`` never stops at EOS.
         ``bad_word_ids`` blocks token sequences (see ``style.build_bad_word_ids``).
         ``no_repeat_ngram_size`` blocks any repeated n-gram (0 turns it off; 1 is rejected, because it
         would ban every token already seen).
@@ -667,6 +709,8 @@ class InkyModel(PreTrainedModel):
         """
         self.eval()
         cfg = self.config
+        if eos_token_id is _USE_CONFIG_EOS:
+            eos_token_id = cfg.eos_token_id      # DOC-05: stop at the configured <|endoftext|> by default
         if reduce_scratch_blocks and input_ids.shape[0] != 1:
             raise ValueError("scratch reduction needs batch size 1")
         if no_repeat_ngram_size == 1:

@@ -23,11 +23,11 @@ drafts are paid for once and then discarded.
 """
 
 import copy
-from typing import Dict, Optional, Tuple
+from typing import Dict, Tuple, Union
 
 import torch
 
-from .modeling import InkyCache, InkyModel
+from .modeling import _USE_CONFIG_EOS, InkyCache, InkyModel
 
 
 def _fork(cache: InkyCache) -> InkyCache:
@@ -50,7 +50,7 @@ def self_speculative_generate(
     max_new_tokens: int,
     draft_loops: int = 2,
     draft_len: int = 4,
-    eos_token_id: Optional[int] = None,
+    eos_token_id: Union[int, None, object] = _USE_CONFIG_EOS,
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Greedy decoding with the same model as drafter (``draft_loops``) and verifier (full loops).
 
@@ -70,8 +70,11 @@ def self_speculative_generate(
 
     Output matches ``model.generate(input_ids, max_new_tokens, do_sample=False,
     repetition_penalty=1.0, no_repeat_ngram_size=0, num_loops=config.max_recurrent_loops)``
-    token for token. Generation stops at ``max_new_tokens``, at ``eos_token_id`` (included in the
+    token for token. Generation stops at ``max_new_tokens``, at the EOS id (included in the
     output, as in ``generate``), or when the sequence reaches ``config.max_position_embeddings``.
+
+    ``eos_token_id`` follows ``generate``: left at its default it is ``config.eos_token_id``, an int
+    overrides it, and an explicit ``None`` never stops at EOS.
 
     Batch size must be 1.
     """
@@ -82,6 +85,8 @@ def self_speculative_generate(
 
     model.eval()
     cfg = model.config
+    if eos_token_id is _USE_CONFIG_EOS:
+        eos_token_id = cfg.eos_token_id
     max_loops = cfg.max_recurrent_loops
     max_pos = cfg.max_position_embeddings
 

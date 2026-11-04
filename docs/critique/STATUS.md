@@ -20,21 +20,20 @@ Status categories:
 | File | FIXED | OPEN | ACCEPTED-DESIGN | NOT-A-BUG | Total |
 | :--- | ---: | ---: | ---: | ---: | ---: |
 | [core.md](core.md) | 8 | 4 | 3 | 1 | 16 |
-| [data_docs.md](data_docs.md) | 14 | 1 | 0 | 0 | 15 |
+| [data_docs.md](data_docs.md) | 15 | 0 | 0 | 0 | 15 |
 | [arlo_metrics.md](arlo_metrics.md) | 10 | 2 | 0 | 0 | 12 |
 | [generation.md](generation.md) | 10 | 4 | 0 | 0 | 14 |
-| [training.md](training.md) | 12 | 3 | 0 | 0 | 15 |
-| **All** | **54** | **14** | **3** | **1** | **72** |
+| [training.md](training.md) | 13 | 2 | 0 | 0 | 15 |
+| **All** | **56** | **12** | **3** | **1** | **72** |
 
 Fixed by opt-in only (the default is unchanged): GEN-04 (`cache_dequantized`), GEN-06 and GEN-07
-(`repeat_window`), GEN-13 (`count_prose_only`), TRAIN-04 (dropout, no early stopping). CORE-08 is
+(`repeat_window`), GEN-13 (`count_prose_only`), TRAIN-04 (dropout and early stopping, both off by default). CORE-08 is
 listed as OPEN because its default (`lm_loss_recompute=True`) still runs the second head pass.
 
-Tests: 490 collected and 490 passed (`python -B -m pytest tests -q -p no:cacheprovider`, 2 warnings,
-about 5 minutes on CPU, run 2026-11-03).
+Tests: over 518 collected (the final count and pass result will be refreshed at the end of this change
+set; the earlier 490-test run on 2026-11-03 predates the latest fixes).
 
-Passing tests show that the code runs. They do not show that the open items are fixed. DOC-05 still
-has a test that does not set an EOS id, so it cannot detect the default-stop problem.
+Passing tests show that the code runs. They do not show that the open items are fixed.
 
 ## Open items by theme
 
@@ -51,14 +50,17 @@ has a test that does not set an EOS id, so it cannot detect the default-stop pro
 - **Model design (open).** The MoE router z-loss still averages over pad positions (CORE-10, partly
   fixed in the highway). The train-mode cached forward has no assertion (CORE-15). The decode
   prefix is recomputed per option (CORE-16).
-- **Decision engine (Arlo).** `decide_*` does not warn when untrained (ARLO-01). The prefix is
-  recomputed per option (ARLO-02). The query comes only from the prefix (ARLO-03).
-- **Training.** Train and evaluation depth differ by default (TRAIN-08). The Moonlight LR has no
-  guard (TRAIN-05). No early stopping (TRAIN-04). `distillation_loss` is neither chunked nor wired in
-  (TRAIN-15).
-- **Docs and tests.** The default EOS stop in `generate` is still unset (DOC-05).
+- **Decision engine (Arlo).** The prefix is recomputed per option (ARLO-02). The query comes only
+  from the prefix (ARLO-03). The untrained warning (ARLO-01) is fixed: it is cleared by `train_arlo`
+  or `mark_arlo_trained()`.
+- **Training.** Train and evaluation depth differ by default (TRAIN-08; `evaluate(train_draw=True)`
+  now also reports the mean over integer depths, `nll_train_draw`). `distillation_loss` is neither
+  chunked nor wired in (TRAIN-15). Fixed in this change set: the Moonlight LR warning (TRAIN-05) and
+  opt-in early stopping (TRAIN-04).
+- **Docs and tests.** No open items. DOC-05 (default EOS stop in `generate`) is fixed; it is a
+  behaviour change, listed below.
 
 Behaviour changes from the fixes (see README "Behaviour changes"): default `min_chars` 20, default
 `step_ce_token_fraction` 0.25, scratch notes capped at 256 tokens, reserved ids dropped from the data
 and blocked in `generate`, top-k ties keep exactly k candidates, `no_repeat_ngram_size=1` raises,
-Arlo off by default.
+Arlo off by default, and `generate` now stops at `config.eos_token_id` by default (DOC-05).

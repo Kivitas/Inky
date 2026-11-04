@@ -10,7 +10,7 @@ Counts for this file: 10 FIXED, 2 OPEN (of 12).
 
 | ID | Severity | Status | Evidence in current code |
 | :--- | :--- | :--- | :--- |
-| ARLO-01 | high | FIXED | `train_arlo` trains only the Arlo parameters, with the language model frozen (`arlo.py:217-284`). `enable_arlo` defaults to False. `decide_*` still does not warn when the engine is untrained, so use its output only after `train_arlo`. |
+| ARLO-01 | high | FIXED | `train_arlo` trains only the Arlo parameters, with the language model frozen (`arlo.py:217-284`). `enable_arlo` defaults to False. `decide_*` now warns while the engine is untrained; the warning is cleared by `train_arlo` or by `model.mark_arlo_trained()` (call it after loading trained Arlo weights). |
 | ARLO-02 | high | OPEN | The options run in one batched forward instead of N forwards. The prefix is still recomputed for each option, with no cache. |
 | MET-01 | high | FIXED | A class with gold counts as 0 in macro precision, recall and F1 (`choice_report`). |
 | MET-02 | high | FIXED | F-beta and per-option F1 are 0 when precision and recall are both 0. |

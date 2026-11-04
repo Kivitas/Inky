@@ -31,11 +31,14 @@ def main() -> None:
     config = InkyConfig()
     model = InkyModel(config)
 
+    total_layer_applications = (
+        config.num_pre_layers + config.num_recurrent_layers * config.max_recurrent_loops + config.num_post_layers
+    )
     print(f"Inky, untrained (seed {args.seed})")
     print(f"  context window         {config.max_position_embeddings} tokens")
     print(f"  effective depth        {config.num_pre_layers} + {config.num_recurrent_layers} x "
           f"{config.max_recurrent_loops} + {config.num_post_layers} = "
-          f"{config.num_pre_layers + config.num_recurrent_layers * config.max_recurrent_loops + config.num_post_layers} "
+          f"{total_layer_applications} "
           f"layer applications (training samples {config.min_recurrent_loops}..{config.max_recurrent_loops} loops)")
     print("  parameters")
     for name, count in model.count_parameters().items():

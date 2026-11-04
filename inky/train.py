@@ -25,9 +25,10 @@ import os
 import random
 import re
 import shutil
+import warnings
 from collections.abc import Sequence as SequenceABC
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Sequence, Tuple, Union
+from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tuple, Union
 
 import torch
 
@@ -43,6 +44,28 @@ LOSS_PART_NAMES = ("ce", "step_ce", "z_loss", "moe_aux", "ponder_kl")
 
 # Mixed-precision settings accepted by ``train(amp_dtype=...)``. None means fp32.
 AMP_DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16}
+
+# TRAIN-05: the default Muon LR (0.02) is tuned for the "shape" update scale. Moonlight scaling is set for
+# AdamW-sized LRs (about 6e-4 to 1e-3), so a Muon LR above this threshold with "moonlight" updates roughly
+# 3-4x as much as shape mode at hidden size 384 (the ratio depends on the matrix shape) and is warned about.
+MOONLIGHT_MUON_LR_WARN_ABOVE = 0.005
+
+
+def _check_moonlight_lr(optimizer) -> None:
+    """Warn when the Moonlight update scale is combined with a Muon LR that looks like the shape-mode default."""
+    muon = getattr(optimizer, "muon", None)
+    if getattr(optimizer, "scale_mode", None) != "moonlight" or muon is None:
+        return
+    lr = float(muon.defaults["lr"])     # the constructor LR, not the warmup/decay-scaled one
+    if lr > MOONLIGHT_MUON_LR_WARN_ABOVE:
+        warnings.warn(
+            f"scale_mode='moonlight' with muon_lr={lr:g}: Moonlight scaling is designed for AdamW-sized learning "
+            f"rates (about 6e-4 to 1e-3), so at this width this update is roughly 3-4x the shape-mode size "
+            f"(depending on matrix shape) and may diverge. The 0.02 default is a shape-mode value; "
+            f"set muon_lr to an AdamW-scale value (TRAIN-05).",
+            UserWarning,
+            stacklevel=3,
+        )
 
 
 def _check_amp_dtype(amp_dtype: Optional[str]) -> None:
@@ -412,6 +435,8 @@ def train(
     grad_accum_steps: int = 1,
     amp_dtype: Optional[str] = None,
     eval_by_depth: bool = False,
+    early_stop_patience: Optional[int] = None,
+    early_stop_min_delta: float = 0.0,
 ) -> List[Dict[str, Any]]:
     """Run optimiser steps up to the total ``steps`` and return the history of the whole run.
 
@@ -469,10 +494,29 @@ def train(
       * only the newest ``keep_last`` ``step_N`` directories are kept (0 keeps all).
       * ``best.pt`` holds the weights of the best eval so far (lowest ``eval_nll``), rewritten on each
         improvement.
+    ``early_stop_patience`` (default None = off, TRAIN-04) stops the run after that many consecutive evals
+    without an improvement of more than ``early_stop_min_delta`` (default 0.0: any strict decrease counts) over
+    the best eval NLL that counted as an improvement. ``best.pt`` and ``is_best`` still follow every strict
+    new minimum, whatever ``early_stop_min_delta`` is. It needs ``eval_batches`` and ``eval_every > 0``. The
+    stopping step is treated as the last step: its eval is recorded with ``"early_stopped": True`` and, with
+    ``checkpoint_dir``, a ``step_N/`` checkpoint is written there. The LR schedule is still computed from
+    ``steps``, so an early stop happens at a higher learning rate than a full run would end at. The count is
+    rebuilt from the eval NLLs in the history on resume (it does not rely on ``is_best``, which older histories lack).
+
     The model's previous train/eval mode is restored afterwards.
     """
     if steps < 1:
         raise ValueError(f"steps must be >= 1, got {steps}")
+    if early_stop_patience is not None:
+        if int(early_stop_patience) != early_stop_patience or early_stop_patience < 1:
+            raise ValueError(f"early_stop_patience must be None or an integer >= 1, got {early_stop_patience}")
+        early_stop_patience = int(early_stop_patience)
+        if eval_batches is None or eval_every <= 0:
+            raise ValueError("early_stop_patience needs eval_batches and eval_every > 0")
+    if not (math.isfinite(early_stop_min_delta) and early_stop_min_delta >= 0):
+        raise ValueError(f"early_stop_min_delta must be a finite number >= 0, got {early_stop_min_delta}")
+    early_stop_min_delta = float(early_stop_min_delta)
+    _check_moonlight_lr(optimizer)
     if max_skipped_steps < 0:
         raise ValueError(f"max_skipped_steps must be >= 0, got {max_skipped_steps}")
     if keep_last < 0:
@@ -536,6 +580,8 @@ def train(
         "grad_accum_steps": grad_accum_steps,
         "amp_dtype": amp_dtype,
         "eval_by_depth": eval_by_depth,
+        "early_stop_patience": early_stop_patience,
+        "early_stop_min_delta": early_stop_min_delta,
         "model_config": cfg.to_dict(),
     }
 
@@ -553,6 +599,8 @@ def train(
     )
     consecutive_skips = 0
     total_skipped = 0
+    evals_since_best, patience_ref = _patience_state(history, early_stop_min_delta)
+    stopped_early = False
 
     was_training = model.training
     model.train()
@@ -569,6 +617,7 @@ def train(
 
             # Draw every micro-batch of this step first, so the data order does not depend on a skip.
             micro = [next(batches) for _ in range(grad_accum_steps)]
+            train_line_logged = False
             losses: List[float] = []
             part_sums: Dict[str, float] = {}
             skip_reason = None
@@ -663,6 +712,7 @@ def train(
                 history.append(record)
                 if log_every > 0 and (step % log_every == 0 or is_last):
                     log_fn(_train_line(step, steps, record))
+                    train_line_logged = True
 
             if eval_list is not None and (step % eval_every == 0 or is_last):
                 ev = evaluate(model, eval_list, num_loops=None)
@@ -681,6 +731,22 @@ def train(
                     f"step {step} eval nll {ev['nll']:.4f} (per token, comparable to ce) "
                     f"perplexity {ev['perplexity']:.2f}" + (" new best" if is_best else "")
                 )
+                if math.isfinite(ev["nll"]):
+                    if ev["nll"] < patience_ref - early_stop_min_delta:
+                        patience_ref = ev["nll"]
+                        evals_since_best = 0
+                    else:
+                        evals_since_best += 1
+                if early_stop_patience is not None and evals_since_best >= early_stop_patience:
+                    stopped_early = True
+                    entry["early_stopped"] = True
+                    log_fn(
+                        f"early stop at step {step}: eval NLL has not improved by more than "
+                        f"{early_stop_min_delta:g} for {evals_since_best} evals "
+                        f"(early_stop_patience={early_stop_patience})"
+                    )
+                    if log_every > 0 and not train_line_logged and not record["skipped"]:
+                        log_fn(_train_line(step, steps, record))
                 if eval_by_depth:
                     by_depth = perplexity_by_loops(model, eval_list, depth_counts)
                     entry["per_depth"] = {
@@ -695,8 +761,9 @@ def train(
                 if is_best and ckpt_root is not None:
                     _save_best(ckpt_root, model, step, ev["nll"], ev["perplexity"])
 
+            final = is_last or stopped_early
             periodic = checkpoint_every > 0 and step % checkpoint_every == 0 and not record["skipped"]
-            if ckpt_root is not None and (periodic or is_last):
+            if ckpt_root is not None and (periodic or final):
                 path = ckpt_root / f"step_{step}"
                 save_training_state(
                     path,
@@ -709,8 +776,36 @@ def train(
                 )
                 _prune_checkpoints(ckpt_root, keep_last)
                 log_fn(f"saved checkpoint {path}")
+            if stopped_early:
+                break
     finally:
         model.train(was_training)
 
-    log_fn(f"done: {steps} steps, {total_skipped} skipped in total")
+    if stopped_early:
+        log_fn(f"done: stopped early at step {step} of {steps} steps, {total_skipped} skipped in total")
+    else:
+        log_fn(f"done: {steps} steps, {total_skipped} skipped in total")
     return history
+
+
+def _patience_state(history: List[Dict[str, Any]], min_delta: float = 0.0) -> Tuple[int, float]:
+    """Early-stop state rebuilt from the eval NLLs alone: (evals since the last improvement, reference NLL).
+
+    Only finite ``eval_nll`` values count, in order; an eval improves when it is below the reference by more than
+    ``min_delta``. With ``min_delta=0`` this is the number of finite evals after the first minimum. It does not
+    use ``is_best``, which histories from older runs lack.
+    """
+    ref = math.inf
+    count = 0
+    for rec in history:
+        if rec.get("kind") != "eval":
+            continue
+        nll = rec.get("eval_nll")
+        if nll is None or not math.isfinite(nll):
+            continue
+        if nll < ref - min_delta:
+            ref = nll
+            count = 0
+        else:
+            count += 1
+    return count, ref

@@ -79,6 +79,11 @@ class MultiLatentAttention(nn.Module):
     Queries go through a low-rank bottleneck. Keys and values share one compressed latent
     per token, and the RoPE part of the key is shared across heads. The cache stores only
     the latent and the RoPE key, which is much smaller than full per-head K and V.
+
+    Cost note for ``qk_norm=True``: the key norm is nonlinear, so the absorbed cached-decode path cannot
+    fold the key up-projection into the query. Each decode step up-projects the whole latent cache to
+    per-head k_nope (O(T * H * nope * kv_rank) work and a [B, H, T, nope] temporary), which gives up
+    most of the decode-time benefit of absorption. The cache itself stays small (latent + RoPE key).
     """
 
     def __init__(self, config: InkyConfig):
@@ -102,6 +107,30 @@ class MultiLatentAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.v_dim, d, bias=False)
         self.scale = self.qk_dim ** -0.5
 
+        # Optional QK-norm (per head, over the nope and rope parts separately). Created only when enabled,
+        # so the default parameter set is unchanged. Keys are normalised after up-projection, so the
+        # absorbed path has to materialise k_nope when this is on (see _absorbed_attention).
+        self.qk_norm = bool(config.qk_norm)
+        if self.qk_norm:
+            self.q_nope_norm = RMSNorm(self.nope_dim, config.rms_norm_eps)
+            self.q_pe_norm = RMSNorm(self.rope_dim, config.rms_norm_eps)
+            self.k_nope_norm = RMSNorm(self.nope_dim, config.rms_norm_eps)
+            self.k_pe_norm = RMSNorm(self.rope_dim, config.rms_norm_eps)
+
+    def _split_q(self, q: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Splits the projected queries [B, H, S, qk] into nope and rotated rope parts."""
+        q_nope, q_pe = q.split([self.nope_dim, self.rope_dim], dim=-1)
+        if self.qk_norm:
+            q_nope = self.q_nope_norm(q_nope)
+            q_pe = self.q_pe_norm(q_pe)
+        return q_nope, apply_rope(q_pe, cos, sin)
+
+    def _prep_k_pe(self, k_pe: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Shared RoPE key [B, 1, S, rope], normalised (if enabled) and rotated before it is cached."""
+        if self.qk_norm:
+            k_pe = self.k_pe_norm(k_pe)
+        return apply_rope(k_pe, cos, sin)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -118,12 +147,11 @@ class MultiLatentAttention(nn.Module):
         H = self.num_heads
 
         q = self.q_b_proj(self.q_a_norm(self.q_a_proj(x))).view(B, S, H, self.qk_dim).transpose(1, 2)
-        q_nope, q_pe = q.split([self.nope_dim, self.rope_dim], dim=-1)
-        q_pe = apply_rope(q_pe, cos, sin)
+        q_nope, q_pe = self._split_q(q, cos, sin)
 
         c_kv, k_pe = self.kv_a_proj(x).split([self.kv_rank, self.rope_dim], dim=-1)
         c_kv = self.kv_a_norm(c_kv)
-        k_pe = apply_rope(k_pe.unsqueeze(1), cos, sin)  # [B, 1, S, rope]
+        k_pe = self._prep_k_pe(k_pe.unsqueeze(1), cos, sin)  # [B, 1, S, rope]
 
         if past is not None:
             c_kv = torch.cat([past[0], c_kv], dim=1)
@@ -182,6 +210,8 @@ class MultiLatentAttention(nn.Module):
         T = c_kv.shape[1]
         kv = self.kv_b_proj(c_kv).view(B, T, H, self.nope_dim + self.v_dim).transpose(1, 2)
         k_nope, v = kv.split([self.nope_dim, self.v_dim], dim=-1)
+        if self.qk_norm:
+            k_nope = self.k_nope_norm(k_nope)
         k = torch.cat([k_nope, k_pe.expand(B, H, T, self.rope_dim)], dim=-1)
         q = torch.cat([q_nope, q_pe], dim=-1)
         if extra_mask is None:
@@ -218,11 +248,14 @@ class MultiLatentAttention(nn.Module):
         c_kv, k_pe = c_kv.to(calc), k_pe.to(calc)
         w_kv = self.kv_b_proj.weight.to(calc).view(H, self.nope_dim + self.v_dim, self.kv_rank)
         w_uk, w_uv = w_kv.split([self.nope_dim, self.v_dim], dim=1)  # [H, nope, r], [H, v, r]
-        q_c = torch.einsum("bhsn,hnr->bhsr", q_nope, w_uk)            # [B, H, Q, r]
-        scores = (
-            torch.matmul(q_c, c_kv.unsqueeze(1).transpose(-1, -2))
-            + torch.matmul(q_pe, k_pe.transpose(-1, -2))
-        ) * self.scale                                                 # [B, H, Q, T]
+        if self.qk_norm:
+            # The per-head key norm is not linear, so the nope keys are materialised for the scores.
+            k_nope = self.k_nope_norm(torch.einsum("btr,hnr->bhtn", c_kv, w_uk))   # [B, H, T, nope]
+            nope_scores = torch.matmul(q_nope, k_nope.transpose(-1, -2))
+        else:
+            q_c = torch.einsum("bhsn,hnr->bhsr", q_nope, w_uk)        # [B, H, Q, r]
+            nope_scores = torch.matmul(q_c, c_kv.unsqueeze(1).transpose(-1, -2))
+        scores = (nope_scores + torch.matmul(q_pe, k_pe.transpose(-1, -2))) * self.scale  # [B, H, Q, T]
         if mask is not None:
             scores = scores.masked_fill(~mask, float("-inf"))
         probs = torch.softmax(scores, dim=-1)
@@ -258,12 +291,11 @@ class MultiLatentAttention(nn.Module):
         _, K, _ = x_act.shape
         H = self.num_heads
         q = self.q_b_proj(self.q_a_norm(self.q_a_proj(x_act))).view(1, K, H, self.qk_dim).transpose(1, 2)
-        q_nope, q_pe = q.split([self.nope_dim, self.rope_dim], dim=-1)
-        q_pe = apply_rope(q_pe, cos[active], sin[active])
+        q_nope, q_pe = self._split_q(q, cos[active], sin[active])
 
         c, k_pe = self.kv_a_proj(x_act).split([self.kv_rank, self.rope_dim], dim=-1)
         c = self.kv_a_norm(c)
-        k_pe = apply_rope(k_pe.unsqueeze(1), cos[active], sin[active])  # [1, 1, K, rope]
+        k_pe = self._prep_k_pe(k_pe.unsqueeze(1), cos[active], sin[active])  # [1, 1, K, rope]
 
         c_store, kpe_store = store
         c_store[:, active] = c.to(c_store.dtype)
@@ -394,6 +426,7 @@ class SharedExpertMoE(nn.Module):
         self.top_k = min(config.num_active_routed, self.num_routed)
         self.balance_rate = config.balance_rate
         self.z_loss_coef = config.router_z_loss_coef
+        self.dense_max_tokens = int(config.moe_dense_max_tokens)
 
         self.shared_experts = nn.ModuleList(SwiGLU(d, ff) for _ in range(config.num_shared_experts))
         self.routed_experts = nn.ModuleList(SwiGLU(d, ff) for _ in range(self.num_routed))
@@ -428,6 +461,10 @@ class SharedExpertMoE(nn.Module):
         z_loss = torch.logsumexp(logits.float(), dim=-1).pow(2).mean() * self.z_loss_coef
         return out.view(B, S, D), z_loss
 
+    def _use_dense(self, n_tokens: int, device_type: str) -> bool:
+        """True when the sync-free dense dispatch should be used: small batch on a non-CPU device."""
+        return device_type != "cpu" and n_tokens <= self.dense_max_tokens
+
     def _dispatch_routed(
         self,
         flat: torch.Tensor,
@@ -438,8 +475,12 @@ class SharedExpertMoE(nn.Module):
         """Adds the weighted routed-expert outputs to ``out``.
 
         The (token, slot) assignments are sorted by expert once, so each expert sees one contiguous
-        block of rows. The outputs are scaled and scatter-added back to their tokens in one index_add.
+        block of rows, and the outputs are scatter-added back in one index_add (grouped path). Its
+        per-expert counts are read on the host, which is free on CPU but a device sync elsewhere. For
+        small batches on an accelerator (decode) the dense form is used instead, see ``_use_dense``.
         """
+        if self._use_dense(flat.shape[0], flat.device.type):
+            return self._dispatch_routed_dense(flat, idx, weights, out)
         k = idx.shape[1]
         flat_idx = idx.reshape(-1)                                         # [N*k], assignment a = token*k + slot
         order = torch.argsort(flat_idx, stable=True)
@@ -452,6 +493,27 @@ class SharedExpertMoE(nn.Module):
             return out
         y = torch.cat(ys, dim=0) * gate
         return out.index_add(0, token_of, y)
+
+    def _dispatch_routed_dense(
+        self,
+        flat: torch.Tensor,
+        idx: torch.Tensor,
+        weights: torch.Tensor,
+        out: torch.Tensor,
+    ) -> torch.Tensor:
+        """Sync-free form of the routed dispatch: a dense [N, E] gate matrix, zero where not selected.
+
+        Every routed expert runs on every token, so this only pays off for small N. The product is
+        masked with ``where`` so a non-finite output of an unselected expert cannot turn into NaN
+        through ``inf * 0``.
+        """
+        gate = torch.zeros(flat.shape[0], self.num_routed, device=flat.device, dtype=flat.dtype)
+        gate = gate.scatter(1, idx, weights.to(flat.dtype))             # idx holds distinct experts per token
+        for e, expert in enumerate(self.routed_experts):
+            g = gate[:, e:e + 1]
+            y = expert(flat)
+            out = out + torch.where(g > 0, y * g, torch.zeros_like(y))
+        return out
 
     @torch.no_grad()
     def update_balance_bias(self) -> None:

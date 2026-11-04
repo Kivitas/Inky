@@ -10,15 +10,15 @@ The per-epoch reshuffling, RNG state in checkpoints, atomic and rotated checkpoi
 `scripts/train.py` entry point are now in the working tree (not yet committed). The statuses above reflect
 the working tree.
 
-Counts for this file: 12 FIXED, 3 OPEN (of 15).
+Counts for this file: 13 FIXED, 2 OPEN (of 15).
 
 | ID | Severity | Status | Evidence in current code |
 | :--- | :--- | :--- | :--- |
 | TRAIN-01 | high | FIXED | Each `step_N/` holds the weights, optimiser state, step, history and `rng.pt` (RNG state). `resume_from` continues the schedule and the data order. |
 | TRAIN-02 | high | FIXED | `HybridOptimizer` defaults `muon_weight_decay` to 0.1. |
 | TRAIN-03 | high | FIXED | A non-finite loss is skipped, and so is a non-finite gradient norm (`train.py`, around lines 596-636). The run stops after `max_skipped_steps` in a row. |
-| TRAIN-04 | high | FIXED | Opt-in: `embedding_dropout` and `residual_dropout` (both default 0). `best.pt` keeps the lowest-eval-NLL weights. No early stopping. |
-| TRAIN-05 | medium | OPEN | PLAN now says about 4× (was 2×). Nothing refuses or warns about `moonlight` with `muon_lr=0.02`. |
+| TRAIN-04 | high | FIXED | Opt-in: `embedding_dropout` and `residual_dropout` (both default 0). `best.pt` keeps the lowest-eval-NLL weights. Early stopping is opt-in: `early_stop_patience` and `early_stop_min_delta` in `train` (CLI `--early-stop-patience`, `--early-stop-min-delta`), both off by default. |
+| TRAIN-05 | medium | FIXED | PLAN now says about 4× (was 2×). `train` warns when `scale_mode="moonlight"` is combined with a Muon LR that looks like the shape-mode default (0.02). It warns only; it does not refuse. |
 | TRAIN-06 | medium | FIXED | The default warmup is 5% of the steps (at least 1). |
 | TRAIN-07 | medium | FIXED | With a checkpoint directory, the last step is always saved (`train` docstring). |
 | TRAIN-08 | medium | OPEN | Partly fixed. `eval_by_depth` (opt-in) reports perplexity at each training depth. By default evaluation and generation use depth 6 while training draws 2 to 6. |

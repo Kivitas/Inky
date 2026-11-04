@@ -57,7 +57,8 @@ OTHER = (
 
 def _brute_force_dedupe(docs):
     """Reference: the original exhaustive algorithm, exact Jaccard against every kept document."""
-    from inky.data import NEAR_DUPLICATE_THRESHOLD, _jaccard, _shingles, clean_text as clean
+    from inky.data import NEAR_DUPLICATE_THRESHOLD, _jaccard, _shingles
+    from inky.data import clean_text as clean
 
     kept, kept_sh, seen = [], [], set()
     for doc in docs:

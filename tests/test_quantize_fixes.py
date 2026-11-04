@@ -17,7 +17,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import inky.quantize as quantize  # noqa: E402
 from inky.quantize import QuantLinear, quantize_model  # noqa: E402
 from tests.test_quantize import model, tiny_config  # noqa: E402,F401  (fixture reuse)
-from inky import InkyModel  # noqa: E402
 
 
 def _linear(in_f=48, out_f=40, bias=True, seed=0):
@@ -76,13 +75,13 @@ def test_cache_off_is_default_and_keeps_no_float_copy():
     assert ql._dequant_cache is None
 
 
-def test_quantize_model_default_is_no_cache(model):
+def test_quantize_model_default_is_no_cache(model):  # noqa: F811  (fixture from test_quantize)
     q = quantize_model(copy.deepcopy(model), bits=8)
     layers = [m for m in q.modules() if isinstance(m, QuantLinear)]
     assert layers and not any(m.cache_dequantized for m in layers)
 
 
-def test_model_outputs_equal_with_and_without_cache(model):
+def test_model_outputs_equal_with_and_without_cache(model):  # noqa: F811  (fixture from test_quantize)
     ids = torch.randint(0, 512, (2, 10))
     for bits in (8, 4):
         off = quantize_model(copy.deepcopy(model), bits=bits, cache_dequantized=False)
@@ -148,7 +147,7 @@ def test_weight_property_unchanged_with_and_without_cache():
     assert torch.equal(off.weight, off.dequantize(torch.float32))
 
 
-def test_state_dict_keys_unchanged_by_cache(model):
+def test_state_dict_keys_unchanged_by_cache(model):  # noqa: F811  (fixture from test_quantize)
     off = quantize_model(copy.deepcopy(model), bits=8, cache_dequantized=False)
     on = quantize_model(copy.deepcopy(model), bits=8, cache_dequantized=True)
     on(torch.randint(0, 512, (1, 4)))

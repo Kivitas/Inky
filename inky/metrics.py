@@ -22,7 +22,7 @@ and recall are both 0. The display prints None as "n/a" rather than hiding it.
 import math
 import random
 from collections import Counter
-from typing import Callable, Dict, Iterable, List, Optional, Sequence
+from typing import Callable, Dict, List, Optional, Sequence
 
 import torch
 
