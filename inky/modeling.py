@@ -1,6 +1,7 @@
 """Inky language model: pre layers, a looped recurrent core with PonderNet halting, post layers."""
 
 import warnings
+import weakref
 from dataclasses import dataclass
 from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
@@ -16,6 +17,8 @@ from .data import DEFAULT_RESERVED_IDS
 from .layers import (
     InkyBlock,
     KVEntry,
+    LatentKV,
+    MoRRouter,
     PonderHalting,
     RecurrentCore,
     RMSNorm,
@@ -33,11 +36,35 @@ from .style import NgramBanIndex, banned_by_bad_words
 _USE_CONFIG_EOS = object()
 
 
+def _claim(entry, cache: "InkyCache"):
+    """Marks a freshly built latent entry as owned by ``cache`` (see ``_writable_past``). Other entries pass through."""
+    if isinstance(entry, LatentKV):
+        entry.owner = weakref.ref(cache)
+    return entry
+
+
+def _writable_past(entry, cache: "InkyCache"):
+    """The entry to hand to a layer as ``past``: an entry that ``cache`` itself produced may be extended in
+    place (its buffer has spare capacity, so no per-token concatenation). An entry that came from another
+    cache (a fork shares the lists of its parent), a snapshot or a plain tuple is not writable, so the layer
+    copies it on the first append and the owner of the buffer is never overwritten."""
+    if isinstance(entry, LatentKV) and entry.owner is not None and entry.owner() is cache:
+        return entry.alias_writable()
+    return entry
+
+
 class InkyCache:
     """Per-sequence decoding state.
 
     One latent-KV entry per pre layer, per post layer, and per (loop, recurrent layer), plus the
-    SSM highway's running prefix sum for each loop. The loop count is fixed at the first call.
+    SSM highway's running prefix sum for each loop (None when ``use_highway`` is off). The loop count is
+    fixed at the first call.
+
+    Latent-attention entries are ``LatentKV``: a preallocated buffer that grows geometrically (up to
+    ``max_position_embeddings``) plus a valid length. A decode step writes the new latents into the buffer
+    instead of concatenating the whole cache. They unpack as ``(c_kv, k_pe)``, are never edited in place
+    once built, and only the cache that produced an entry extends its buffer in place; a fork or snapshot
+    shares the buffer safely because anything else copies on its first append.
     """
 
     def __init__(self, config: InkyConfig):
@@ -57,16 +84,21 @@ class InkyOutput:
     # MoE balance-free aux: pre and post layers summed, recurrent layers averaged over the loops run.
     moe_aux_loss: Optional[torch.Tensor] = None
     # Expected number of loops per token under the halting distribution, sum_n n * p_n(t), averaged over
-    # tokens. Same definition in forward and forward_early_exit (in [1, L]).
+    # tokens. Same definition in forward and forward_early_exit (in [1, L]). Under routing_mode='mor' it is
+    # the mean of the routed depths (each token's realised loop count, capped by num_loops).
     mean_loops: Optional[torch.Tensor] = None
     hidden: Optional[torch.Tensor] = None      # final hidden states, set when return_hidden=True
-    loop_applications: Optional[int] = None    # token-loop pairs actually computed (early exit only)
-    full_loop_applications: Optional[int] = None  # tokens x loops, for the same input
+    # Token-loop pairs actually computed, and tokens x loops for the same input. Set by forward_early_exit
+    # and, under routing_mode='mor', by forward (token rows run through the recurrent block stack).
+    loop_applications: Optional[int] = None
+    full_loop_applications: Optional[int] = None
     # Realised exit loop per token, averaged (early exit only). Equals L when nothing exits early.
     # Not the same quantity as mean_loops: it is the loop a token stopped at, not the expected value.
     mean_exit_loop: Optional[torch.Tensor] = None
     # Set when labels are given: detached, unweighted loss terms. Total loss is
     # ce + z_loss_coef * z_loss + moe_aux + ponder_step_loss_coef * step_ce + ponder_kl_coef * ponder_kl.
+    # Under routing_mode='mor': ce + z_loss_coef * z_loss + moe_aux + mor_capacity_aux_coef * mor_balance
+    # (step_ce and ponder_kl are reported as 0).
     loss_parts: Optional[Dict[str, torch.Tensor]] = None
 
 
@@ -83,11 +115,17 @@ class InkyModel(PreTrainedModel):
         self.core = RecurrentCore(config)
         self.post_layers = nn.ModuleList(InkyBlock(config) for _ in range(config.num_post_layers))
         self.norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
-        self.halting = PonderHalting(config.hidden_size, config.ponder_prior_steps)
+        mor = config.routing_mode == "mor"
+        # Under MoR routing the depth router replaces the PonderNet gate, so the gate is not created.
+        self.halting = None if mor else PonderHalting(config.hidden_size, config.ponder_prior_steps)
         self.arlo = Arlo(config) if config.enable_arlo else None
+        self.mor_router = MoRRouter(config) if mor else None
         self.post_init()
         # Start the halting gate at its prior. Set after post_init, which would reset the bias.
-        self.halting.reset_prior()
+        if self.halting is not None:
+            self.halting.reset_prior()
+        if self.mor_router is not None:
+            self.mor_router.reset_prior(config.mor_target)
         # ARLO-01: the decision engine is an untrained prior until train_arlo has run. A gradient hook on
         # each Arlo parameter sets the flag on the first backward pass (train_arlo does one per step), so
         # arlo.py does not need to change. The flag is not saved with the weights (see ``arlo_trained``).
@@ -143,9 +181,11 @@ class InkyModel(PreTrainedModel):
             "pre_layers": n(self.pre_layers),
             "recurrent_core": n(self.core),
             "post_layers": n(self.post_layers),
-            "norm + halting": n(self.norm) + n(self.halting),
+            "norm + halting": n(self.norm) + (n(self.halting) if self.halting is not None else 0),
             "decision engine": n(self.arlo) if self.arlo is not None else 0,
         }
+        if self.mor_router is not None:
+            parts["mor_router"] = n(self.mor_router)
         parts["total"] = n(self)
         return parts
 
@@ -163,6 +203,8 @@ class InkyModel(PreTrainedModel):
             return cache.num_loops
         if num_loops is not None:
             return int(num_loops)
+        if self.config.routing_mode == "mor":
+            return self.config.max_recurrent_loops      # the router sets each token's depth; this is the cap
         if self.training:
             # Sample a depth per batch so the shared core learns to work at any number of loops.
             # Drawn from torch's RNG (or ``generator``), so torch.manual_seed makes runs reproducible.
@@ -265,6 +307,81 @@ class InkyModel(PreTrainedModel):
                 total = total + self._run_head(self._chunk_weighted_ce, hc, yc, wc)
         return total * (scale / n_valid)
 
+    # ------------------------------------------------------------------ MoR routing
+
+    def _mor_route(
+        self,
+        h: torch.Tensor,
+        loops: int,
+        keep: Optional[torch.Tensor],
+        generator: Optional[torch.Generator],
+    ):
+        """Depth router. Returns ``(depth [B, S] long, gate [B, S] float or None, probs [B, S, n_depths])``.
+
+        The logits come from each token's own state only (causal). Training samples the depth with
+        Gumbel-max from ``logits / mor_temperature`` (``mor_sample_depth=False`` takes the argmax instead);
+        eval always takes the argmax. ``probs`` is the tempered softmax; ``gate`` is the probability of the
+        chosen depth (None when ``mor_gate_scale`` is off) and carries the router's gradient. Depth is
+        capped at ``loops`` and set to 0 at padded positions (``keep`` False), which never run.
+        """
+        cfg = self.config
+        scaled = self.mor_router(h) / cfg.mor_temperature
+        if self.training and cfg.mor_sample_depth:
+            dev = generator.device if generator is not None else scaled.device
+            u = torch.rand(scaled.shape, generator=generator, device=dev).to(scaled.device)
+            noise = -torch.log(-torch.log(u.clamp(1e-10, 1.0 - 1e-7)))
+            choice = (scaled.detach() + noise).argmax(dim=-1)
+        else:
+            choice = scaled.detach().argmax(dim=-1)
+        probs = torch.softmax(scaled, dim=-1)
+        gate = probs.gather(-1, choice.unsqueeze(-1)).squeeze(-1) if cfg.mor_gate_scale else None
+        depth = (choice + cfg.min_recurrent_loops).clamp(max=loops)
+        if keep is not None:
+            depth = depth * keep.to(depth.dtype)
+        return depth, gate, probs
+
+    def _mor_balance(self, probs: torch.Tensor, keep: Optional[torch.Tensor]) -> torch.Tensor:
+        """Depth-balance loss: (mean expected depth - mor_target)^2, with the expectation taken under the
+        router's soft distribution so that it is differentiable. Averaged over real tokens only."""
+        cfg = self.config
+        depths = torch.arange(
+            cfg.min_recurrent_loops, cfg.max_recurrent_loops + 1, device=probs.device, dtype=torch.float32
+        )
+        expected = (probs * depths).sum(-1)                                   # [B, S]
+        if keep is None:
+            mean_depth = expected.mean()
+        else:
+            real = keep.to(expected.dtype)
+            mean_depth = (expected * real).sum() / real.sum().clamp(min=1.0)
+        return (mean_depth - cfg.mor_target).pow(2)
+
+    def _mor_recurrence(self, h, loops, cache, past_len, cos, sin, attn_mask, segment_ids, valid_mask, keep,
+                        generator):
+        """Routed recurrence for ``routing_mode='mor'`` (see ``RecurrentCore.forward_mor``).
+
+        Returns ``(h_out, core_aux, depth, probs, rows_computed)`` and fills the per-loop cache entries
+        and highway prefix sums of ``cache`` (when given).
+        """
+        depth, gate, probs = self._mor_route(h, loops, keep, generator)
+        past_core = past_prefix = None
+        if cache is not None:
+            past_core = [
+                [_writable_past(e, cache) for e in cache.core[i]] if cache.core[i] is not None else None
+                for i in range(loops)
+            ]
+            past_prefix = list(cache.prefix)
+        h_out, aux, rows, entries, prefixes = self.core.forward_mor(
+            h, depth, gate, loops, cos, sin,
+            past_core=past_core, past_prefix=past_prefix, past_len=past_len,
+            attn_mask=attn_mask, segment_ids=segment_ids, valid_mask=valid_mask,
+            gather=self.config.mor_gather, want_cache=cache is not None,
+        )
+        if cache is not None:
+            for i, ents in enumerate(entries):
+                cache.core[i] = [_claim(e, cache) for e in ents]
+                cache.prefix[i] = prefixes[i]
+        return h_out, aux, depth, probs, rows
+
     # ------------------------------------------------------------------ forward
 
     def forward(
@@ -299,6 +416,28 @@ class InkyModel(PreTrainedModel):
             With left padding, the last pad position predicts the first real token, so that target label
             must also be -100 (the loss does not infer it from the mask).
         ``generator`` (optional) drives the random loop-depth draw and the step-CE token subset.
+
+        Depth routing (``config.routing_mode``). ``"ponder"`` (default): PonderNet, every token runs every
+        loop and the output is the halting-weighted mix of the loop states. ``"mor"``: token-choice
+        Mixture-of-Recursions. After the pre layers a router picks a depth d(t) per token from that token's
+        own state (Gumbel-max sample in training, argmax in eval and decode; capped by ``num_loops``, which
+        defaults to ``max_recurrent_loops`` and is fixed by the first call of a cached sequence). Loop n
+        runs only the tokens with d(t) >= n: their attention queries, latent projections, output
+        projection and MoE run on the gathered active rows, so compute scales with the sum of the depths.
+        An exited token keeps its state frozen and keeps the latents of its last active loop as the keys and
+        values other tokens see in deeper loops (stale reuse). The step modulation and the SSM highway see
+        the frozen state of exited tokens: the highway's running mean at loop n averages every earlier
+        token's loop-n modulated state, active or not, but only active tokens use its output. An active
+        token's update is ``h + gate * (core_out - h)`` with gate the router probability of its depth
+        (``mor_gate_scale``). The output state of a token is its state after its last active loop (no
+        halting mixture). The loss is CE + z-loss on that final state, the MoE aux, and
+        ``mor_capacity_aux_coef * (E[depth] - target)^2``; ``loss_parts`` reports step_ce and ponder_kl as
+        0. A cached step routes the new token, runs it for its d loops only, and fills the deeper loops'
+        caches with its last latent and its frozen highway contribution, so cached decoding equals the full
+        forward. ``attention_mask`` / ``segment_ids`` are supported (padded positions get depth 0 and never
+        run). ``ssm_mixer_layers`` is rejected at config time. Layer-drop (``loop_dropout_prob``) skips a
+        layer for all active tokens of a loop; an exited token whose layer-j latent was never written keeps
+        a zero key/value there (training only).
         """
         B, S = input_ids.shape
         cache = past
@@ -325,10 +464,10 @@ class InkyModel(PreTrainedModel):
         moe_aux = h.new_zeros((), dtype=torch.float32)
 
         for i, layer in enumerate(self.pre_layers):
-            h, present, aux = layer(h, cos, sin, cache.pre[i] if cache is not None else None,
+            h, present, aux = layer(h, cos, sin, _writable_past(cache.pre[i], cache) if cache is not None else None,
                                     attn_mask=attn_mask, segment_ids=segment_ids)
             if cache is not None:
-                cache.pre[i] = present
+                cache.pre[i] = _claim(present, cache)
             moe_aux = moe_aux + aux
 
         loops = self._choose_loops(cache, num_loops, generator)
@@ -337,66 +476,104 @@ class InkyModel(PreTrainedModel):
             cache.core = [None] * loops
             cache.prefix = [None] * loops
 
-        # PonderNet halting over the recurrent loops. Each loop emits lambda_n(t); the halting
-        # distribution p_n(t) puts stop mass on each loop, and the output is the expectation of the
-        # loop states under p. Every loop still runs, so cached decoding matches the full forward
-        # pass exactly. This version saves no compute (see README, Known issues).
-        h_loop, prev_mem = h, None
-        lambdas: List[torch.Tensor] = []
-        loop_states: List[torch.Tensor] = []
-        core_aux = h.new_zeros((), dtype=torch.float32)   # summed over loops, averaged below
-
-        for step in range(1, loops + 1):
-            idx = step - 1
-            h_next, mem, new_prefix, presents, aux = self.core(
-                h_loop,
-                step,
-                cos,
-                sin,
-                past=cache.core[idx] if cache is not None else None,
-                prefix_sum=cache.prefix[idx] if cache is not None else None,
-                prev_mem=prev_mem,
-                past_len=past_len,
-                attn_mask=attn_mask,
-                segment_ids=segment_ids,
-                valid_mask=valid_mask,
+        mor = self.config.routing_mode == "mor"
+        mor_probs = mor_rows = None
+        if mor:
+            # Mixture-of-Recursions: route, then run each loop on the active tokens only (see forward docstring).
+            h_out, core_aux, mor_depth, mor_probs, mor_rows = self._mor_recurrence(
+                h, loops, cache, past_len, cos, sin, attn_mask, segment_ids, valid_mask, keep, generator
             )
-            if cache is not None:
-                cache.core[idx] = presents
-                cache.prefix[idx] = new_prefix
-            prev_mem = mem
-            core_aux = core_aux + aux
-
-            lambdas.append(self.halting(h_next))
-            loop_states.append(h_next)
-            h_loop = h_next
-        # The recurrent layers run once per loop. Averaging keeps the aux at the scale of one pass, so
-        # it does not grow with the loop count. Each layer's own term is still its per-loop mean.
-        moe_aux = moe_aux + core_aux / loops
-
-        weights = geometric_halting_weights(lambdas)                 # [L, B, S], sums to 1 over L
-        states = torch.stack(loop_states, dim=0).float()             # [L, B, S, D]
-        h_out = (weights.unsqueeze(-1) * states).sum(dim=0)          # [B, S, D]
-        loop_index = torch.arange(1, loops + 1, device=h.device, dtype=torch.float32).view(-1, 1, 1)
-        per_token_loops = (weights * loop_index).sum(dim=0)           # [B, S] expected loops per token
-        if keep is not None:
-            real = keep.to(per_token_loops.dtype)
-            mean_loops = (per_token_loops * real).sum() / real.sum().clamp(min=1.0)
+            moe_aux = moe_aux + core_aux
+            per_token_loops = mor_depth.to(torch.float32)
+            if keep is not None:
+                real = keep.to(per_token_loops.dtype)
+                mean_loops = (per_token_loops * real).sum() / real.sum().clamp(min=1.0)
+            else:
+                mean_loops = per_token_loops.mean()
         else:
-            mean_loops = per_token_loops.mean()
+            # PonderNet halting over the recurrent loops. Each loop emits lambda_n(t); the halting
+            # distribution p_n(t) puts stop mass on each loop, and the output is the expectation of the
+            # loop states under p. Every loop still runs, so cached decoding matches the full forward
+            # pass exactly. This version saves no compute (see README, Known issues).
+            h_loop, prev_mem = h, None
+            lambdas: List[torch.Tensor] = []
+            loop_states: List[torch.Tensor] = []
+            core_aux = h.new_zeros((), dtype=torch.float32)   # summed over loops, averaged below
+
+            for step in range(1, loops + 1):
+                idx = step - 1
+                h_next, mem, new_prefix, presents, aux = self.core(
+                    h_loop,
+                    step,
+                    cos,
+                    sin,
+                    past=(
+                        [_writable_past(e, cache) for e in cache.core[idx]]
+                        if cache is not None and cache.core[idx] is not None else None
+                    ),
+                    prefix_sum=cache.prefix[idx] if cache is not None else None,
+                    prev_mem=prev_mem,
+                    past_len=past_len,
+                    attn_mask=attn_mask,
+                    segment_ids=segment_ids,
+                    valid_mask=valid_mask,
+                )
+                if cache is not None:
+                    cache.core[idx] = [_claim(e, cache) for e in presents]
+                    cache.prefix[idx] = new_prefix
+                prev_mem = mem
+                core_aux = core_aux + aux
+
+                lambdas.append(self.halting(h_next))
+                loop_states.append(h_next)
+                h_loop = h_next
+            # The recurrent layers run once per loop. Averaging keeps the aux at the scale of one pass, so
+            # it does not grow with the loop count. Each layer's own term is still its per-loop mean.
+            moe_aux = moe_aux + core_aux / loops
+
+            weights = geometric_halting_weights(lambdas)                 # [L, B, S], sums to 1 over L
+            states = torch.stack(loop_states, dim=0).float()             # [L, B, S, D]
+            h_out = (weights.unsqueeze(-1) * states).sum(dim=0)          # [B, S, D]
+            loop_index = torch.arange(1, loops + 1, device=h.device, dtype=torch.float32).view(-1, 1, 1)
+            per_token_loops = (weights * loop_index).sum(dim=0)           # [B, S] expected loops per token
+            if keep is not None:
+                real = keep.to(per_token_loops.dtype)
+                mean_loops = (per_token_loops * real).sum() / real.sum().clamp(min=1.0)
+            else:
+                mean_loops = per_token_loops.mean()
 
         h = h_out.to(h.dtype)
         for i, layer in enumerate(self.post_layers):
-            h, present, aux = layer(h, cos, sin, cache.post[i] if cache is not None else None,
+            h, present, aux = layer(h, cos, sin, _writable_past(cache.post[i], cache) if cache is not None else None,
                                     attn_mask=attn_mask, segment_ids=segment_ids)
             if cache is not None:
-                cache.post[i] = present
+                cache.post[i] = _claim(present, cache)
             moe_aux = moe_aux + aux
 
         if cache is not None:
             cache.seq_len += S
 
         h = self.norm(h)
+
+        extra = {}
+        if mor:
+            extra = dict(loop_applications=mor_rows, full_loop_applications=B * S * loops)
+
+        if labels is not None and mor:
+            ce, z = self._lm_loss(h, labels)
+            balance = self._mor_balance(mor_probs, keep)
+            loss = ce + self.config.z_loss_coef * z + moe_aux + self.config.mor_capacity_aux_coef * balance
+            zero = ce.detach() * 0.0
+            parts = {
+                "ce": ce.detach(),
+                "step_ce": zero,
+                "z_loss": z.detach(),
+                "moe_aux": moe_aux.detach(),
+                "ponder_kl": zero,
+                "mor_balance": balance.detach(),
+            }
+            return InkyOutput(loss=loss, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops,
+                              loss_parts=parts, **extra)
 
         if labels is not None:
             ce, z = self._lm_loss(h, labels)
@@ -421,9 +598,9 @@ class InkyModel(PreTrainedModel):
                               loss_parts=parts)
 
         if return_hidden:
-            return InkyOutput(hidden=h, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
+            return InkyOutput(hidden=h, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops, **extra)
         logits = self._project(h[:, -1:] if last_only else h)
-        return InkyOutput(logits=logits, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops)
+        return InkyOutput(logits=logits, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops, **extra)
 
     def _packing_mask(
         self,
@@ -476,9 +653,32 @@ class InkyModel(PreTrainedModel):
         token actually assigned to loop n (the unassigned remainder counts at its exit loop). It is the
         same quantity ``forward`` reports, and equals it when ``halt_threshold=None``. ``mean_exit_loop``
         is the loop each token stopped at, averaged over tokens.
+
+        Under ``routing_mode='mor'`` the exit loop of a token is simply its router depth (capped by
+        ``num_loops``): the call runs the routed forward pass, which already skips exited tokens, and
+        ``halt_threshold`` must be None (there is no halting mass to threshold). ``mean_loops`` and
+        ``mean_exit_loop`` are both the mean routed depth.
         """
         if input_ids.shape[0] != 1:
             raise ValueError("early exit needs batch size 1")
+        if self.config.routing_mode == "mor":
+            if halt_threshold is not None:
+                raise ValueError(
+                    "halt_threshold is not used with routing_mode='mor': a token exits at its router depth"
+                )
+            self.eval()
+            L = int(num_loops) if num_loops is not None else self.config.max_recurrent_loops
+            out = self.forward(input_ids, num_loops=L, return_hidden=True)
+            common = dict(
+                mean_loops=out.mean_loops,
+                mean_exit_loop=out.mean_loops,
+                loop_applications=out.loop_applications,
+                full_loop_applications=out.full_loop_applications,
+            )
+            if return_hidden:
+                return InkyOutput(hidden=out.hidden, **common)
+            h = out.hidden
+            return InkyOutput(logits=self._project(h[:, -1:] if last_only else h), **common)
         if halt_threshold is not None and not 0.0 < halt_threshold <= 1.0:
             raise ValueError(f"halt_threshold must be in (0, 1], got {halt_threshold}")
         S = input_ids.shape[1]

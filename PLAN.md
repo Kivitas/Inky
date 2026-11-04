@@ -138,7 +138,7 @@ Phase 1 cannot start until these are decided:
 - **Tokenizer location**: the path to `EOS_Tokenizer/` (currently an external project), and
   approval to add the three scratch special tokens (ids 50000 to 50002) to it. Until those ids exist,
   `reduce_scratch_blocks=True` cannot be used.
-- **Licence**: the repository has no LICENSE file. The choice is yours.
+- **Licence**: resolved. `LICENSE` is proprietary, all rights reserved (private repository).
 - **Framing of the style controls**: the README says detector evasion is not a validated capability.
   Decide whether the bad-word, stock-phrase and n-gram controls stay described as detector-related
   or are reframed as variety controls only. This is a decision for the owner; nothing has been changed.
@@ -157,9 +157,9 @@ Phase 1 cannot start until these are decided:
 | 5 Training loop | `inky/train.py`, `scripts/train.py` | Done, smoke-tested only (`--dry-run`). Resume with RNG state, skip on non-finite loss or gradient, 5% warmup, gradient accumulation, optional AMP, opt-in dropout, `best.pt`, last step always saved. No training run. Open: Moonlight LR guard (TRAIN-05), no early stopping (`docs/critique/training.md`) |
 | 6 Loop curriculum | `inky/train.py` (`loop_curriculum`) | Done, tested |
 | 7 Data pipeline | `inky/data.py` | Done: script-aware filter, streaming MinHash near-duplicate removal (`dedupe_stream`; threshold 0.8 on word 5-gram Jaccard; 30-word docs with one changed word are kept), reserved-id drop, BOM and null input handled, int32 packing, `min_chars` default 20. No open items in the data critique except the EOS default in DOC-05 |
-| 8 Ablations | not built | Needs training runs; deferred |
+| 8 Ablations | `scripts/ablate.py`, `scripts/bench.py` | Runner built and smoke-tested on synthetic data; real ablations need a corpus and training runs |
 | 9 Selective SSM mixer | `inky/layers.py` (`SelectiveSSMMixer`), `ssm_mixer_layers` | Done, chunked scan; off by default; tested. Memory at 8k not measured (CORE-12) |
 | 10 Distillation loss | `inky/distill.py` | Done, tested; no teacher, not wired into training, not chunked (TRAIN-15) |
 
-Test suite: 490 tests collected and 490 passing (`python -B -m pytest tests -q -p no:cacheprovider`,
-2 warnings, about 5 minutes on CPU, 2026-11-03). The open items are listed in docs/critique/STATUS.md.
+Test suite: see README and docs/critique/STATUS.md for the current count (`python -B -m pytest tests -q
+-p no:cacheprovider`, about 5 minutes on CPU). The open items are listed in docs/critique/STATUS.md.

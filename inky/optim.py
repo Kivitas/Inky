@@ -112,10 +112,14 @@ class Muon(torch.optim.Optimizer):
         ns_steps: int = 5,
         weight_decay: float = 0.0,
         scale_mode: str = "shape",
+        batched: bool = False,
     ):
         if lr <= 0.0:
             raise ValueError(f"Muon lr must be positive, got {lr}")
         self.scale_mode = _check_scale_mode(scale_mode)
+        # batched=True stacks same-shape updates and runs one Newton-Schulz call per shape (same results as
+        # the per-matrix loop to float tolerance; the state_dict format is identical either way).
+        self.batched = bool(batched)
         defaults = dict(lr=lr, momentum=momentum, nesterov=nesterov, ns_steps=ns_steps, weight_decay=weight_decay)
         super().__init__(params, defaults)
 
@@ -131,6 +135,32 @@ class Muon(torch.optim.Optimizer):
         if mode is not None:
             self.scale_mode = _check_scale_mode(mode)
 
+    @staticmethod
+    def _orthogonalise_batched(updates: List[torch.Tensor], ns_steps: int) -> List[torch.Tensor]:
+        """Newton-Schulz for a list of updates, one batched call per (shape, dtype, device) bucket.
+
+        Returns the orthogonalised updates in the input order. A bucket of one goes through the plain
+        per-matrix call, so a single matrix is bit-identical to the unbatched path.
+        """
+        buckets: Dict[tuple, List[int]] = {}
+        for i, u in enumerate(updates):
+            buckets.setdefault((tuple(u.shape), u.dtype, u.device), []).append(i)
+        out: List[Optional[torch.Tensor]] = [None] * len(updates)
+        for idxs in buckets.values():
+            if len(idxs) == 1:
+                out[idxs[0]] = zeropower_via_newtonschulz5(updates[idxs[0]], steps=ns_steps)
+                continue
+            stacked = zeropower_via_newtonschulz5(torch.stack([updates[i] for i in idxs]), steps=ns_steps)
+            for j, i in enumerate(idxs):
+                out[i] = stacked[j]
+        return out  # type: ignore[return-value]
+
+    def _apply(self, p: torch.Tensor, u: torch.Tensor, lr: float, wd: float) -> None:
+        alpha = lr * muon_scale(p.size(-2), p.size(-1), self.scale_mode)
+        if wd > 0.0:
+            p.mul_(1.0 - lr * wd)                                # decoupled weight decay
+        p.add_(u.to(p.dtype).view_as(p), alpha=-alpha)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -142,6 +172,7 @@ class Muon(torch.optim.Optimizer):
             lr, momentum = group["lr"], group["momentum"]
             nesterov, ns_steps, wd = group["nesterov"], group["ns_steps"], group["weight_decay"]
 
+            pending = []  # (param, update): only filled in batched mode
             for p in group["params"]:
                 if p.grad is None:
                     continue
@@ -153,13 +184,15 @@ class Muon(torch.optim.Optimizer):
                 buf = state["momentum_buffer"]
                 buf.mul_(momentum).add_(g)                       # heavy-ball momentum
                 update = g.add(buf, alpha=momentum) if nesterov else buf
+                if self.batched:
+                    pending.append((p, update))
+                else:
+                    self._apply(p, zeropower_via_newtonschulz5(update, steps=ns_steps), lr, wd)
 
-                u = zeropower_via_newtonschulz5(update, steps=ns_steps)
-                alpha = lr * muon_scale(p.size(-2), p.size(-1), self.scale_mode)
-
-                if wd > 0.0:
-                    p.mul_(1.0 - lr * wd)                        # decoupled weight decay
-                p.add_(u.to(p.dtype).view_as(p), alpha=-alpha)
+            if pending:
+                done = self._orthogonalise_batched([u for _, u in pending], ns_steps)
+                for (p, _), u in zip(pending, done):
+                    self._apply(p, u, lr, wd)
 
         return loss
 
@@ -260,6 +293,8 @@ class HybridOptimizer:
         (the two groups are scaled together by ``set_lr_scale``).
       - ``scale_mode``: "shape" (default) or "moonlight" update scaling (see ``muon_scale``).
       - ``min_muon_dim``: 2D matrices with a smaller dimension go to AdamW (see ``split_parameters``).
+      - ``muon_batched`` (default False): orthogonalise same-shape matrices in one batched Newton-Schulz
+        call. Same results as the per-matrix loop (to float tolerance) and the same state_dict format.
     """
 
     def __init__(
@@ -274,6 +309,7 @@ class HybridOptimizer:
         adamw_weight_decay: float = 0.1,
         scale_mode: str = "shape",
         min_muon_dim: int = MIN_MUON_DIM,
+        muon_batched: bool = False,
     ):
         self.scale_mode = _check_scale_mode(scale_mode)
         muon_params, decay, no_decay = split_parameters(model, min_muon_dim=min_muon_dim)
@@ -282,6 +318,7 @@ class HybridOptimizer:
         self.muon = Muon(
             muon_params, lr=muon_lr, momentum=muon_momentum, nesterov=True,
             ns_steps=muon_ns_steps, weight_decay=muon_weight_decay, scale_mode=self.scale_mode,
+            batched=muon_batched,
         )
         self.adamw = torch.optim.AdamW(
             [

@@ -60,17 +60,26 @@ NLL. Each stage starts from the previous stage's checkpoint and logs its own hel
 Run each row against the same token budget and the same held-out split. The dense baseline is row 1,
 and every other row is compared with it.
 
+`scripts/ablate.py` runs the config-toggle rows. List the names with `--list-variants`; the variants are
+`baseline`, `dense`, `no_highway`, `qk_norm`, `qk_norm_latent`, `vocab16k`, `vocab32k`, `fewer_loops`,
+`fixed_depth`, `more_experts` and `mor`. The same overrides can be launched one at a time with
+`scripts/train.py --set ...`. `--synthetic` runs on random tokens and only checks the plumbing.
+
 | # | Variant | Question it answers | Compare against | Status |
 | :-- | :--- | :--- | :--- | :--- |
-| 1 | Dense transformer, matched total and active size | Does recurrence or MoE help at all? | Itself | Planned |
-| 2 | MoE (shared expert plus routed experts) | Does MoE beat dense at this active-parameter scale and short budget? | Row 1 | Planned |
-| 3 | Vocabulary 16k, 32k, 50k | How much budget does the embedding cost, and what does it buy? | 50k | Planned |
-| 4 | Highway on and off | Does the causal running mean add anything? | On | Planned |
-| 5 | QK-norm on and off | Does it stabilise training or change loss? | Off | Planned (`qk_norm` flag exists, default off) |
-| 6 | PonderNet halting against Mixture-of-Recursions-style routing | Which saves more training compute at equal loss? | PonderNet | Planned |
-| 7 | Muon plus AdamW against AdamW alone | Does Muon pay for its per-step cost at this scale? | AdamW | Planned |
-| 8 | Training depth fixed at 6 against 2-6 with curriculum | Does training at mixed depth reduce the train and inference mismatch? | Fixed 6 | Planned |
+| 1 | Dense baseline, matched active size: `--variants dense` (`--set use_moe=False`) | Does MoE help at all? (a non-recurrent transformer is not a switch) | `baseline` | Planned, switch exists, not run |
+| 2 | MoE: `--variants baseline` (and `more_experts`, `--set num_routed_experts=16`) | Does MoE beat dense at this active-parameter scale and short budget? | Row 1 | Planned |
+| 3 | Vocabulary: `--variants vocab16k,vocab32k` (`--set vocab_size=16003` or `32003`) | How much budget does the embedding cost, and what does it buy? | `baseline` (50k) | Planned, needs a matching tokenizer |
+| 4 | Highway off: `--variants no_highway` (`--set use_highway=False`) | Does the causal running mean add anything? | `baseline` | Planned, switch exists |
+| 5 | QK-norm: `--variants qk_norm,qk_norm_latent` (`--set qk_norm=True`, plus `--set qk_norm_mode="latent"`) | Does it stabilise training or change loss? | `baseline` | Planned |
+| 6 | PonderNet halting against `--set routing_mode="mor"` | Which saves more training compute at equal loss? | `baseline` (PonderNet) | Planned, `mor` is not an `ablate.py` variant yet; untrained |
+| 7 | Muon plus AdamW against AdamW alone (`--muon-batched` for the Muon speed) | Does Muon pay for its per-step cost at this scale? | AdamW | Planned, not a config toggle |
+| 8 | Training depth: `--variants fixed_depth` against `baseline` with `--loop-curriculum` (also `fewer_loops`) | Does training at mixed depth reduce the train and inference mismatch? | `fixed_depth` | Planned |
 | 9 | Scratch reduction on and off | Does PENCIL-style scratch help prose? | Off | Planned, after training teaches the markers |
+
+Names are exact as in `scripts/ablate.py --list-variants`; `--set` flags take Python literals. If `vocab_size`
+is set without the scratch ids, they become `vocab_size-3..-1`, and `scripts/train.py` refuses a tokenizer
+whose size + 3 differs from `vocab_size` (`--tokenizer-vocab-check`).
 
 The table lists questions, not results. Each row needs held-out perplexity at the trained depth and
 at depth 6, and the metrics in section 5.
@@ -99,5 +108,6 @@ Detector scores are not a metric in this plan. The project makes no claim about 
 2. Measure the token budget curve on the baseline, and choose the target within the 1-5B range.
 3. Run rows 2-4, then rows 5-8, against the same budget.
 4. Run stages 2-3 on the chosen variant, and only then stage 4.
-5. Re-measure decode speed after the cache and dispatch changes, and record the result in the
-   README with its commit.
+5. Re-measure decode speed with `scripts/bench.py` after the cache and dispatch changes, and record the
+   result in the README with its commit. (The growable cache measured about 88 against about 92 ms per
+   token at 2,000 tokens on CPU; the older 131-185 ms table is stale.)
