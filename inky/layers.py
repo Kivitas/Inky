@@ -628,6 +628,7 @@ class SharedExpertMoE(nn.Module):
         self.num_routed = config.num_routed_experts
         self.top_k = min(config.num_active_routed, self.num_routed)
         self.balance_rate = config.balance_rate
+        self.balance_update = getattr(config, "balance_update", "sign")
         self.z_loss_coef = config.router_z_loss_coef
         self.dense_max_tokens = int(config.moe_dense_max_tokens)
 
@@ -732,11 +733,19 @@ class SharedExpertMoE(nn.Module):
 
     @torch.no_grad()
     def update_balance_bias(self) -> None:
-        """Moves the balance biases towards uniform load, using the counts since the last call, then resets them."""
+        """Moves the balance biases towards uniform load, using the counts since the last call, then resets them.
+
+        ``balance_update="sign"`` moves every bias by exactly ``balance_rate`` (up for an under-used expert, down
+        for an over-used one, no move at exactly the uniform load), as in DeepSeek-V3. ``"proportional"`` moves
+        it by ``balance_rate * (uniform - load)``, which is at most ``balance_rate / num_routed`` and shrinks as
+        the load evens out."""
         total = self.load_counts.sum()
         load = self.load_counts / total.clamp(min=1.0)
         target = 1.0 / self.num_routed
-        step = self.balance_rate * (target - load)
+        if self.balance_update == "sign":
+            step = self.balance_rate * torch.sign(target - load)
+        else:
+            step = self.balance_rate * (target - load)
         # No assignments since the last update means no information: leave the biases unchanged.
         self.balance_bias.add_(torch.where(total > 0, step, torch.zeros_like(step)))
         self.expert_load.copy_(torch.where(total > 0, load, self.expert_load))
@@ -866,16 +875,24 @@ class LoopStepModulation(nn.Module):
 class StateSpaceMemoryHighway(nn.Module):
     """Carries a per-position memory across loop iterations.
 
-    The input to each loop is replaced by its causal running mean, which is projected into
-    a small state. That state is updated from the previous loop's state with a learned gate.
+    The causal running mean of the loop input is projected into a small state. That state is updated from
+    the previous loop's state with a learned gate, and read back into the stream as
+    ``h + out_gain * RMSNorm(out_proj(mem))``.
+
+    ``out_gain`` is a learned scalar. The RMSNorm output has unit scale whatever the scale of ``h`` is, so a
+    fixed multiplier (formerly 0.1) can be as large as the stream itself early on. ``gain_init`` (default 0.0)
+    starts the highway switched off, so it only enters the stream as far as training makes it useful; 0.1
+    reproduces the earlier fixed scale. While the gain is exactly 0 the highway's other weights receive no
+    gradient, and the gain itself does.
     """
 
-    def __init__(self, hidden_size: int, state_dim: int, eps: float):
+    def __init__(self, hidden_size: int, state_dim: int, eps: float, gain_init: float = 0.0):
         super().__init__()
         self.in_proj = nn.Linear(hidden_size, state_dim, bias=False)
         self.a_gate = nn.Linear(state_dim, state_dim)
         self.out_proj = nn.Linear(state_dim, hidden_size, bias=False)
         self.norm = RMSNorm(hidden_size, eps)
+        self.out_gain = nn.Parameter(torch.full((1,), float(gain_init)))
 
     def forward(
         self,
@@ -925,7 +942,7 @@ class StateSpaceMemoryHighway(nn.Module):
             alpha = torch.sigmoid(self.a_gate(prev_mem))
             mem = alpha * prev_mem + (1.0 - alpha) * torch.tanh(x_m)
 
-        out = h + 0.1 * self.norm(self.out_proj(mem))
+        out = h + self.out_gain.to(h.dtype) * self.norm(self.out_proj(mem))
         return out, mem, new_prefix
 
     @staticmethod
@@ -1040,8 +1057,10 @@ class RecurrentCore(nn.Module):
         self.step_mod = LoopStepModulation(config.hidden_size, config.max_recurrent_loops) \
             if config.use_step_modulation else None
         # use_highway=False (ablation) does not create the module, so parameter counts reflect it.
-        self.ssm = StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps) \
-            if config.use_highway else None
+        self.ssm = StateSpaceMemoryHighway(
+            config.hidden_size, config.ssm_state_dim, config.rms_norm_eps,
+            gain_init=getattr(config, "highway_gain_init", 0.0),
+        ) if config.use_highway else None
         self.damped_beta = nn.Parameter(torch.zeros(config.hidden_size))
         self.loop_dropout_prob = config.loop_dropout_prob
 

@@ -353,6 +353,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--max-skipped-steps", type=int, default=50, help="consecutive skipped steps before abort")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--eval-every", type=int, default=0, help="eval every N steps (0 = no eval)")
+    parser.add_argument("--diagnose-every", type=int, default=0,
+                        help="every N steps log stream RMS per loop, loop-to-loop change, highway gain and expert "
+                             "load (one extra eval-mode forward pass; 0 = off)")
     parser.add_argument("--early-stop-patience", type=int, default=None,
                         help="stop after N consecutive evals without a new best eval NLL (needs --eval-every > 0; "
                              "default off)")
@@ -404,6 +407,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         parser.error("--steps must be >= 1")
     if args.grad_accum < 1:
         parser.error("--grad-accum must be >= 1")
+    if args.diagnose_every < 0:
+        parser.error("--diagnose-every must be >= 0")
     if args.early_stop_patience is not None:
         if args.early_stop_patience < 1:
             parser.error("--early-stop-patience must be >= 1")
@@ -484,6 +489,7 @@ def main(argv: Optional[List[str]] = None) -> None:
         grad_accum_steps=args.grad_accum,
         amp_dtype=args.amp_dtype,
         eval_by_depth=args.eval_by_depth,
+        diagnose_every=args.diagnose_every,
         early_stop_patience=args.early_stop_patience,
         early_stop_min_delta=args.early_stop_min_delta,
         compile_model=compile_model,

@@ -5,7 +5,7 @@ window, meant to run locally.
 
 **Status: untrained.** This repository contains the model code, a training loop with a command-line
 entry point (smoke-tested, including `--dry-run`, never run on a real corpus), decoding controls, an
-evaluation harness, tooling scripts (`train`, `bench`, `ablate`, `sample`), and 680 tests. There is no training corpus, no trained weights, no baseline
+evaluation harness, tooling scripts (`train`, `bench`, `ablate`, `sample`, `diagnose`), and 713 tests. There is no training corpus, no trained weights, no baseline
 comparison, and no measured quality. Nothing here is a claim about how Inky writes.
 
 Inky takes its language-model path from the EOS project (`Desktop/New folder/EOS LLM`) and scales
@@ -45,7 +45,7 @@ Counts from `scripts/build_untrained.py` and `model.count_parameters()`:
 | Post layer (1 block) | 7.74 M | 7.74 M |
 | Norms and halting unit | < 0.01 M | < 0.01 M |
 | Decision engine (8 slots, width 128, 4 pointer heads) | 0 | 0.40 M |
-| **Total** | **50.22 M** (50,219,201) | **50.61 M** (50,614,854) |
+| **Total** | **50.22 M** (50,219,202) | **50.61 M** (50,614,855) |
 
 Each block is a latent-KV attention layer (about 0.44 M) plus a shared-expert MoE: one shared
 expert and eight routed experts, with two routed experts active per token (about 7.3 M).
@@ -76,14 +76,14 @@ tokens → embedding
 | Shared-expert MoE | One always-on SwiGLU expert plus 8 routed experts (top-2, sigmoid router). Aux-loss-free balancing via a bias buffer. | `SharedExpertFineGrainedMoE` |
 | Recurrent core | One set of shared layers applied repeatedly. Gives depth without extra parameters. | `RecurrentCoreBlock` |
 | Step modulation | FiLM scale and shift per loop index. Starts as the identity. | `StepModulation` |
-| State-space highway | Carries a per-position memory across loops. Its causal running mean is cached for decoding. Optional selective-SSM mixer (`ssm_mixer_layers`, off by default) uses a chunked scan. | `StateSpaceMemoryHighway` |
-| PonderNet halting | Each loop emits a stop probability. The halting distribution is pulled to a geometric prior (mean 3 loops) by a KL term. The output is the halting-weighted mix of loop states. | PonderNet (arXiv 2107.05407, see docs/research/act.md) |
+| State-space highway | Carries a per-position memory across loops. Its causal running mean is cached for decoding. It re-enters the stream through a learned scalar gain that starts at 0 (`highway_gain_init`), so the model begins without it. Optional selective-SSM mixer (`ssm_mixer_layers`, off by default) uses a chunked scan. | `StateSpaceMemoryHighway` |
+| PonderNet halting | Each loop emits a stop probability. The halting distribution is pulled to a geometric prior (mean 3 loops) by a KL term. The output is the halting-weighted mix of loop states, mixed by direction and rescaled to the weighted mean RMS (`loop_mix_normalize`), so each loop's share is its halting probability. | PonderNet (arXiv 2107.05407, see docs/research/act.md) |
 | Per-loop loss | Each loop's state is also trained to predict the next token, weighted by its halting probability (`step_ce_token_fraction`, default 0.25). | new in Inky |
 | Chunked loss | Next-token cross-entropy and z-loss in chunks, so full 8k × 50k logits never exist at once. | `chunked_ce` |
 | Scratch reduction | The model may draft notes, then close the block. Reduction deletes the notes and keeps the text. | PENCIL (arXiv:2503.14337) |
 
 Config switches that change the attention, MoE and routing profile (all defaults keep the
-50,219,201-parameter architecture above):
+50,219,202-parameter architecture above):
 
 - `qk_norm` (opt-in, default `False`) and `qk_norm_mode` (`"head"` default, or `"latent"`):
   RMS-normalises queries and keys. With `"head"`, the key norm blocks absorption, so decoding
@@ -96,9 +96,35 @@ Config switches that change the attention, MoE and routing profile (all defaults
   = 2,112, the MoE's active feed-forward width per token (router not counted).
 - `use_highway` (default `True`): `False` does not build the state-space highway at all.
 - Parameter counts with the switches off (from `model.count_parameters()`): no highway 50,165,505;
-  dense 30,742,721; dense and no highway 30,689,025. The dense variant is smaller than the MoE
+  dense 30,742,722; dense and no highway 30,689,025. The dense variant is smaller than the MoE
   default because it matches active, not total, feed-forward parameters. These are ablation
   switches; no variant has been trained or compared.
+- `highway_gain_init` (default `0.0`): initial value of the learned scalar `out_gain` on the highway's
+  output, `h + out_gain * RMSNorm(out_proj(mem))`. The RMSNorm output has unit scale whatever the
+  stream's scale is, and the embeddings start at RMS 0.02, so the earlier fixed factor of 0.1 made the
+  highway as large as the stream at initialisation (about 120% of the loop-1 input, measured with
+  `scripts/diagnose.py`). With 0.0 the model starts without the highway and the gain opens only if it
+  helps; while it is exactly 0 the highway's other weights get no gradient and the gain does. `0.1`
+  reproduces the earlier scale.
+- `loop_mix_normalize` (default `True`): the PonderNet mixture is `(sum_n p_n h_n / rms_n) * (sum_n p_n rms_n)`
+  instead of `sum_n p_n h_n`. The stream grows with every loop, so in the plain sum a late loop counts for more
+  than its `p_n`; the normalised form gives each loop exactly its halting share and keeps the output at the
+  stream's scale. It is identical to the plain sum when all loop states have the same RMS. `False` is the plain
+  sum. `forward_early_exit` follows the same setting.
+- `balance_update` (default `"sign"`): how the MoE balance bias moves each optimizer step. `"sign"` moves every
+  bias by exactly `balance_rate` towards uniform load (the DeepSeek-V3 rule); `"proportional"` is the earlier
+  rule, whose step is at most `balance_rate / num_routed_experts`. In a toy run (tiny model, 8 experts, 200 steps,
+  one seed) the expert-load spread (coefficient of variation) fell from 1.46 at step 10 to 0.35 at step 200
+  with `"sign"` and 1e-3, against 1.19 with `"proportional"`. Neither rule prevented the collapse in the first
+  steps there, and nothing here is measured on real data. Training also clears the MoE routing counters after
+  each eval and each skipped step, so those passes no longer feed the next bias update.
+
+Diagnostics: `python scripts/diagnose.py` (or `inky.loop_diagnostics(model, ids)`) reports the stream RMS
+entering and leaving each loop, the loop-to-loop change, the highway's share, the halting weights and the
+expert load, and `python scripts/train.py ... --diagnose-every N` logs the same during training. At
+initialisation on random tokens, stream RMS grows 4.8x over the six loops with the earlier settings and 2.0x
+with these defaults, and the core-layer expert-load coefficient of variation is 0.26 and 0.24 instead of 0.66
+and 0.45. These are scale checks at initialisation, not quality results.
 - `moe_dense_max_tokens` (default 64): the sync-free dense MoE dispatch is used only for small token
   counts (at most this many) on non-CPU devices. Larger batches use the grouped path. CPU always uses
   the grouped path.
@@ -113,7 +139,7 @@ arXiv 2507.10524, token-choice variant). Fields: `mor_router_hidden` (default `N
 layer; an int gives an MLP), `mor_capacity_aux_coef` (default 0.01), `mor_gate_scale` (default
 `True`), `mor_temperature` (default 1.0), `mor_target_depth` (default `None`, meaning
 `ponder_prior_steps`, clipped into the loop range), `mor_sample_depth` (default `True`) and
-`mor_gather` (default `True`). With `"mor"` the default config has 50,220,741 parameters (the router
+`mor_gather` (default `True`). With `"mor"` the default config has 50,220,742 parameters (the router
 replaces the halting unit).
 
 Semantics:
@@ -204,6 +230,9 @@ Flags worth knowing:
   every training depth.
 - `--embedding-dropout` and `--residual-dropout` (both default 0). Residual dropout applies to each
   block application, so when enabled the shared core drops the same blocks at every loop.
+- `--diagnose-every N` (opt-in, default 0): every N steps run `inky.loop_diagnostics` on the step's last
+  micro-batch and add a `"diagnostics"` record to the history (stream RMS per loop, loop-to-loop change,
+  highway gain, expert load), plus a log line. It costs one eval-mode forward pass and changes nothing else.
 - `--early-stop-patience N` and `--early-stop-min-delta D` (opt-in, both off by default): stop after
   N consecutive evals without an eval-NLL improvement of more than D. This needs `--eval-every` and
   held-out batches. `best.pt` is unaffected.
@@ -249,7 +278,7 @@ Other training code:
 
 ```bash
 pip install -e .[dev]
-python -m pytest tests -q               # 680 tests collected
+python -m pytest tests -q               # 713 tests collected
 python -m ruff check .                  # lint, also run in CI
 python scripts/build_untrained.py --out checkpoints/inky-50m-init
 ```
@@ -266,6 +295,10 @@ python scripts/ablate.py --list-variants
 python scripts/ablate.py --synthetic --tiny --steps 20 --out-dir runs/ablate
 python scripts/ablate.py --corpus data/*.jsonl --tokenizer-path path/to/tokenizer.json --steps 500 \
     --variants baseline,dense,no_highway,qk_norm --out-dir runs/ablate
+
+# Architecture scale report: stream RMS per loop, loop change, highway share, expert load
+python scripts/diagnose.py --tiny --seq-len 64
+python scripts/diagnose.py --set highway_gain_init=0.1 --set loop_mix_normalize=False   # the earlier behaviour
 
 # Generate from a checkpoint with the prose controls
 python scripts/sample.py --dry-run
@@ -310,7 +343,7 @@ def encode(text: str) -> list:
 config = InkyConfig()                       # enable_arlo=False by default
 torch.manual_seed(0)
 model = InkyModel(config).eval()            # untrained: the text it writes is random
-print(model.count_parameters()["total"])    # 50,219,201 for the default config (about 50.22M)
+print(model.count_parameters()["total"])    # 50,219,202 for the default config (about 50.22M)
 
 prompt_ids = torch.tensor([encode("The lighthouse keeper said")])
 out = model.generate(
@@ -364,6 +397,7 @@ inky/train.py           training loop: WSD schedule, loop curriculum, grad accum
 inky/data.py            text cleaning, quality filter, streaming MinHash near-duplicate removal, reserved-id drop, packing
 inky/distill.py         distillation loss (not wired into training)
 inky/evaluation.py      held-out split, perplexity, loop statistics, early-exit drift
+inky/diagnostics.py     loop_diagnostics: stream RMS per loop, loop change, highway share, expert load
 inky/metrics.py         reports for binary decisions, choices and generated text
 inky/quantize.py        int8 and int4 weight-only quantization (inference)
 inky/speculative.py     self-speculative greedy decoding (no writing controls)
@@ -372,8 +406,9 @@ scripts/train.py        command-line training entry point (--dry-run available)
 scripts/bench.py        prefill and per-token decode timing
 scripts/ablate.py       ablation runner (named variants, --synthetic mode)
 scripts/sample.py       text generation from a checkpoint with the prose controls
+scripts/diagnose.py     architecture scale report (stream RMS per loop, highway gain, expert load)
 LICENSE                 proprietary, all rights reserved
-tests/                  pytest suite (run with `python -m pytest tests -q`; 680 tests collected)
+tests/                  pytest suite (run with `python -m pytest tests -q`; 713 tests collected)
 docs/critique/          critique findings and their status (STATUS.md is the index)
 docs/research/          research notes (ACT / PonderNet, training)
 ```
@@ -423,6 +458,11 @@ Project-level:
   by design (CORE-01, accepted design).
 
 Behaviour changes from the recent fixes (these change results compared with earlier runs):
+
+- **Phase A architecture fixes.** The highway output now has a learned gain that starts at 0 (+1 parameter,
+  50,219,202 in total), the PonderNet mixture is scale-preserving, and the MoE balance rule is `"sign"`. The
+  old behaviour is `--set highway_gain_init=0.1 --set loop_mix_normalize=False --set balance_update=proportional`.
+  Nothing has been trained either way; runs made before this change are not comparable with later ones.
 
 - **Default `min_chars` is 20**, not 200. Short texts (haiku, short dialogue) now enter the corpus.
 - **`step_ce_token_fraction` defaults to 0.25.** Each loop's loss is a sampled estimate of the full

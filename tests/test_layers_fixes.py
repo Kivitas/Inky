@@ -28,6 +28,7 @@ from inky.layers import (  # noqa: E402
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512,
         scratch_open_id=508,
         scratch_sep_id=509,
@@ -127,7 +128,7 @@ def loop_ssm_forward(mixer: SelectiveSSMMixer, x, past_state=None):
 
 def test_expert_load_accumulates_over_calls_and_resets_on_update():
     torch.manual_seed(1)
-    config = tiny_config(balance_rate=0.1)
+    config = tiny_config(balance_rate=0.1, balance_update="proportional")   # the sign rule is tested elsewhere
     moe = SharedExpertMoE(config).eval()
     moe.balance_bias.normal_(0.0, 0.5)
     x1, x2 = torch.randn(2, 5, 64), torch.randn(3, 4, 64)
@@ -153,7 +154,7 @@ def test_expert_load_accumulates_over_calls_and_resets_on_update():
 def test_single_forward_per_update_matches_previous_behaviour():
     # Non-looped use: one forward between updates. The bias step uses that forward's load fraction.
     torch.manual_seed(2)
-    config = tiny_config(balance_rate=0.05)
+    config = tiny_config(balance_rate=0.05, balance_update="proportional")
     moe = SharedExpertMoE(config).eval()
     x = torch.randn(1, 9, 64)
     with torch.no_grad():
@@ -456,7 +457,8 @@ def test_segment_mean_matches_naive_reference_on_several_segments():
 def test_highway_packed_documents_match_separate_runs():
     torch.manual_seed(16)
     config = tiny_config()
-    ssm = StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps).eval()
+    ssm = StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps,
+                                gain_init=0.1).eval()
     doc_a, doc_b = torch.randn(1, 5, 64), torch.randn(1, 7, 64)
     packed = torch.cat([doc_a, doc_b], dim=1)
     seg = torch.tensor([[0] * 5 + [1] * 7])
@@ -473,7 +475,8 @@ def test_highway_packed_documents_match_separate_runs():
 
 def test_highway_segments_reject_carried_prefix_and_cache():
     config = tiny_config()
-    ssm = StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps).eval()
+    ssm = StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps,
+                                gain_init=0.1).eval()
     h = torch.randn(1, 4, 64)
     seg = torch.zeros(1, 4, dtype=torch.long)
     with pytest.raises(ValueError):

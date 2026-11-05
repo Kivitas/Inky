@@ -3,6 +3,7 @@
 from .arlo import Arlo
 from .config import InkyConfig
 from .data import doc_boundary_mask, pack_sequences_with_segments
+from .diagnostics import format_diagnostics, loop_diagnostics
 from .evaluation import early_exit_drift, perplexity_by_loops
 from .metrics import (
     baseline_reports,
@@ -53,4 +54,6 @@ __all__ = [
     "compare_to_reference",
     "perplexity_by_loops",
     "early_exit_drift",
+    "loop_diagnostics",
+    "format_diagnostics",
 ]

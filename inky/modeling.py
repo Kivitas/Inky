@@ -214,6 +214,24 @@ class InkyModel(PreTrainedModel):
             return int(draw)
         return self.config.max_recurrent_loops
 
+    def _state_rms(self, x: torch.Tensor) -> torch.Tensor:
+        """Per-token RMS of ``x`` over the last dimension (kept as a size-1 dim), in float32."""
+        return x.float().pow(2).mean(-1, keepdim=True).add(self.config.rms_norm_eps).sqrt()
+
+    def _mix_loop_states(self, states: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+        """Halting-weighted mixture of the loop states. ``states`` [L, B, S, D] (float32), ``weights`` [L, B, S].
+
+        With ``loop_mix_normalize`` (default) the loop states are mixed by direction and the result is given the
+        p-weighted mean RMS: ``(sum_n p_n h_n / rms_n) * (sum_n p_n rms_n)``. Loop n then contributes in
+        proportion to ``p_n`` however large its state is (the stream grows with every loop), and the output
+        keeps the stream's scale. When all loop states have the same RMS this equals ``sum_n p_n h_n``.
+        Without it the mixture is the plain weighted sum."""
+        w = weights.unsqueeze(-1)
+        if not self.config.loop_mix_normalize:
+            return (w * states).sum(dim=0)
+        rms = self._state_rms(states)                                    # [L, B, S, 1]
+        return (w * states / rms).sum(dim=0) * (w * rms).sum(dim=0)
+
     def _project(self, h: torch.Tensor) -> torch.Tensor:
         logits = F.linear(h, self.embed_tokens.weight).float()
         cap = self.config.final_logit_softcapping
@@ -533,7 +551,7 @@ class InkyModel(PreTrainedModel):
 
             weights = geometric_halting_weights(lambdas)                 # [L, B, S], sums to 1 over L
             states = torch.stack(loop_states, dim=0).float()             # [L, B, S, D]
-            h_out = (weights.unsqueeze(-1) * states).sum(dim=0)          # [B, S, D]
+            h_out = self._mix_loop_states(states, weights)               # [B, S, D]
             loop_index = torch.arange(1, loops + 1, device=h.device, dtype=torch.float32).view(-1, 1, 1)
             per_token_loops = (weights * loop_index).sum(dim=0)           # [B, S] expected loops per token
             if keep is not None:
@@ -705,6 +723,10 @@ class InkyModel(PreTrainedModel):
         surv = torch.ones(S, device=h.device, dtype=torch.float32)   # probability of not stopped yet
         cum = torch.zeros(S, device=h.device, dtype=torch.float32)   # halting mass assigned so far
         out = torch.zeros(1, S, cfg.hidden_size, device=h.device, dtype=torch.float32)
+        # loop_mix_normalize: ``out`` accumulates sum_n p_n h_n / rms_n and ``scale_acc`` sum_n p_n rms_n, and the
+        # two are multiplied at the end (see _mix_loop_states); otherwise ``out`` is the plain sum_n p_n h_n.
+        norm_mix = cfg.loop_mix_normalize
+        scale_acc = torch.zeros(S, device=h.device, dtype=torch.float32)
         exit_loop = torch.full((S,), float(L), device=h.device)
         expected_loops = torch.zeros(S, device=h.device, dtype=torch.float32)  # sum_n n * (mass at loop n)
         ssm_mem = None
@@ -722,7 +744,12 @@ class InkyModel(PreTrainedModel):
             else:
                 w = surv[active]                                       # the remainder on the last loop
                 surv_new = torch.zeros_like(w)
-            out[0, active] += w.unsqueeze(-1) * out_act[0].float()
+            if norm_mix:
+                r = self._state_rms(out_act[0])                           # [K, 1]
+                out[0, active] += w.unsqueeze(-1) * out_act[0].float() / r
+                scale_acc[active] += w * r[:, 0]
+            else:
+                out[0, active] += w.unsqueeze(-1) * out_act[0].float()
             cum[active] += w
             expected_loops[active] += w * float(n)
             surv[active] = surv_new
@@ -734,12 +761,20 @@ class InkyModel(PreTrainedModel):
                 exit_now = cum[active] >= halt_threshold
             if bool(exit_now.any()):
                 ex = active[exit_now]
-                out[0, ex] += surv[ex].unsqueeze(-1) * state[0, ex].float()   # unassigned mass
+                st = state[0, ex].float()
+                if norm_mix:                                                   # unassigned mass
+                    r = self._state_rms(st)
+                    out[0, ex] += surv[ex].unsqueeze(-1) * st / r
+                    scale_acc[ex] += surv[ex] * r[:, 0]
+                else:
+                    out[0, ex] += surv[ex].unsqueeze(-1) * st
                 expected_loops[ex] += surv[ex] * float(n)                      # ...counted at its exit loop
                 surv[ex] = 0.0
                 exit_loop[ex] = float(n)
             active = active[~exit_now]
 
+        if norm_mix:
+            out = out * scale_acc.view(1, S, 1)
         hidden = out.to(h.dtype)
         for layer in self.post_layers:
             hidden, _, _ = layer(hidden, cos, sin, None)
@@ -850,6 +885,17 @@ class InkyModel(PreTrainedModel):
         for module in self.modules():
             if hasattr(module, "update_balance_bias"):
                 module.update_balance_bias()
+
+    @torch.no_grad()
+    def reset_moe_load(self) -> None:
+        """Discard the MoE routing counts collected since the last balance update.
+
+        The counters fill on every forward pass, including eval and the pass of a skipped step, so call this
+        after any pass whose routing should not move the balance biases. ``train`` does so after each eval and
+        after each skipped step."""
+        for module in self.modules():
+            if hasattr(module, "reset_expert_load"):
+                module.reset_expert_load()
 
     # ------------------------------------------------------------------ generation
 

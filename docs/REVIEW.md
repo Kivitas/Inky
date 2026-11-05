@@ -7,7 +7,7 @@ been trained or scored.
 ## Summary
 
 Inky is a ~50M-parameter recurrent language model with an 8k window. The code is complete enough to
-build, run and test (680 tests collected), and the training loop has been smoke-tested with `--dry-run` only.
+build, run and test (713 tests collected), and the training loop has been smoke-tested with `--dry-run` only.
 The main gap is evidence: there is no corpus, no trained weights, no baseline run (the dense switch
 exists but was never trained) and no measured quality. Most design choices are therefore unvalidated, and the next work should test them rather
 than add to them.
@@ -52,7 +52,8 @@ than add to them.
   cached decode path absorbed), and still has no gated attention. QK-norm is untested on trained
   weights.
 - **Highway.** The state-space memory highway is a causal running mean carried across loops. It has
-  not been ablated, so its contribution is unknown. `use_highway=False` (50,165,505 parameters) and the
+  not been ablated, so its contribution is unknown. It now enters the stream through a learned gain that
+  starts at 0 (see "Phase A" below). `use_highway=False` (50,165,505 parameters) and the
   `no_highway` variant in `scripts/ablate.py` exist for the test.
 - **Depth mismatch.** Training draws 2 to 6 loops per batch, while inference uses 6 by default. The
   model is therefore evaluated at a depth it was only partly trained for, unless `eval_by_depth` is
@@ -60,7 +61,7 @@ than add to them.
 
 ### Process and project gaps
 
-- **No baseline run.** `use_moe=False` builds a dense variant (30,742,721 parameters, which matches
+- **No baseline run.** `use_moe=False` builds a dense variant (30,742,722 parameters, which matches
   the MoE's active feed-forward width, not its total), but nothing has been trained or scored against
   it or a published reference, so no claim of improvement is possible yet.
 - **No CUDA testing.** Everything was run on CPU. `--amp fp16`, `--compile` and the MoE dense dispatch
@@ -99,14 +100,35 @@ than add to them.
 These changes are in the working tree (not yet committed). They are code changes only; none has been
 measured on trained weights.
 
+Phase A (architecture scale and balance fixes). Measured at initialisation on random tokens with
+`scripts/diagnose.py`, not on trained weights:
+
+- **Highway gain** (`highway_gain_init`, default 0.0). The highway added `0.1 * RMSNorm(...)` to a stream whose
+  RMS is 0.02 to 0.3, i.e. 120% of the loop-1 input, and its per-parameter gradient was about 47x that of the
+  core MoE. It now starts switched off behind a learned scalar (+1 parameter).
+- **Scale-preserving loop mixture** (`loop_mix_normalize`, default True). The stream RMS grew 4.8x over six
+  loops (0.058 to 0.278), so `p_n` was not each loop's real share of the plain sum. With the gain at 0 the
+  growth is 2.0x, and the mixture now gives each loop its halting share. `forward_early_exit` matches `forward`.
+- **MoE balance rule** (`balance_update`, default `"sign"`). The old step was at most `balance_rate / 8`. A
+  toy run (tiny model, 200 steps, one seed) removed the imbalance with the sign rule and not with the old
+  one. `train` now also clears the routing counters after each eval and each skipped step: before, eval
+  batches doubled the counts the next update saw (checked by removing the reset: 192 instead of 96 assignments).
+- **Diagnostics** (`inky/diagnostics.py`, `scripts/diagnose.py`, `train --diagnose-every`).
+- At initialisation the core-layer expert-load coefficient of variation fell from 0.66 and 0.45 to 0.26 and 0.24.
+  That fits the old highway pushing a near-constant vector into the router, but no training run confirms it.
+
+The remaining architecture items (matched-compute comparison of vocabulary size and unique layers against
+loops, MoE against dense, MLA against GQA, attention output gate, loop mechanism, input injection) are
+comparisons that need training runs and are not started.
+
 Done in the latest round:
 
 - **Growable decode cache** (`LatentKV` in `inky/layers.py`): no per-token `torch.cat`. Measured
   about 88 against about 92 ms per token on CPU at 2,000 tokens, so a small gain only.
 - **Latent QK-norm** (`qk_norm_mode="latent"`): keeps absorbed cached decode with `qk_norm` on.
 - **Dense baseline switch** (`use_moe=False`, `dense_intermediate_size`) and **highway switch**
-  (`use_highway=False`). Parameter counts: default 50,219,201; no highway 50,165,505; dense
-  30,742,721; dense and no highway 30,689,025. Nothing has been trained with them.
+  (`use_highway=False`). Parameter counts: default 50,219,202; no highway 50,165,505; dense
+  30,742,722; dense and no highway 30,689,025. Nothing has been trained with them.
 - **Mixture-of-Recursions routing** (`routing_mode="mor"`, `mor_*` fields): token-choice causal depth
   router, active tokens only per loop, stale-KV reuse. Untrained and unmeasured.
 - **Batched Muon** (`--muon-batched`) and **`--compile`** (falls back to eager).

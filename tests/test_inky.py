@@ -21,6 +21,7 @@ OPEN, SEP, CLOSE = 508, 509, 510  # scratch ids inside the tiny vocabulary
 def tiny_config(**overrides) -> InkyConfig:
     """Same structure as the default config, at a size that runs in well under a second on CPU."""
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512,
         scratch_open_id=OPEN,
         scratch_sep_id=SEP,
@@ -55,8 +56,8 @@ def seeded_model(config: InkyConfig) -> InkyModel:
 
 
 # Exact counts, kept here in one place (TEST-03). README: 50.22M default, 50.61M with the decision engine.
-EXPECTED_DEFAULT_PARAMS = 50_219_201
-EXPECTED_ARLO_PARAMS = 50_614_854
+EXPECTED_DEFAULT_PARAMS = 50_219_202     # 50,219,201 plus the highway's learned output gain (one scalar)
+EXPECTED_ARLO_PARAMS = 50_614_855
 
 
 def test_default_config_parameter_count_is_exact():

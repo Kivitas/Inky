@@ -85,6 +85,11 @@ class InkyConfig(PretrainedConfig):
         num_active_routed: int = 2,
         router_z_loss_coef: float = 1e-3,
         balance_rate: float = 1e-3,        # aux-loss-free congestion-bias rate
+        # How the congestion bias moves each optimizer step. "sign": every bias moves by +-balance_rate towards
+        # the uniform load (the DeepSeek-V3 rule, so a step of 1e-3 can overcome a score gap of ~1e-2 in tens of
+        # steps). "proportional": the step is balance_rate * (uniform - load), at most ~1/num_routed_experts of
+        # that, which is the original Inky rule and is much slower to remove an early imbalance.
+        balance_update: str = "sign",
         # MoE dispatch: on a non-CPU device, batches of at most this many tokens run every routed expert
         # on every token (sync-free, no host read of expert counts; ~num_routed/top_k times the routed
         # compute). Larger batches (training, prefill) use the grouped path. 0 disables the dense path.
@@ -93,10 +98,21 @@ class InkyConfig(PretrainedConfig):
         # is dense_intermediate_size; None picks (num_shared_experts + top-k routed) * intermediate_size,
         # which equals the MoE's ACTIVE feed-forward parameters per token (the router's num_routed * hidden
         # weights are not counted). use_highway=False does not create the StateSpaceMemoryHighway at all.
-        # Both default to True, which is the standard architecture (50,219,201 parameters).
+        # Both default to True, which is the standard architecture (50,219,202 parameters).
         use_moe: bool = True,
         dense_intermediate_size: int | None = None,
         use_highway: bool = True,
+        # Initial value of the learned gain on the highway's output (``h + gain * RMSNorm(out_proj(mem))``). The
+        # RMSNorm output has unit scale whatever the stream's scale is, and the token embeddings start at RMS 0.02,
+        # so a fixed 0.1 made the highway about as large as the stream itself at initialisation (125% of the loop-1
+        # input, measured). 0.0 (default) starts the model without the highway and lets the gain grow if the
+        # highway helps; 0.1 reproduces the earlier fixed scale. Ignored when use_highway is False.
+        highway_gain_init: float = 0.0,
+        # Loop mixture. The PonderNet output is sum_n p_n * h_n over loop states whose scale grows with n (RMS
+        # 0.06 -> 0.28 over six loops at init), so p_n alone does not say how much loop n contributes. True mixes
+        # the directions h_n / rms(h_n) with p_n and multiplies by the p-weighted mean RMS, so each loop's share
+        # is p_n and the output keeps the stream's scale. False is the plain sum_n p_n * h_n.
+        loop_mix_normalize: bool = True,
         # Context and numerics
         max_position_embeddings: int = 8192,
         rope_theta: float = 500000.0,
@@ -207,6 +223,11 @@ class InkyConfig(PretrainedConfig):
         self.num_active_routed = num_active_routed
         self.router_z_loss_coef = router_z_loss_coef
         self.balance_rate = balance_rate
+        if balance_update not in ("sign", "proportional"):
+            raise ValueError(f"balance_update must be 'sign' or 'proportional', got {balance_update!r}")
+        self.balance_update = balance_update
+        self.highway_gain_init = float(highway_gain_init)
+        self.loop_mix_normalize = bool(loop_mix_normalize)
         if int(moe_dense_max_tokens) < 0:
             raise ValueError(f"moe_dense_max_tokens must be >= 0, got {moe_dense_max_tokens}")
         self.moe_dense_max_tokens = int(moe_dense_max_tokens)

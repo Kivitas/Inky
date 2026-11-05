@@ -15,6 +15,7 @@ OPEN, SEP, CLOSE = 508, 509, 510
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512,
         scratch_open_id=OPEN,
         scratch_sep_id=SEP,

@@ -21,6 +21,7 @@ OPEN, SEP, CLOSE = 508, 509, 510
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512, scratch_open_id=OPEN, scratch_sep_id=SEP, scratch_close_id=CLOSE,
         hidden_size=64, num_attention_heads=4, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=16,
         q_lora_rank=32, kv_lora_rank=24, intermediate_size=96, num_routed_experts=4, num_active_routed=2,
@@ -65,7 +66,7 @@ def test_defaults_keep_ponder_and_the_documented_parameter_count():
     assert cfg.mor_temperature == 1.0
     assert cfg.mor_target == cfg.ponder_prior_steps
     model = InkyModel(cfg)
-    assert model.count_parameters()["total"] == 50_219_201
+    assert model.count_parameters()["total"] == 50_219_202
     assert model.halting is not None and model.mor_router is None
     assert not any(k.startswith("mor_router") for k in model.state_dict())
 

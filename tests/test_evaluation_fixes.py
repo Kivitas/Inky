@@ -26,6 +26,7 @@ VOCAB = 512
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=VOCAB,
         hidden_size=64,
         num_attention_heads=4,
