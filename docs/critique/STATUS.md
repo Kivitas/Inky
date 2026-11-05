@@ -30,8 +30,9 @@ Fixed by opt-in only (the default is unchanged): GEN-04 (`cache_dequantized`), G
 (`repeat_window`), GEN-13 (`count_prose_only`), TRAIN-04 (dropout and early stopping, both off by default). CORE-08 is
 listed as OPEN because its default (`lm_loss_recompute=True`) still runs the second head pass.
 
-Tests: 680 collected and 680 passed (`python -B -m pytest tests -q -p no:cacheprovider`, 21 warnings,
-about 4 minutes on CPU, 2026-11-04).
+Tests: 713 collected and 713 passed (`python -B -m pytest tests -q -p no:cacheprovider`, 21 warnings,
+about 5.5 minutes on CPU, 2026-11-05), after the Phase A architecture changes described in
+`docs/REVIEW.md`. The 33 new tests are in `tests/test_phase_a_architecture.py`.
 
 Passing tests show that the code runs. They do not show that the open items are fixed.
 

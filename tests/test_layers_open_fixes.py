@@ -23,6 +23,7 @@ from inky.layers import (  # noqa: E402
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512,
         scratch_open_id=508,
         scratch_sep_id=509,
@@ -164,7 +165,8 @@ def test_bf16_decode_step_matches_fp32_decode_step_closely():
 
 def highway(config: InkyConfig) -> StateSpaceMemoryHighway:
     torch.manual_seed(6)
-    return StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps).eval()
+    return StateSpaceMemoryHighway(config.hidden_size, config.ssm_state_dim, config.rms_norm_eps,
+                                gain_init=0.1).eval()
 
 
 def test_highway_all_true_valid_mask_matches_default():
@@ -291,8 +293,9 @@ def test_recurrent_core_all_true_valid_mask_matches_default():
 # ---------------------------------------------------------------- CORE-14: highway normalisation (design check)
 
 def test_highway_added_term_has_fixed_rms_by_design_regardless_of_input_scale():
-    """CORE-14 is NOT-A-BUG: the RMSNorm sets the magnitude of the highway's added term to 0.1 * weight RMS
-    by design (the default output is unchanged). This test pins that property so a change is deliberate."""
+    """CORE-14 is NOT-A-BUG: the RMSNorm sets the magnitude of the highway's added term to ``gain`` * weight RMS
+    by design, whatever the scale of the input (here the gain is 0.1, the old fixed factor; the default gain now
+    starts at 0 and is learned). This test pins that property so a change is deliberate."""
     config = tiny_config()
     hw = highway(config)
     for scale in (1.0, 30.0):

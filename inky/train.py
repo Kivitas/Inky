@@ -35,6 +35,7 @@ from typing import Any, Callable, Dict, Iterable, Iterator, List, Optional, Tupl
 import torch
 
 from .data import doc_boundary_mask, pack_sequences, pack_sequences_with_segments
+from .diagnostics import format_diagnostics_line, loop_diagnostics
 from .evaluation import evaluate, perplexity_by_loops
 from .optim import format_group_counts
 
@@ -484,8 +485,15 @@ def train(
     early_stop_min_delta: float = 0.0,
     compile_model: bool = False,
     extra_config: Optional[Dict[str, Any]] = None,
+    diagnose_every: int = 0,
 ) -> List[Dict[str, Any]]:
     """Run optimiser steps up to the total ``steps`` and return the history of the whole run.
+
+    ``diagnose_every`` (default 0 = off) runs ``inky.diagnostics.loop_diagnostics`` on (up to two rows of) the
+    step's last micro-batch every that many steps and appends a ``{"kind": "diagnostics", "step": ..., ...}``
+    record to the history: stream RMS per loop, loop-to-loop change, highway share and gain, expert load. It
+    costs one extra eval-mode forward pass and changes nothing else (the MoE load counters of the training step
+    are put back).
 
     ``steps`` is the total run length: schedules (LR, curriculum) are always computed from it. When
     ``warmup_steps`` is None it defaults to 5% of ``steps`` (at least 1), so a fresh run never starts at
@@ -569,6 +577,9 @@ def train(
         early_stop_patience = int(early_stop_patience)
         if eval_batches is None or eval_every <= 0:
             raise ValueError("early_stop_patience needs eval_batches and eval_every > 0")
+    if int(diagnose_every) != diagnose_every or diagnose_every < 0:
+        raise ValueError(f"diagnose_every must be an integer >= 0, got {diagnose_every}")
+    diagnose_every = int(diagnose_every)
     if not (math.isfinite(early_stop_min_delta) and early_stop_min_delta >= 0):
         raise ValueError(f"early_stop_min_delta must be a finite number >= 0, got {early_stop_min_delta}")
     early_stop_min_delta = float(early_stop_min_delta)
@@ -763,6 +774,7 @@ def train(
             if record["skip_reason"] is not None:
                 # The optimiser does not run, so its moments and the weights stay as they were.
                 optimizer.zero_grad()
+                target.reset_moe_load()   # the skipped step's routing must not feed the next balance update
                 if unscaled:
                     scaler.update()  # lowers the loss scale after an fp16 overflow
                 record.update(skipped=True, grad_norm=grad_norm, tokens_per_sec=_rate(step_tokens, step_t0, device))
@@ -841,9 +853,15 @@ def train(
                             f"step {step} eval depth {c} loops: nll {by_depth[c]['nll']:.4f} "
                             f"perplexity {by_depth[c]['perplexity']:.2f}"
                         )
+                target.reset_moe_load()   # eval routing is not training routing: keep it out of the next update
                 model.train()
                 if is_best and ckpt_root is not None:
                     _save_best(ckpt_root, model, step, ev["nll"], ev["perplexity"])
+
+            if diagnose_every > 0 and step % diagnose_every == 0 and not record["skipped"]:
+                diag = loop_diagnostics(target, ids[:2].to(device))
+                history.append({"kind": "diagnostics", "step": step, **diag})
+                log_fn(format_diagnostics_line(step, diag))
 
             final = is_last or stopped_early
             periodic = checkpoint_every > 0 and step % checkpoint_every == 0 and not record["skipped"]

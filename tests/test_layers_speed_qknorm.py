@@ -13,11 +13,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from inky import InkyConfig  # noqa: E402
 from inky.layers import MultiLatentAttention, RotaryEmbedding, SharedExpertMoE  # noqa: E402
 
-DEFAULT_PARAM_COUNT = 50_219_201
+DEFAULT_PARAM_COUNT = 50_219_202
 
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512,
         scratch_open_id=508,
         scratch_sep_id=509,

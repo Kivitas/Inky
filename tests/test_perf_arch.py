@@ -21,12 +21,13 @@ from inky import layers as layers_mod  # noqa: E402
 from inky.layers import DenseFFN, LatentKV, MultiLatentAttention, RotaryEmbedding, SharedExpertMoE  # noqa: E402
 from inky.speculative import self_speculative_generate  # noqa: E402
 
-DEFAULT_PARAM_COUNT = 50_219_201
+DEFAULT_PARAM_COUNT = 50_219_202
 KV_RANK = 24   # distinct from every other width in the tiny config, so cats on it are recognisable
 
 
 def tiny_config(**overrides) -> InkyConfig:
     kwargs = dict(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512, scratch_open_id=508, scratch_sep_id=509, scratch_close_id=510,
         hidden_size=64, num_attention_heads=4, qk_nope_head_dim=12, qk_rope_head_dim=4, v_head_dim=16,
         q_lora_rank=32, kv_lora_rank=KV_RANK, intermediate_size=96, num_routed_experts=4, num_active_routed=2,

@@ -105,8 +105,11 @@ def test_grad_accum_equals_one_big_batch():
         (p.detach() - b).abs().max().item() for p, b in zip(model_big.parameters(), before)
     )
     assert moved > 1e-4, "the step should change the weights, otherwise the comparison proves nothing"
+    # The two gradients agree to ~1e-10, but the first AdamW step is g / (|g| + eps), which amplifies that noise
+    # for the few router entries whose gradient is itself ~1e-8 (measured: 1.4e-5 on a 3e-3 step). So the
+    # tolerance is a small fraction of the learning rate, not of the float error.
     for pa, pb in zip(model_big.parameters(), model_acc.parameters()):
-        assert torch.allclose(pa.detach(), pb.detach(), atol=1e-5, rtol=1e-4)
+        assert torch.allclose(pa.detach(), pb.detach(), atol=5e-5, rtol=1e-4)
 
 
 def test_grad_accum_runs_one_record_per_optimiser_step():

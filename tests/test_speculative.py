@@ -13,6 +13,7 @@ from inky.speculative import self_speculative_generate  # noqa: E402
 
 def tiny_config() -> InkyConfig:
     return InkyConfig(
+        highway_gain_init=0.1,  # keeps the highway active in these checks (the default gain is 0)
         vocab_size=512,
         scratch_open_id=508,
         scratch_sep_id=509,
