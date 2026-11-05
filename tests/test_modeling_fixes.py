@@ -269,10 +269,11 @@ def test_packing_arguments_are_validated():
 def test_ssm_mixer_layers_raise_the_clear_error_with_masks():
     model = seeded_model(tiny_config(ssm_mixer_layers=(0,)))
     ids = torch.randint(2, 500, (1, 6))
-    with pytest.raises(NotImplementedError, match="does not support attn_mask or segment_ids"):
+    with pytest.raises(NotImplementedError, match="does not support attn_mask"):
         model(ids, attention_mask=torch.ones(1, 6, dtype=torch.bool))
-    with pytest.raises(NotImplementedError, match="ssm_mixer_layers"):
-        model(ids, segment_ids=torch.zeros(1, 6, dtype=torch.long))
+    with torch.no_grad():
+        out = model(ids, segment_ids=torch.zeros(1, 6, dtype=torch.long))
+    assert torch.isfinite(out.logits).all()
 
 
 # ---------------------------------------------------------------- 5. step-CE token subset

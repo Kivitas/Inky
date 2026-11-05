@@ -113,6 +113,17 @@ def apply_rope(x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.T
     return (xf * cos.to(calc) + _rotate_half(xf) * sin.to(calc)).to(x.dtype)
 
 
+def causal_band_mask(S: int, T: int, past_len: int, window: Optional[int], device=None) -> torch.Tensor:
+    """Bool mask [S, T] (True = may attend) for S new queries after ``past_len`` cached positions (T = past_len + S).
+
+    Query i sits at absolute position ``past_len + i`` and may attend to key j when ``j <= past_len + i`` and, with
+    a ``window``, ``past_len + i - j < window`` (the last ``window`` positions, itself included)."""
+    mask = torch.ones(S, T, dtype=torch.bool, device=device).tril(diagonal=past_len)
+    if window is not None:
+        mask = mask & torch.ones(S, T, dtype=torch.bool, device=device).triu(diagonal=past_len - window + 1)
+    return mask
+
+
 class MultiLatentAttention(nn.Module):
     """Causal multi-latent attention.
 
@@ -160,6 +171,8 @@ class MultiLatentAttention(nn.Module):
         self.o_proj = nn.Linear(self.num_heads * self.v_dim, d, bias=False)
         self.scale = self.qk_dim ** -0.5
         self.max_len = int(config.max_position_embeddings)   # cache capacity ceiling (see _append)
+        # Optional attention output gate (config.attention_gate): one sigmoid per head, from the block input.
+        self.out_gate = nn.Linear(d, self.num_heads) if config.attention_gate else None
 
         # Optional QK-norm (per head, over the nope and rope parts separately). Created only when enabled,
         # so the default parameter set is unchanged. In "head" mode keys are normalised after
@@ -197,10 +210,13 @@ class MultiLatentAttention(nn.Module):
         past: Optional[KVEntry] = None,
         attn_mask: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
+        window: Optional[int] = None,
     ) -> Tuple[torch.Tensor, KVEntry]:
         """``attn_mask`` (bool, broadcastable to [B, 1, S, past+S] or [B, S, past+S]; True = may attend)
         and ``segment_ids`` (int [B, S]; a query attends only to keys with the same id, prefill only)
-        are optional and are combined with the causal mask. Both None gives the default behaviour."""
+        are optional and are combined with the causal mask. Both None gives the default behaviour.
+        ``window`` (default None = global) limits each query to the last ``window`` positions, itself included;
+        the cache entry still holds every position, a one-token decode just reads the last ``window`` of them."""
         B, S, _ = x.shape
         H = self.num_heads
 
@@ -217,16 +233,22 @@ class MultiLatentAttention(nn.Module):
         else:
             present = LatentKV(c_kv, k_pe, S)
         past_len = c_kv.shape[1] - S
+        windowed = window is not None and past_len + S > window          # a window that covers everything is global
 
-        if attn_mask is None and segment_ids is None:
+        if attn_mask is None and segment_ids is None and (S == 1 or not windowed):
             if S == 1:
+                if windowed:                                             # the new token sees the last `window` keys
+                    c_kv, k_pe = c_kv[:, -window:], k_pe[:, :, -window:]
                 out = self._decode_absorbed(q_nope, q_pe, c_kv, k_pe)
             else:
                 out = self._full_attention(q_nope, q_pe, c_kv, k_pe, past_len)
         else:
             extra = self._extra_mask(B, S, past_len, past is not None, attn_mask, segment_ids, x.device)
-            out = self._full_attention(q_nope, q_pe, c_kv, k_pe, past_len, extra_mask=extra)
+            out = self._full_attention(q_nope, q_pe, c_kv, k_pe, past_len, extra_mask=extra,
+                                       window=window if windowed else None)
 
+        if self.out_gate is not None:                                    # out [B, H, S, v], gate [B, S, H]
+            out = out * torch.sigmoid(self.out_gate(x)).transpose(1, 2).unsqueeze(-1).to(out.dtype)
         out = out.transpose(1, 2).reshape(B, S, H * self.v_dim)
         return self.o_proj(out), present
 
@@ -307,6 +329,7 @@ class MultiLatentAttention(nn.Module):
         k_pe: torch.Tensor,
         past_len: int,
         extra_mask: Optional[torch.Tensor] = None,
+        window: Optional[int] = None,
     ) -> torch.Tensor:
         B, H, S, _ = q_nope.shape
         T = c_kv.shape[1]
@@ -316,14 +339,14 @@ class MultiLatentAttention(nn.Module):
             k_nope = self.k_nope_norm(k_nope)
         k = torch.cat([k_nope, k_pe.expand(B, H, T, self.rope_dim)], dim=-1)
         q = torch.cat([q_nope, q_pe], dim=-1)
-        if extra_mask is None:
+        if extra_mask is None and window is None:
             if past_len == 0:
                 return F.scaled_dot_product_attention(q, k, v, is_causal=True)
-            # Query i sits at absolute position past_len + i and may attend to keys j <= past_len + i.
-            mask = torch.ones(S, T, dtype=torch.bool, device=q.device).tril(diagonal=past_len)
-        else:
-            causal = torch.ones(S, T, dtype=torch.bool, device=q.device).tril(diagonal=past_len)
-            mask = causal & extra_mask
+        # Query i sits at absolute position past_len + i and may attend to keys j <= past_len + i (and, with a
+        # window, only the last `window` of them).
+        mask = causal_band_mask(S, T, past_len, window, q.device)
+        if extra_mask is not None:
+            mask = mask & extra_mask
         return F.scaled_dot_product_attention(q, k, v, attn_mask=mask)
 
     def _absorbed_attention(
@@ -409,6 +432,8 @@ class MultiLatentAttention(nn.Module):
         positions = torch.arange(S, device=x_act.device)
         mask = (positions.unsqueeze(0) <= active.unsqueeze(1)).view(1, 1, K, S)   # [1, 1, K, S]
         out = self._absorbed_attention(q_nope, q_pe, c_kv=c_store, k_pe=kpe_store, mask=mask)
+        if self.out_gate is not None:
+            out = out * torch.sigmoid(self.out_gate(x_act)).transpose(1, 2).unsqueeze(-1).to(out.dtype)
         out = out.transpose(1, 2).reshape(1, K, H * self.v_dim)
         return self.o_proj(out)
 
@@ -494,8 +519,109 @@ class MultiLatentAttention(nn.Module):
             out = self._absorbed_attention(qn, qp, c_kv, k_all, mask=plan.mask)
         else:
             out = self._attend_masked(qn, qp, c_kv, k_all, plan.mask)           # [B, H, Kmax, v]
-        out = out[plan.b_idx, :, plan.slot].reshape(K, H * self.v_dim)          # padding-free again
+        out = out[plan.b_idx, :, plan.slot]                                     # [K, H, v], padding-free again
+        if self.out_gate is not None:
+            out = out * torch.sigmoid(self.out_gate(x_rows)).unsqueeze(-1).to(out.dtype)
+        out = out.reshape(K, H * self.v_dim)
         return self.o_proj(out), c_store, k_store, present
+
+
+class GroupedQueryAttention(nn.Module):
+    """Plain causal attention with ``num_kv_heads`` shared key/value heads (``attention_type="gqa"``).
+
+    It has the same call signature and cache protocol as ``MultiLatentAttention`` so a block can use either.
+    Queries and keys have ``qk_nope_head_dim + qk_rope_head_dim`` dims, RoPE rotates the last
+    ``qk_rope_head_dim`` of them, and values have ``v_head_dim``. ``qk_norm`` applies a per-head RMSNorm to the
+    queries and keys before RoPE (``qk_norm_mode`` has no meaning here, there is no latent).
+
+    Cache. The entry is a ``LatentKV`` whose two buffers hold the flattened keys (after RoPE and QK-norm)
+    [B, T, Hkv * qk_dim] and the flattened values [B, 1, T, Hkv * v_dim], so the growable-buffer, fork and
+    snapshot machinery of the latent cache works unchanged (``_append`` is shared with ``MultiLatentAttention``).
+    It is larger than the latent cache (56 against 31.5 MiB in bf16 at 8k for the default shape with 2 KV heads),
+    which does not matter at this size. Decoding runs standard attention over the whole cache, with no
+    absorption. There is no ``forward_subset`` or ``forward_mor``: early exit and MoR routing need the latent
+    layout and are rejected for this arm.
+    """
+
+    _grown_capacity = MultiLatentAttention._grown_capacity
+    _append = MultiLatentAttention._append
+    _extra_mask = staticmethod(MultiLatentAttention._extra_mask)
+
+    def __init__(self, config: InkyConfig):
+        super().__init__()
+        d = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.num_kv_heads = config.num_kv_heads
+        self.qk_dim = config.qk_head_dim
+        self.rope_dim = config.qk_rope_head_dim
+        self.v_dim = config.v_head_dim
+        self.q_proj = nn.Linear(d, self.num_heads * self.qk_dim, bias=False)
+        self.k_proj = nn.Linear(d, self.num_kv_heads * self.qk_dim, bias=False)
+        self.v_proj = nn.Linear(d, self.num_kv_heads * self.v_dim, bias=False)
+        self.o_proj = nn.Linear(self.num_heads * self.v_dim, d, bias=False)
+        self.max_len = int(config.max_position_embeddings)
+        self.out_gate = nn.Linear(d, self.num_heads) if config.attention_gate else None
+        self.qk_norm = bool(config.qk_norm)
+        if self.qk_norm:
+            self.q_norm = RMSNorm(self.qk_dim, config.rms_norm_eps)
+            self.k_norm = RMSNorm(self.qk_dim, config.rms_norm_eps)
+
+    def _rope(self, x: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor) -> torch.Tensor:
+        """Rotates the last ``rope_dim`` dims of x [B, h, S, qk_dim]."""
+        keep, pe = x.split([self.qk_dim - self.rope_dim, self.rope_dim], dim=-1)
+        return torch.cat([keep, apply_rope(pe, cos, sin)], dim=-1)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: torch.Tensor,
+        sin: torch.Tensor,
+        past: Optional[KVEntry] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
+        window: Optional[int] = None,
+    ) -> Tuple[torch.Tensor, KVEntry]:
+        B, S, _ = x.shape
+        H, Hk = self.num_heads, self.num_kv_heads
+        q = self.q_proj(x).view(B, S, H, self.qk_dim).transpose(1, 2)
+        k = self.k_proj(x).view(B, S, Hk, self.qk_dim).transpose(1, 2)
+        v = self.v_proj(x).view(B, S, Hk * self.v_dim)
+        if self.qk_norm:
+            q, k = self.q_norm(q), self.k_norm(k)
+        q, k = self._rope(q, cos, sin), self._rope(k, cos, sin)
+        k_flat = k.transpose(1, 2).reshape(B, S, Hk * self.qk_dim)
+        v_flat = v.unsqueeze(1)                                              # [B, 1, S, Hk * v]
+
+        present = self._append(past, k_flat, v_flat) if past is not None else LatentKV(k_flat, v_flat, S)
+        k_all, v_all = present
+        T = k_all.shape[1]
+        past_len = T - S
+        k_all = k_all.reshape(B, T, Hk, self.qk_dim).transpose(1, 2)         # [B, Hk, T, qk]
+        v_all = v_all[:, 0].reshape(B, T, Hk, self.v_dim).transpose(1, 2)    # [B, Hk, T, v]
+
+        sdpa = F.scaled_dot_product_attention
+        windowed = window is not None and T > window                         # a window that covers everything is global
+        if attn_mask is None and segment_ids is None and (S == 1 or not windowed):
+            if past_len == 0:
+                out = sdpa(q, k_all, v_all, is_causal=True, enable_gqa=True)
+            elif S == 1:
+                if windowed:                                                  # only the last `window` keys
+                    k_all, v_all = k_all[:, :, -window:], v_all[:, :, -window:]
+                out = sdpa(q, k_all, v_all, enable_gqa=True)                  # the new token sees the whole cache
+            else:
+                mask = causal_band_mask(S, T, past_len, None, q.device)
+                out = sdpa(q, k_all, v_all, attn_mask=mask, enable_gqa=True)
+        else:
+            extra = self._extra_mask(B, S, past_len, past is not None, attn_mask, segment_ids, x.device)
+            mask = causal_band_mask(S, T, past_len, window if windowed else None, q.device)
+            if extra is not None:
+                mask = mask & extra
+            out = sdpa(q, k_all, v_all, attn_mask=mask, enable_gqa=True)
+
+        if self.out_gate is not None:
+            out = out * torch.sigmoid(self.out_gate(x)).transpose(1, 2).unsqueeze(-1).to(out.dtype)
+        out = out.transpose(1, 2).reshape(B, S, H * self.v_dim)
+        return self.o_proj(out), present
 
 
 class SelectiveSSMMixer(nn.Module):
@@ -509,6 +635,12 @@ class SelectiveSSMMixer(nn.Module):
     The cache entry is (state, empty), where state is [B, hidden, state_dim] and empty is [B, 1, 0],
     so it has the same tuple shape as a KVEntry. The mixer is causal by construction and does not
     use cos or sin (no RoPE).
+
+    Packed documents are supported through ``segment_ids`` (prefill only): the state is reset at each
+    segment boundary, so every document is processed as if it ran alone. The ids of a row must be contiguous
+    (a document is one run of equal ids, as ``pack_sequences_with_segments`` produces); an id that comes back
+    after another one is treated as the same document, as in the attention layers. Padding masks
+    (``attn_mask``) are not supported.
     """
 
     scan_chunk = 64  # tokens per chunk in the chunked scan; the within-chunk work is O(chunk^2 * N)
@@ -534,28 +666,34 @@ class SelectiveSSMMixer(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, KVEntry]:
-        if attn_mask is not None or segment_ids is not None:
-            # The mixer's state runs along the whole sequence, so a mask cannot stop packed documents or
-            # masked positions from influencing later tokens. Packed batches need latent-attention blocks.
+        if attn_mask is not None:
+            # Padding masks are not supported: a masked position would still feed later tokens through the state.
             raise NotImplementedError(
-                "SelectiveSSMMixer (ssm_mixer_layers) does not support attn_mask or segment_ids: its recurrent "
-                "state runs across the whole sequence, so packed documents would leak into each other. "
-                "Keep packed batches to attention-only recurrent layers, or run the SSM model unpacked."
+                "SelectiveSSMMixer (ssm_mixer_layers) does not support attn_mask (padding masks). Packed documents "
+                "ARE supported through segment_ids; pad by running shorter rows separately instead."
             )
         B, S, _ = x.shape
+        seg = None
+        if segment_ids is not None:
+            if past is not None:
+                raise ValueError("segment_ids is only supported for prefill (no past cache)")
+            if tuple(segment_ids.shape) != (B, S):
+                raise ValueError(f"segment_ids must have shape {(B, S)}, got {tuple(segment_ids.shape)}")
+            seg = segment_ids.to(x.device)
         u = self.in_proj(x)                              # [B, S, d]
         log_a = F.logsigmoid(self.decay_proj(x))         # [B, S, N] log of the input-dependent decay
         g = torch.sigmoid(self.gate_proj(x))             # [B, S, N] input-dependent input gate
 
         h0 = u.new_zeros(B, u.shape[-1], self.state_dim) if past is None else past[0]
-        y, h = self._chunked_scan(log_a, g, u, h0)
+        y, h = self._chunked_scan(log_a, g, u, h0, seg)
         y = y + self.skip * u                                                 # [B, S, d]
 
         present = (h, x.new_zeros(B, 1, 0))
         return self.out_proj(y), present
 
     def _chunked_scan(
-        self, log_a: torch.Tensor, g: torch.Tensor, u: torch.Tensor, h0: torch.Tensor
+        self, log_a: torch.Tensor, g: torch.Tensor, u: torch.Tensor, h0: torch.Tensor,
+        seg: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """Evaluates h_t = a_t * h_{t-1} + g_t * u_t (per channel and state) and the readout, chunk by chunk.
 
@@ -564,6 +702,10 @@ class SelectiveSSMMixer(nn.Module):
         contributes exp(L_t) * h_0. The decay depends only on (token, state), so the chunk's
         pairwise weights are [B, C, C, N] and the channel dimension is handled by one matmul.
         Returns y [B, S, d] (readout only, no skip) and the final state [B, d, N].
+
+        ``seg`` (LongTensor [B, S], optional) gives packed-document ids. Token t only receives contributions
+        from earlier tokens of its own segment, and the carried-in state only reaches tokens of the segment
+        that the previous token belonged to. Each segment is therefore scanned from a zero state.
         """
         B, S, _ = u.shape
         C_max = self.scan_chunk
@@ -580,8 +722,17 @@ class SelectiveSSMMixer(nn.Module):
             causal = torch.ones(C, C, dtype=torch.bool, device=u.device).tril().view(1, C, C, 1)
             W = torch.exp(diff.masked_fill(~causal, 0.0)).masked_fill(~causal, 0.0).to(u.dtype)
             Mg = W * gc.unsqueeze(1)                       # [B, t, s, N], weight with the gate g_s
-            intra = torch.matmul(Mg.permute(0, 3, 1, 2), uc.unsqueeze(1))   # [B, N, t, d]
             carry = torch.exp(L).to(u.dtype).unsqueeze(2) * h.unsqueeze(1)  # [B, C, d, N]
+            if seg is not None:
+                seg_c = seg[:, c0:c0 + C_max]                                # [B, C]
+                same = seg_c.unsqueeze(2) == seg_c.unsqueeze(1)              # [B, t, s]: same segment
+                Mg = Mg * same.unsqueeze(-1).to(Mg.dtype)
+                if c0 > 0:
+                    carry_mask = seg_c == seg[:, c0 - 1].unsqueeze(1)        # [B, C]: h belongs to token c0-1
+                else:
+                    carry_mask = torch.ones_like(seg_c, dtype=torch.bool)    # the initial state is zero anyway
+                carry = carry * carry_mask[:, :, None, None].to(carry.dtype)
+            intra = torch.matmul(Mg.permute(0, 3, 1, 2), uc.unsqueeze(1))   # [B, N, t, d]
             h_chunk = intra.permute(0, 2, 3, 1) + carry                     # [B, C, d, N]
             ys.append(torch.einsum("bcdn,dn->bcd", h_chunk, self.readout))
             h = h_chunk[:, -1]
@@ -632,7 +783,7 @@ class SharedExpertMoE(nn.Module):
         self.z_loss_coef = config.router_z_loss_coef
         self.dense_max_tokens = int(config.moe_dense_max_tokens)
 
-        self.shared_experts = nn.ModuleList(SwiGLU(d, ff) for _ in range(config.num_shared_experts))
+        self.shared_experts = nn.ModuleList(SwiGLU(d, config.shared_ffn_size) for _ in range(config.num_shared_experts))
         self.routed_experts = nn.ModuleList(SwiGLU(d, ff) for _ in range(self.num_routed))
         self.router = nn.Linear(d, self.num_routed, bias=False)
         self.register_buffer("balance_bias", torch.zeros(self.num_routed))
@@ -770,7 +921,12 @@ class InkyBlock(nn.Module):
         self.residual_dropout = float(getattr(config, "residual_dropout", 0.0))
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # The token mixer is named `attn` in both cases so the block's forward is the same.
-        self.attn = SelectiveSSMMixer(config) if use_ssm else MultiLatentAttention(config)
+        if use_ssm:
+            self.attn = SelectiveSSMMixer(config)
+        elif config.attention_type == "gqa":
+            self.attn = GroupedQueryAttention(config)
+        else:
+            self.attn = MultiLatentAttention(config)
         self.post_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # use_moe=False swaps in one dense SwiGLU of the MoE's active width (a baseline / ablation).
         self.mlp = SharedExpertMoE(config) if config.use_moe else DenseFFN(config)
@@ -780,9 +936,11 @@ class InkyBlock(nn.Module):
             return F.dropout(branch, p=self.residual_dropout, training=True)
         return branch
 
-    def _forward(self, x, cos, sin, past, attn_mask=None, segment_ids=None):
+    def _forward(self, x, cos, sin, past, attn_mask=None, segment_ids=None, window=None):
+        # The SSM mixer has no window (its state already decays); only the attention variants take one.
+        extra = {} if window is None or isinstance(self.attn, SelectiveSSMMixer) else {"window": window}
         attn_out, present = self.attn(self.input_norm(x), cos, sin, past,
-                                      attn_mask=attn_mask, segment_ids=segment_ids)
+                                      attn_mask=attn_mask, segment_ids=segment_ids, **extra)
         x = x + self._residual_drop(attn_out) * self.residual_scale
         mlp_out, aux = self.mlp(self.post_norm(x))
         x = x + self._residual_drop(mlp_out) * self.residual_scale
@@ -796,17 +954,19 @@ class InkyBlock(nn.Module):
         past: Optional[KVEntry] = None,
         attn_mask: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
+        window: Optional[int] = None,
     ) -> Tuple[torch.Tensor, KVEntry, torch.Tensor]:
-        """``attn_mask`` and ``segment_ids`` are passed to the token mixer (see MultiLatentAttention.forward)."""
+        """``attn_mask``, ``segment_ids`` and ``window`` are passed to the token mixer (see
+        MultiLatentAttention.forward)."""
         if self.use_checkpoint and self.training and past is None and torch.is_grad_enabled():
             # Recompute activations in backward. Only used for full-sequence training, not decoding.
             def run(hs):
-                out, _, aux = self._forward(hs, cos, sin, None, attn_mask, segment_ids)
+                out, _, aux = self._forward(hs, cos, sin, None, attn_mask, segment_ids, window)
                 return out, aux
 
             out, aux = torch.utils.checkpoint.checkpoint(run, x, use_reentrant=False)
             return out, None, aux
-        return self._forward(x, cos, sin, past, attn_mask, segment_ids)
+        return self._forward(x, cos, sin, past, attn_mask, segment_ids, window)
 
     def forward_subset(
         self,
@@ -1063,6 +1223,20 @@ class RecurrentCore(nn.Module):
         ) if config.use_highway else None
         self.damped_beta = nn.Parameter(torch.zeros(config.hidden_size))
         self.loop_dropout_prob = config.loop_dropout_prob
+        # loop_input_injection: per-channel gain on the prelude output added to every loop's block input. It
+        # starts at 0, so the model starts identical to one without it.
+        self.inject_gain = nn.Parameter(torch.zeros(config.hidden_size)) if config.loop_input_injection else None
+        # Local attention (config.local_window): which 1-based loops use the window.
+        self.local_window = config.local_window
+        self.local_loops = frozenset(config.local_window_loops) if config.local_window is not None else frozenset()
+
+    def _inject(self, x: torch.Tensor, h0: Optional[torch.Tensor]) -> torch.Tensor:
+        """``x + inject_gain * h0`` when injection is on (``h0`` is the prelude output), else ``x``."""
+        if self.inject_gain is None:
+            return x
+        if h0 is None:
+            raise ValueError("loop_input_injection needs the prelude output h0")
+        return x + self.inject_gain.to(x.dtype) * h0
 
     def forward(
         self,
@@ -1077,6 +1251,7 @@ class RecurrentCore(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
+        h0: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], List[Optional[KVEntry]], torch.Tensor
     ]:
@@ -1084,8 +1259,12 @@ class RecurrentCore(nn.Module):
         document and is passed to every block. ``attn_mask`` (see MultiLatentAttention.forward) is passed to
         every block. The highway has no attention, so it takes only ``segment_ids`` and ``valid_mask`` (the
         pads it must leave out of its running mean, see StateSpaceMemoryHighway.forward). The defaults of
-        all three give the default behaviour. Packing needs ``past is None`` and ``prefix_sum is None``."""
+        all three give the default behaviour. Packing needs ``past is None`` and ``prefix_sum is None``.
+        ``h0`` is the prelude output, needed (and only used) when ``loop_input_injection`` is on. Loops listed in
+        ``config.local_window_loops`` attend to the last ``config.local_window`` positions only."""
         h_in = h
+        h = self._inject(h, h0)
+        window = self.local_window if step in self.local_loops else None
         if self.step_mod is not None:
             h = self.step_mod(h, step)
         if self.ssm is not None:
@@ -1106,7 +1285,8 @@ class RecurrentCore(nn.Module):
                 presents.append(None)
                 continue
             past_i = past[i] if past is not None else None
-            h, present, layer_aux = layer(h, cos, sin, past_i, attn_mask=attn_mask, segment_ids=segment_ids)
+            h, present, layer_aux = layer(h, cos, sin, past_i, attn_mask=attn_mask, segment_ids=segment_ids,
+                                          window=window)
             presents.append(present)
             aux = aux + layer_aux
 
@@ -1184,7 +1364,7 @@ class RecurrentCore(nn.Module):
             K = int(rows.numel())
             if K == 0 and not want_cache:
                 break                                  # depths only shrink: no later loop has an active token
-            x_all = state.view(B, S, D)
+            x_all = self._inject(state.view(B, S, D), h)       # ``h`` is the prelude output
             if self.step_mod is not None:
                 x_all = self.step_mod(x_all, n)
             prefix_in = past_prefix[idx] if past_prefix is not None else None
@@ -1263,14 +1443,16 @@ class RecurrentCore(nn.Module):
         active: torch.Tensor,
         stores: List[Tuple[torch.Tensor, torch.Tensor]],
         prev_mem: Optional[torch.Tensor],
+        h0: Optional[torch.Tensor] = None,
     ):
-        """Inference-only loop step for the active tokens (batch size 1).
+        """Inference-only loop step for the active tokens (batch size 1). ``h0`` [1, S, D] is the prelude output,
+        needed only when ``loop_input_injection`` is on.
 
         ``state`` [1, S, D] holds every token's current loop state; exited tokens keep their final
         state. The SSM highway runs over all positions (it is cheap), and the attention blocks run
         only on ``active``. Returns the new states of the active tokens [1, K, D] and the SSM memory.
         """
-        x = state
+        x = self._inject(state, h0)
         if self.step_mod is not None:
             x = self.step_mod(x, step)
         if self.ssm is not None:

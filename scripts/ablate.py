@@ -82,6 +82,46 @@ def _fixed_depth(base: Overrides) -> Overrides:
     return dict(min_recurrent_loops=int(base.get("max_recurrent_loops", 6)))
 
 
+def _big_experts(base: Overrides) -> Overrides:
+    """Half as many routed experts, each twice as wide: same expert parameters and the same active width."""
+    ff = int(base.get("intermediate_size", 704))
+    routed = int(base.get("num_routed_experts", 8))
+    active = int(base.get("num_active_routed", 2))
+    return dict(shared_intermediate_size=ff, intermediate_size=2 * ff,
+                num_routed_experts=max(2, routed // 2), num_active_routed=max(1, active // 2))
+
+
+def _core_shape(layers: int) -> Callable[[Overrides], Overrides]:
+    """``layers`` unique recurrent layers with fewer loops, at about the same number of layer applications."""
+    def build(base: Overrides) -> Overrides:
+        base_layers = int(base.get("num_recurrent_layers", 2))
+        base_loops = int(base.get("max_recurrent_loops", 6))
+        applications = base_layers * base_loops
+        loops = max(1, round(applications / layers))
+        min_loops = min(int(base.get("min_recurrent_loops", 2)), loops)
+        prior = min(float(base.get("ponder_prior_steps", 3.0)), float(loops))
+        return dict(num_recurrent_layers=layers, max_recurrent_loops=loops, min_recurrent_loops=min_loops,
+                    ponder_prior_steps=prior)
+    return build
+
+
+def _local_window(base: Overrides) -> Overrides:
+    """A window of one eighth of the context (1,024 at 8k) in every loop except the last, which stays global."""
+    window = max(1, int(base.get("max_position_embeddings", 8192)) // 8)
+    loops = int(base.get("max_recurrent_loops", 6))
+    return dict(local_window=window, local_window_loops=tuple(range(1, loops)))
+
+
+def _compose(*specs) -> Callable[[Overrides], Overrides]:
+    """Merge variant specs (dicts or functions of the base) in order; later keys win."""
+    def build(base: Overrides) -> Overrides:
+        out: Overrides = {}
+        for spec in specs:
+            out.update(dict(spec(base) if callable(spec) else spec))
+        return out
+    return build
+
+
 # name -> overrides, or a function of the base overrides returning overrides (so relative variants follow --set).
 VARIANTS: Dict[str, Union[Overrides, Callable[[Overrides], Overrides]]] = {
     "baseline": {},
@@ -95,6 +135,17 @@ VARIANTS: Dict[str, Union[Overrides, Callable[[Overrides], Overrides]]] = {
     "fixed_depth": _fixed_depth,                                          # row 8: always train at the maximum depth
     "more_experts": _more_experts,                                        # twice the routed experts, same top-k
     "mor": {"routing_mode": "mor"},                                       # row 6: token-choice depth routing
+    "gqa": {"attention_type": "gqa"},                                     # plain grouped-query attention vs MLA
+    "attn_gate": {"attention_gate": True},                                # does a per-head sigmoid output gate help
+    "last_loop": {"routing_mode": "last"},                                # last loop state, no halting mixture
+    "inject": {"loop_input_injection": True},                             # re-inject the prelude output into each loop
+    "big_experts": _big_experts,                                          # fewer, wider routed experts, same params
+    "core3x4": _core_shape(3),                                            # 3 unique recurrent layers x 4 loops
+    "core4x3": _core_shape(4),                                            # 4 unique recurrent layers x 3 loops
+    "local_window": _local_window,                                        # local attention in all loops but the last
+    "hybrid_ssm": {"ssm_mixer_layers": (1,)},                             # second recurrent layer is a selective SSM
+    "v16k_core3x4": _compose(_vocab_variant(16000), _core_shape(3)),      # 16k vocabulary with the 3x4 core
+    "v16k_core4x3": _compose(_vocab_variant(16000), _core_shape(4)),      # 16k vocabulary with the 4x3 core
 }
 
 

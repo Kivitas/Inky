@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from inky import (  # noqa: E402
     InkyConfig,
     InkyModel,
-    modeling,
+    generation,
 )
 from inky.scratch import reduce_scratch  # noqa: E402
 from inky.style import banned_by_bad_words, banned_by_no_repeat_ngram, build_bad_word_ids  # noqa: E402
@@ -271,7 +271,7 @@ def test_generate_reduces_scratch_and_keeps_prompt(monkeypatch):
     # Script the sampler: notes (5), separator, text (7), close, then one more text token (9).
     # After the close, the notes and markers must be gone and the text (7, 9) must remain.
     script = [OPEN, 5, SEP, 7, CLOSE, 9]
-    monkeypatch.setattr(modeling, "_sample", lambda logits, *args: torch.tensor([script.pop(0)]))
+    monkeypatch.setattr(generation, "_sample", lambda logits, *args: torch.tensor([script.pop(0)]))
     model = seeded_model(tiny_config())
     prompt = torch.tensor([[3, 4]])
     out = model.generate(prompt, max_new_tokens=6, do_sample=True, reduce_scratch_blocks=True,
@@ -291,7 +291,7 @@ def test_scratch_reduction_requires_batch_size_one():
 def test_scratch_rebuild_keeps_the_loop_count(monkeypatch):
     # The cache is rebuilt after a scratch close; every loop-count decision must still be 2.
     script = [OPEN, 5, SEP, 7, CLOSE, 9]
-    monkeypatch.setattr(modeling, "_sample", lambda logits, *args: torch.tensor([script.pop(0)]))
+    monkeypatch.setattr(generation, "_sample", lambda logits, *args: torch.tensor([script.pop(0)]))
     model = seeded_model(tiny_config())
     chosen = []
     original = model._choose_loops

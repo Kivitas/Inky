@@ -8,6 +8,8 @@
   - perplexity_by_loops:  perplexity at several recurrent loop counts over the same batches.
   - early_exit_drift:     NLL of forward_early_exit against the full forward, one sequence at a time.
   - bits_per_token:       convert a nat-based NLL to bits.
+  - bytes_per_token:      UTF-8 bytes of text per token for a given encoder (tokenizer-independent scaling).
+  - bits_per_byte:        convert a per-token nat NLL to bits per UTF-8 byte, comparable across tokenizers.
 
 Losses are computed here from the model's outputs, not from the model's own loss, so that every
 scored token is weighted equally and the normalisation is explicit.
@@ -25,7 +27,7 @@ an ``attention_mask`` argument, ``ignore_id`` also passes ``attention_mask = (id
 import inspect
 import itertools
 import math
-from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Tuple, TypeVar
 
 import torch
 import torch.nn.functional as F
@@ -70,6 +72,37 @@ def split_heldout(
 def bits_per_token(nll: float) -> float:
     """Convert a mean negative log likelihood in nats to bits per token."""
     return nll / math.log(2.0)
+
+
+def bytes_per_token(texts: Iterable[str], encode: Callable[[str], Sequence[Any]]) -> float:
+    """Total UTF-8 bytes of ``texts`` divided by the total number of tokens ``encode`` gives them.
+
+    ``encode`` maps a str to a sequence of token ids. Raises ValueError if the texts produce no tokens.
+    """
+    total_bytes = 0
+    total_tokens = 0
+    for text in texts:
+        total_bytes += len(text.encode("utf-8"))
+        total_tokens += len(encode(text))
+    if total_tokens == 0:
+        raise ValueError("cannot compute bytes per token: the texts produced no tokens")
+    return total_bytes / total_tokens
+
+
+def bits_per_byte(nll_per_token: float, bytes_per_token: float) -> float:
+    """Convert a mean per-token NLL in nats to bits per UTF-8 byte.
+
+    ``nll_per_token / (bytes_per_token * ln 2)``. Unlike perplexity, this is comparable across tokenizers
+    with different vocabulary sizes. Raises ValueError for non-finite inputs, ``bytes_per_token <= 0``
+    or a negative NLL.
+    """
+    if not math.isfinite(nll_per_token) or not math.isfinite(bytes_per_token):
+        raise ValueError(f"nll_per_token and bytes_per_token must be finite, got {nll_per_token} and {bytes_per_token}")
+    if bytes_per_token <= 0:
+        raise ValueError(f"bytes_per_token must be positive, got {bytes_per_token}")
+    if nll_per_token < 0:
+        raise ValueError(f"nll_per_token must be non-negative, got {nll_per_token}")
+    return nll_per_token / (bytes_per_token * math.log(2.0))
 
 
 def _accepts(fn, name: str) -> bool:
@@ -200,11 +233,14 @@ def evaluate(
     ignore_id: Optional[int] = None,
     *,
     train_draw: bool = False,
+    bytes_per_token: Optional[float] = None,
 ) -> Dict[str, float]:
     """``perplexity`` plus ``mean_loops``, the mean expected PonderNet loop count over all evaluated positions.
 
     Both numbers come from the same forward pass per batch. ``mean_loops`` is weighted by batch size
     times sequence length, so larger batches count in proportion. ``ignore_id`` works as in ``perplexity``.
+    With ``bytes_per_token`` (see ``bytes_per_token()``) the result also has ``bits_per_byte``; without it the
+    result has no such key.
 
     The default scores at ``num_loops`` (None = the model's maximum depth). With ``train_draw=True`` the result
     also has ``train_draw_depths`` (the integers ``min_recurrent_loops..max_recurrent_loops``), ``nll_train_draw``
@@ -224,6 +260,8 @@ def evaluate(
         "batches": r["batches"],
         "mean_loops": r["mean_loops"],
     }
+    if bytes_per_token is not None:
+        out["bits_per_byte"] = bits_per_byte(r["nll"], bytes_per_token)
     if train_draw:
         cfg = model.config
         depths = list(range(cfg.min_recurrent_loops, cfg.max_recurrent_loops + 1))

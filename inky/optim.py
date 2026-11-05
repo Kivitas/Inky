@@ -30,7 +30,7 @@ import torch
 import torch.nn as nn
 
 # 2D parameters that are lookup tables or per-loop tables and must stay with AdamW.
-ADAMW_ONLY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base")
+ADAMW_ONLY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base", "out_gate")
 
 # Dotted-name segments of tiny gating modules: the MoE router (layers.SharedExpertMoE) and the
 # PonderNet halting gate (layers.PonderHalting, attribute ``halting``). Matched as whole

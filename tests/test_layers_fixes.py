@@ -428,8 +428,8 @@ def test_segment_ids_shape_is_checked():
 def test_ssm_mixer_rejects_masks_it_cannot_honour():
     mixer = SelectiveSSMMixer(tiny_config()).eval()
     x = torch.randn(1, 4, 64)
-    with pytest.raises(NotImplementedError, match="ssm_mixer_layers"):
-        mixer(x, segment_ids=torch.zeros(1, 4, dtype=torch.long))
+    with pytest.raises(NotImplementedError, match="attn_mask"):
+        mixer(x, attn_mask=torch.ones(1, 4, 4, dtype=torch.bool))
 
 
 # ---------------------------------------------------------------- 7. packed documents in the highway and core
@@ -539,13 +539,13 @@ def test_recurrent_core_all_true_attn_mask_matches_default():
     assert torch.allclose(default[0], masked[0], atol=1e-5)
 
 
-def test_recurrent_core_rejects_packing_with_ssm_layers():
+def test_recurrent_core_rejects_padding_with_ssm_layers():
     config = tiny_config(num_recurrent_layers=2, ssm_mixer_layers=(1,))
     core = RecurrentCore(config).eval()
     cos, sin = rope(config)
     h = torch.randn(1, 4, 64)
     with pytest.raises(NotImplementedError, match="ssm_mixer_layers"):
-        core(h, 1, cos[:4], sin[:4], segment_ids=torch.zeros(1, 4, dtype=torch.long))
+        core(h, 1, cos[:4], sin[:4], attn_mask=torch.ones(1, 4, 4, dtype=torch.bool))
 
 
 if __name__ == "__main__":

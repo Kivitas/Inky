@@ -62,7 +62,9 @@ and every other row is compared with it.
 
 `scripts/ablate.py` runs the config-toggle rows. List the names with `--list-variants`; the variants are
 `baseline`, `dense`, `no_highway`, `qk_norm`, `qk_norm_latent`, `vocab16k`, `vocab32k`, `fewer_loops`,
-`fixed_depth`, `more_experts` and `mor`. The same overrides can be launched one at a time with
+`fixed_depth`, `more_experts`, `mor`, `gqa`, `attn_gate`, `last_loop`, `inject`, `big_experts`, `core3x4`,
+`core4x3`, `v16k_core3x4`, `v16k_core4x3`, `local_window` and `hybrid_ssm`. `scripts/arch_budget.py` gives the
+parameter, FLOP, decode and cache cost of the same names before anything is trained. The same overrides can be launched one at a time with
 `scripts/train.py --set ...`. `--synthetic` runs on random tokens and only checks the plumbing.
 
 | # | Variant | Question it answers | Compare against | Status |
@@ -76,6 +78,14 @@ and every other row is compared with it.
 | 7 | Muon plus AdamW against AdamW alone (`--muon-batched` for the Muon speed) | Does Muon pay for its per-step cost at this scale? | AdamW | Planned, not a config toggle |
 | 8 | Training depth: `--variants fixed_depth` against `baseline` with `--loop-curriculum` (also `fewer_loops`) | Does training at mixed depth reduce the train and inference mismatch? | `fixed_depth` | Planned |
 | 9 | Scratch reduction on and off | Does PENCIL-style scratch help prose? | Off | Planned, after training teaches the markers |
+| 10 | Unique layers against loops at the same applications: `--variants core3x4,core4x3` (and `v16k_core3x4,v16k_core4x3` with a 16k vocabulary) | Are more distinct layers and fewer loops better than 2 x 6? | `baseline`, `vocab16k` | Planned, switches exist, not run. Parameters differ (44.9M to 65.7M), so compare at equal FLOPs and note the size. |
+| 11 | Attention type: `--variants gqa` (`--set attention_type="gqa"`) | Does plain grouped-query attention match MLA, and what does it save in decode? | `baseline` | Planned, switch exists, not run. Needs `attention_type="mla"` for MoR and early exit. |
+| 12 | Attention output gate: `--variants attn_gate` | Does a per-head sigmoid gate help at 50M? | `baseline` | Planned, switch exists, not run |
+| 13 | Loop output: `--variants last_loop` against `baseline` (PonderNet) and `mor` | Is the halting mixture worth its gate, KL and per-loop loss? | `baseline` | Planned, switch exists, not run |
+| 14 | Prelude re-injection: `--variants inject` | Does feeding the prelude output to every loop help? | `baseline` | Planned, switch exists, not run |
+| 15 | Fewer, larger experts: `--variants big_experts` | Is 4 routed experts (top-1) as good as 8 (top-2) with fewer dispatch operations? | `baseline` | Planned, switch exists, not run |
+| 16 | Local attention in the early loops: `--variants local_window` | How much quality does a 1/8-context window cost, and how much decode does it save at 8k? | `baseline` | Planned, switch exists, not run |
+| 17 | Hybrid layer: `--variants hybrid_ssm` | Does a selective-SSM layer in the core help or hurt? | `baseline` | Planned, switch exists (packing works), not run |
 
 Names are exact as in `scripts/ablate.py --list-variants`; `--set` flags take Python literals. If `vocab_size`
 is set without the scratch ids, they become `vocab_size-3..-1`, and `scripts/train.py` refuses a tokenizer
@@ -87,7 +97,11 @@ at depth 6, and the metrics in section 5.
 ## 5. Evaluation metrics
 
 - **Held-out perplexity.** On a split held out before training, reported per depth (`eval_by_depth`)
-  and at the final depth. This is the primary metric for the ablations.
+  and at the final depth. This is the primary metric for the ablations that keep the tokenizer.
+- **Bits per byte.** Per-token perplexity is not comparable between vocabularies (a 16k and a 50k tokenizer
+  split the same text into different numbers of tokens), so rows 3 and 10 compare bits per byte:
+  `bytes_per_token(texts, encode)` for each tokenizer, then `bits_per_byte(nll, bytes_per_token)` or
+  `evaluate(..., bytes_per_token=...)`.
 - **Repetition.** Rate of repeated 4-grams and the distinct-n ratio on generated text, at fixed
   decoding settings. The current no-repeat rule should be reported alongside, so that the
   repetition figure is not just a measure of that rule.
