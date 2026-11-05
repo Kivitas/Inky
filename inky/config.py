@@ -43,6 +43,27 @@ class InkyConfig(PretrainedConfig):
         # normed. The key up-projection can then still be folded into the query, so the cached decode
         # path stays cheap and matches the full path exactly. Ignored when qk_norm is False.
         qk_norm_mode: str = "head",
+        # Phase B comparison arms (all default to the existing architecture; none has been trained or compared).
+        # attention_type: "mla" (multi-latent attention above) or "gqa" (plain grouped-query attention with
+        # num_kv_heads key/value heads of width qk_nope_head_dim + qk_rope_head_dim and v_head_dim, RoPE on the
+        # last qk_rope_head_dim dims). At this size MLA's cache saving is ~30 MiB at 8k, while its absorbed decode
+        # costs ~2x the attention FLOPs of plain heads. GQA supports the cache, packing and masks, but not
+        # routing_mode="mor" or forward_early_exit (those need the latent layout). num_kv_heads is ignored for "mla".
+        attention_type: str = "mla",
+        num_kv_heads: int = 2,
+        # attention_gate: a sigmoid gate per head, computed from the block input, multiplies the attention output
+        # before the output projection (the gated-attention design of the Qwen team, reported at 1.7B and 15B).
+        attention_gate: bool = False,
+        # Phase D: local attention in some loops. A query in a loop listed in ``local_window_loops`` (1-based loop
+        # indices) attends only to the last ``local_window`` positions, itself included; the other loops, and the
+        # pre and post layers, stay global. The weights are shared across loops, so this only changes the mask.
+        # Cached decode then reads ``local_window`` cached positions instead of all of them in those loops (the
+        # cache itself still keeps every position). At 8k context the 14 global attention applications are about
+        # three quarters of the decode FLOPs. Needs attention_type "mla" or "gqa" without routing_mode="mor", and
+        # is rejected by forward_early_exit. () or local_window=None keeps every loop global. A selective-SSM layer
+        # (ssm_mixer_layers) ignores the window: its state already decays.
+        local_window: int | None = None,
+        local_window_loops: tuple = (),
         # Recurrent depth: pre layers -> recurrent core (shared over loops) -> post layers
         num_pre_layers: int = 1,
         num_recurrent_layers: int = 2,
@@ -66,7 +87,15 @@ class InkyConfig(PretrainedConfig):
         # latents (stale key/value reuse), and the output is the state after each token's last active loop.
         # Under "mor" the PonderNet halting gate, its KL and the per-loop CE (step_ce) are not used, and
         # num_loops is a cap on the depth. See layers.MoRRouter and InkyModel.forward for the semantics.
+        # routing_mode="last" is the third option: every token runs every loop, there is no halting gate, and the
+        # output is the last loop's state (training still draws the loop count in [min, max]; eval uses the max).
+        # No PonderNet KL and no per-loop loss (step_ce and ponder_kl are reported as 0), as in recurrent-depth models
+        # that train on random depth only.
         routing_mode: str = "ponder",
+        # loop_input_injection: each loop's block input also gets gain * (the prelude output), with a per-channel
+        # gain that starts at 0, so the model starts identical to one without it. The simplest form of the
+        # prelude re-injection used by recurrent-depth models.
+        loop_input_injection: bool = False,
         mor_router_hidden: int | None = None,   # None: the router is one Linear(hidden, depths); int: MLP width
         mor_capacity_aux_coef: float = 1e-2,    # weight of the depth-balance loss ((E[depth] - target)^2)
         mor_gate_scale: bool = True,            # scale an active token's update by its router probability
@@ -80,6 +109,10 @@ class InkyConfig(PretrainedConfig):
         step_ce_token_fraction: float = 0.25,
         # Shared-expert fine-grained MoE
         intermediate_size: int = 704,      # per-expert SwiGLU width
+        # Width of the always-on shared expert(s); None = intermediate_size. With a separate width, "fewer, larger
+        # routed experts" fits the same budget: shared 704 + 4 routed x 1408 with top-1 has the same active width
+        # (2,112) and the same parameters per block as shared 704 + 8 routed x 704 with top-2.
+        shared_intermediate_size: int | None = None,
         num_shared_experts: int = 1,
         num_routed_experts: int = 8,
         num_active_routed: int = 2,
@@ -170,6 +203,33 @@ class InkyConfig(PretrainedConfig):
         if qk_norm_mode not in ("head", "latent"):
             raise ValueError(f"qk_norm_mode must be 'head' or 'latent', got {qk_norm_mode!r}")
         self.qk_norm_mode = qk_norm_mode
+        if attention_type not in ("mla", "gqa"):
+            raise ValueError(f"attention_type must be 'mla' or 'gqa', got {attention_type!r}")
+        self.attention_type = attention_type
+        if int(num_kv_heads) < 1:
+            raise ValueError(f"num_kv_heads must be >= 1, got {num_kv_heads}")
+        self.num_kv_heads = int(num_kv_heads)
+        if attention_type == "gqa" and num_attention_heads % self.num_kv_heads != 0:
+            raise ValueError(
+                f"attention_type='gqa' needs num_attention_heads ({num_attention_heads}) divisible by "
+                f"num_kv_heads ({self.num_kv_heads})"
+            )
+        self.attention_gate = bool(attention_gate)
+        self.loop_input_injection = bool(loop_input_injection)
+        if local_window is not None:
+            local_window = int(local_window)
+            if local_window < 1:
+                raise ValueError(f"local_window must be None or >= 1, got {local_window}")
+        self.local_window = local_window
+        self.local_window_loops = tuple(sorted({int(i) for i in local_window_loops}))
+        if self.local_window_loops:
+            if local_window is None:
+                raise ValueError("local_window_loops needs local_window to be set")
+            bad = [i for i in self.local_window_loops if not 1 <= i <= max_recurrent_loops]
+            if bad:
+                raise ValueError(f"local_window_loops {bad} out of range 1..{max_recurrent_loops}")
+            if routing_mode == "mor":
+                raise ValueError("local_window_loops is not supported with routing_mode='mor'")
         self.num_pre_layers = num_pre_layers
         self.num_recurrent_layers = num_recurrent_layers
         self.num_post_layers = num_post_layers
@@ -181,8 +241,10 @@ class InkyConfig(PretrainedConfig):
         self.ponder_prior_steps = ponder_prior_steps
         self.ponder_kl_coef = ponder_kl_coef
         self.ponder_step_loss_coef = ponder_step_loss_coef
-        if routing_mode not in ("ponder", "mor"):
-            raise ValueError(f"routing_mode must be 'ponder' or 'mor', got {routing_mode!r}")
+        if routing_mode not in ("ponder", "mor", "last"):
+            raise ValueError(f"routing_mode must be 'ponder', 'mor' or 'last', got {routing_mode!r}")
+        if routing_mode == "mor" and attention_type != "mla":
+            raise ValueError("routing_mode='mor' needs attention_type='mla' (it gathers latent keys and values)")
         self.routing_mode = routing_mode
         if mor_router_hidden is not None:
             mor_router_hidden = int(mor_router_hidden)
@@ -218,6 +280,11 @@ class InkyConfig(PretrainedConfig):
             raise ValueError(f"step_ce_token_fraction must be in (0, 1], got {step_ce_token_fraction}")
         self.step_ce_token_fraction = float(step_ce_token_fraction)
         self.intermediate_size = intermediate_size
+        if shared_intermediate_size is not None:
+            shared_intermediate_size = int(shared_intermediate_size)
+            if shared_intermediate_size < 1:
+                raise ValueError(f"shared_intermediate_size must be None or >= 1, got {shared_intermediate_size}")
+        self.shared_intermediate_size = shared_intermediate_size
         self.num_shared_experts = num_shared_experts
         self.num_routed_experts = num_routed_experts
         self.num_active_routed = num_active_routed
@@ -271,7 +338,12 @@ class InkyConfig(PretrainedConfig):
         if self.dense_intermediate_size is not None:
             return self.dense_intermediate_size
         top_k = min(self.num_active_routed, self.num_routed_experts)
-        return (self.num_shared_experts + top_k) * self.intermediate_size
+        return self.num_shared_experts * self.shared_ffn_size + top_k * self.intermediate_size
+
+    @property
+    def shared_ffn_size(self) -> int:
+        """Width of each shared expert: ``shared_intermediate_size`` if set, else ``intermediate_size``."""
+        return self.intermediate_size if self.shared_intermediate_size is None else self.shared_intermediate_size
 
     @property
     def mor_target(self) -> float:

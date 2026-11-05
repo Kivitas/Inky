@@ -5,7 +5,7 @@ window, meant to run locally.
 
 **Status: untrained.** This repository contains the model code, a training loop with a command-line
 entry point (smoke-tested, including `--dry-run`, never run on a real corpus), decoding controls, an
-evaluation harness, tooling scripts (`train`, `bench`, `ablate`, `sample`, `diagnose`), and 713 tests. There is no training corpus, no trained weights, no baseline
+evaluation harness, tooling scripts (`train`, `bench`, `ablate`, `sample`, `diagnose`, `arch_budget`), and 834 tests. There is no training corpus, no trained weights, no baseline
 comparison, and no measured quality. Nothing here is a claim about how Inky writes.
 
 Inky takes its language-model path from the EOS project (`Desktop/New folder/EOS LLM`) and scales
@@ -125,6 +125,50 @@ expert load, and `python scripts/train.py ... --diagnose-every N` logs the same 
 initialisation on random tokens, stream RMS grows 4.8x over the six loops with the earlier settings and 2.0x
 with these defaults, and the core-layer expert-load coefficient of variation is 0.26 and 0.24 instead of 0.66
 and 0.45. These are scale checks at initialisation, not quality results.
+
+Comparison arms (Phases B, D and E of the architecture plan). Each one defaults to the architecture above,
+adds no parameters until it is switched on, and has not been trained or compared. They exist so the
+comparisons can be run: `scripts/ablate.py` has a variant for each and `scripts/arch_budget.py` tabulates
+their cost. All of them keep cached decoding equal to the full forward pass (tested).
+
+- `attention_type="gqa"` (with `num_kv_heads`, default 2): plain grouped-query attention instead of
+  multi-latent attention. Queries and keys have 64 dims with RoPE on the last 16, values 64. Its cache is a
+  `LatentKV` of flattened keys and values: 56 MiB against 31.5 MiB in bf16 at 8k. Decode attention costs 21.5
+  KFLOP per cached token against 45.7 for the absorbed latent form (analytic and measured), so decode at 8k is
+  about 294 MFLOP against 494. A CPU decode step at 4,096 tokens of context took 180 ms against 208 ms for the
+  baseline (one run, untrained fp32). It supports the cache, packing and padding masks; `routing_mode="mor"`
+  and `forward_early_exit` need the latent layout and are rejected. Its quality against MLA is unmeasured.
+- `attention_gate=True`: a sigmoid per head, computed from the block input, multiplies the attention output
+  (the gated-attention design of the Qwen team, reported at 1.7B dense and 15B MoE, not at this size). It adds
+  `heads * (hidden + 1)` parameters per attention layer and works with both attention types and MoR.
+- `routing_mode="last"`: no halting gate; the output is the last loop's state, and training still draws the
+  loop count. The loss is the cross-entropy plus the small terms; `step_ce` and `ponder_kl` are reported as 0.
+  With one loop it equals the PonderNet output (tested).
+- `loop_input_injection=True`: every loop's block input also gets `inject_gain * (prelude output)`, with a
+  per-channel gain that starts at 0, so the model starts identical to one without it. This is the simplest
+  form of the re-injection used in recurrent-depth models.
+- `shared_intermediate_size`: width of the shared expert, separate from the routed experts' `intermediate_size`.
+  With it, 4 routed experts of width 1,408 with top-1 and a shared expert of 704 have the same active width and
+  the same expert parameters per block as the default 8 x 704 with top-2 (the `big_experts` variant).
+- `local_window` with `local_window_loops` (1-based loop numbers): in those loops a query attends to the last
+  `local_window` positions only; the other loops and the pre and post layers stay global. The weights are
+  shared, so only the mask changes, and one-token decode reads `local_window` cached positions instead of all of
+  them (the cache still keeps every position). It works with MLA and GQA, with packing and with gradient
+  checkpointing; it is rejected with MoR, and `forward_early_exit` raises. The `local_window` variant uses a
+  window of 1/8 of the context (1,024 at 8k) in every loop but the last. That cuts decode at 8k from about 494 to
+  260 MFLOP, and a CPU decode step at 4,096 tokens of context took 89 ms against 208 ms (one run, untrained
+  fp32). That is the speed side only: what the window costs in quality is unmeasured.
+- Hybrid layers: `ssm_mixer_layers` (a selective-SSM mixer in place of attention) now supports packed
+  documents through `segment_ids`: the state is reset at each document boundary, and a packed row matches its
+  documents run separately (tested at chunk edges). Padding masks (`attention_mask`) are still not supported.
+  The `hybrid_ssm` variant makes the second recurrent layer an SSM mixer.
+
+Cost tables: `python scripts/arch_budget.py --variants baseline,gqa,local_window` prints parameters, forward
+FLOPs per token, decode FLOPs at several contexts (and extrapolated), and the KV cache. torch's FLOP counter
+counts the CPU attention op (`scaled_dot_product_attention`) as zero, which hides GQA's attention entirely and
+part of the prefill attention for both types, so the script registers the standard formula for it. Bits per byte
+(`inky.bits_per_byte`, `inky.bytes_per_token`, `evaluate(..., bytes_per_token=...)`) is the loss to compare
+across vocabulary sizes, where per-token perplexity is not comparable.
 - `moe_dense_max_tokens` (default 64): the sync-free dense MoE dispatch is used only for small token
   counts (at most this many) on non-CPU devices. Larger batches use the grouped path. CPU always uses
   the grouped path.
@@ -134,7 +178,8 @@ batch size 1, has no training path, and its speed and output drift are unmeasure
 
 ### Mixture-of-Recursions routing (`routing_mode="mor"`)
 
-`routing_mode` is `"ponder"` (default, the PonderNet path above) or `"mor"` (opt-in, Mixture-of-Recursions,
+`routing_mode` is `"ponder"` (default, the PonderNet path above), `"last"` (see the comparison arms) or
+`"mor"` (opt-in, Mixture-of-Recursions,
 arXiv 2507.10524, token-choice variant). Fields: `mor_router_hidden` (default `None`: one linear
 layer; an int gives an MLP), `mor_capacity_aux_coef` (default 0.01), `mor_gate_scale` (default
 `True`), `mor_temperature` (default 1.0), `mor_target_depth` (default `None`, meaning
@@ -278,7 +323,7 @@ Other training code:
 
 ```bash
 pip install -e .[dev]
-python -m pytest tests -q               # 713 tests collected
+python -m pytest tests -q               # 834 tests collected
 python -m ruff check .                  # lint, also run in CI
 python scripts/build_untrained.py --out checkpoints/inky-50m-init
 ```
@@ -295,6 +340,10 @@ python scripts/ablate.py --list-variants
 python scripts/ablate.py --synthetic --tiny --steps 20 --out-dir runs/ablate
 python scripts/ablate.py --corpus data/*.jsonl --tokenizer-path path/to/tokenizer.json --steps 500 \
     --variants baseline,dense,no_highway,qk_norm --out-dir runs/ablate
+
+# Cost of architecture variants: parameters, FLOPs per token, decode FLOPs by context, KV cache
+python scripts/arch_budget.py --variants baseline,gqa,local_window --contexts 2048,4096 --extrapolate-to 8192
+python scripts/arch_budget.py --tiny --variants baseline,dense,core3x4 --json budget.json
 
 # Architecture scale report: stream RMS per loop, loop change, highway share, expert load
 python scripts/diagnose.py --tiny --seq-len 64
@@ -388,7 +437,10 @@ checkpointing.
 inky/__init__.py        public exports
 inky/config.py          InkyConfig (sizes, switches, dropout, scratch ids, Arlo settings)
 inky/layers.py          RMSNorm, RoPE, latent-KV attention (growable LatentKV cache), MoE, recurrent core, highway, selective SSM mixer, PonderNet halting, MoR router
-inky/modeling.py        InkyModel, InkyCache, forward, forward_early_exit, decide_*, generate
+inky/modeling.py        InkyModel: forward, forward_early_exit, loss terms, MoR routing
+inky/cache.py           InkyCache (decoding state) and InkyOutput
+inky/generation.py      InkyGenerationMixin: generate (sampling, prose controls, scratch reduction) and its helpers
+inky/decision.py        InkyDecisionMixin: decide_choice, decide_binary, the Arlo "trained" flag
 inky/scratch.py         reduce_scratch (PENCIL reduction rule, note cap)
 inky/style.py           stock phrases, bad-word and n-gram blocking, soft penalties
 inky/arlo.py            Arlo (latent slots, pointer heads, decision losses, train_arlo) for Choice and Noul
@@ -407,8 +459,9 @@ scripts/bench.py        prefill and per-token decode timing
 scripts/ablate.py       ablation runner (named variants, --synthetic mode)
 scripts/sample.py       text generation from a checkpoint with the prose controls
 scripts/diagnose.py     architecture scale report (stream RMS per loop, highway gain, expert load)
+scripts/arch_budget.py  cost table for named variants (params, FLOPs, decode FLOPs by context, KV cache)
 LICENSE                 proprietary, all rights reserved
-tests/                  pytest suite (run with `python -m pytest tests -q`; 713 tests collected)
+tests/                  pytest suite (run with `python -m pytest tests -q`; 834 tests collected)
 docs/critique/          critique findings and their status (STATUS.md is the index)
 docs/research/          research notes (ACT / PonderNet, training)
 ```
@@ -421,14 +474,17 @@ docs/research/          research notes (ACT / PonderNet, training)
   corpus and a compute budget. The project has neither yet.
 - **No CUDA testing, no distributed training.** Nothing has been run on CUDA. Multi-GPU training (DDP)
   is not implemented.
-- **Ablation switches and MoR are untrained.** `use_moe`, `use_highway`, `qk_norm_mode`,
-  `routing_mode="mor"` and the `scripts/ablate.py` variants exist, but none has been trained or compared.
+- **Ablation switches, comparison arms and MoR are untrained.** `use_moe`, `use_highway`, `qk_norm_mode`,
+  `routing_mode="mor"` and `"last"`, `attention_type="gqa"`, `attention_gate`, `loop_input_injection`,
+  `shared_intermediate_size`, `local_window_loops` and the `scripts/ablate.py` variants exist, and every variant
+  has been run end to end for a few steps on random tokens, but none has been trained on text or compared.
+  Which of them to keep, and deleting the ones that lose (the plan's Phase C), waits for those results.
 - **Scratch needs training.** The reduction mechanism is in place, but the model does not know
   when to use the scratch markers.
 - **Batching.** `forward` accepts an `attention_mask` for uncached passes, and `segment_ids` for
   packed documents. Padding is excluded from the highway's running mean on uncached passes, but the
-  MoE router's z-loss still counts pad positions (CORE-10). Generation and scratch reduction need
-  batch size 1 in practice.
+  MoE router's z-loss still counts pad positions (CORE-10). The selective-SSM mixer packs documents with
+  `segment_ids` but has no padding mask. Generation and scratch reduction need batch size 1 in practice.
 - **Training at 8k is expensive.** Train at shorter lengths first, then extend. Gradient
   checkpointing is available via `InkyConfig(gradient_checkpointing=True)`.
 

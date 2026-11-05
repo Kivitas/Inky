@@ -7,7 +7,7 @@ been trained or scored.
 ## Summary
 
 Inky is a ~50M-parameter recurrent language model with an 8k window. The code is complete enough to
-build, run and test (713 tests collected), and the training loop has been smoke-tested with `--dry-run` only.
+build, run and test (834 tests collected), and the training loop has been smoke-tested with `--dry-run` only.
 The main gap is evidence: there is no corpus, no trained weights, no baseline run (the dense switch
 exists but was never trained) and no measured quality. Most design choices are therefore unvalidated, and the next work should test them rather
 than add to them.
@@ -117,9 +117,62 @@ Phase A (architecture scale and balance fixes). Measured at initialisation on ra
 - At initialisation the core-layer expert-load coefficient of variation fell from 0.66 and 0.45 to 0.26 and 0.24.
   That fits the old highway pushing a near-constant vector into the router, but no training run confirms it.
 
-The remaining architecture items (matched-compute comparison of vocabulary size and unique layers against
-loops, MoE against dense, MLA against GQA, attention output gate, loop mechanism, input injection) are
-comparisons that need training runs and are not started.
+Phases B to E (comparison arms, tools, local attention, SSM packing, module split). All of it is code and
+measurement without training. Every new switch defaults to the existing architecture (the default model is still
+50,219,202 parameters) and keeps cached decoding equal to the full forward pass (tested).
+
+- **Arms (Phase B).** `attention_type="gqa"`, `attention_gate`, `routing_mode="last"`, `loop_input_injection` and
+  `shared_intermediate_size`, with 11 new `scripts/ablate.py` variants (`gqa`, `attn_gate`, `last_loop`,
+  `inject`, `big_experts`, `core3x4`, `core4x3`, `v16k_core3x4`, `v16k_core4x3`, `local_window`, `hybrid_ssm`).
+  All 22 variants were run end to end for 4 steps on random tokens to check the plumbing; those losses mean
+  nothing and no arm has been trained on text.
+- **Tools.** `scripts/arch_budget.py` (cost table), bits per byte for comparing vocabularies
+  (`inky.bits_per_byte`), and the diagnostics from Phase A.
+- **Local attention (Phase D).** `local_window` and `local_window_loops`.
+- **SSM packing (Phase E).** `SelectiveSSMMixer` takes `segment_ids`, so hybrid models can train on packed
+  documents. Padding masks are still unsupported.
+- **Module split (Phase C, mechanical part).** `modeling.py` went from 1,279 to 754 lines: `generate` and its
+  helpers are in `inky/generation.py`, `decide_*` in `inky/decision.py`, `InkyCache` and `InkyOutput` in
+  `inky/cache.py`. The old names still import from `inky.modeling`; tests that patch `_sample` or
+  `_cache_restore` now patch `inky.generation`.
+
+Measured with `scripts/arch_budget.py` on the default shapes (CPU, fp32, untrained, one run). FLOPs are forward
+FLOPs per token including the LM head, prefill at 512 tokens with attention counted without a causal discount;
+decode FLOPs are for one cached token at 8,192 tokens of context, extrapolated from 2,048 and 4,096 (window
+arm) or 256 to 2,048 (others):
+
+| Variant | Params | MFLOP/token (fwd) | Decode MFLOP at 8k | Cache at 8k (bf16) |
+| :--- | ---: | ---: | ---: | ---: |
+| baseline (MoE 2 x 6, 50k vocab) | 50.2M | 130.5 | 493.9 | 31.5 MiB |
+| vocab16k | 37.2M | 104.4 | 467.7 | 31.5 MiB |
+| gqa (2 KV heads) | 50.0M | 129.3 | 294.4 | 56.0 MiB |
+| local_window (1,024 in loops 1-5) | 50.2M | 130.5 | 259.9 | 31.5 MiB |
+| core3x4 | 58.0M | 130.3 | 493.6 | 31.5 MiB |
+| core4x3 | 65.7M | 130.2 | 493.5 | 31.5 MiB |
+| v16k_core3x4 | 44.9M | 104.1 | 467.5 | 31.5 MiB |
+| v16k_core4x3 | 52.6M | 104.0 | 467.4 | 31.5 MiB |
+
+Real CPU decode steps at 4,096 tokens of context (median of 5, one run): baseline 208 ms, gqa 180 ms,
+local_window 89 ms. FLOP savings only show up in time when attention dominates: at 256 tokens a decode step is
+about 70 ms and is bound by per-operation overhead, not FLOPs, so these are long-context results.
+
+One correction found while building the tool: torch's FLOP counter counts the CPU attention op
+(`scaled_dot_product_attention`) as zero. That left attention out of every GQA figure and part of every prefill
+figure (the earlier 81 MFLOP body figure is 92 with attention counted). The multi-latent decode figures were
+already right, because that path uses explicit matmuls. The script now registers the standard formula.
+
+Not done, and why:
+
+- **Which arm wins.** Every comparison in the plan needs training runs. None was run, so nothing was adopted,
+  deleted or made a default.
+- **Deleting the losing code paths (Phase C).** `forward_mor`/`MoRRouter` or the PonderNet terms, the
+  latent early exit, the MLA absorbed paths if GQA wins, the `qk_norm` "head" mode: all wait for those results.
+- **Fused MoE dispatch (Phase D).** Decode is overhead-bound at short context and a fused dispatch needs the
+  routed experts stored as stacked tensors, which changes the state-dict layout and how Muon sees them. It should
+  follow the `big_experts` result, which already halves the number of expert calls.
+- **Multi-token prediction (Phase E).** Skipped on purpose: the LM head is already about a third of the forward
+  FLOPs.
+- **Memory of the packed SSM scan at 8k.** Not measured (CORE-12 still stands).
 
 Done in the latest round:
 

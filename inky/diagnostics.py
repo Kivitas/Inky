@@ -104,8 +104,11 @@ def loop_diagnostics(model, input_ids: torch.Tensor, num_loops: Optional[int] = 
     }
 
     if rec["loop_out"]:
-        lambdas = [model.halting(h) for h in rec["loop_out"]]
-        weights = geometric_halting_weights(lambdas)                              # [L, B, S]
+        if model.halting is None:       # routing_mode='last': the last loop is the output, all the weight is on it
+            weights = torch.zeros(len(rec["loop_out"]), *rec["loop_out"][0].shape[:2], device=rec["loop_out"][0].device)
+            weights[-1] = 1.0
+        else:
+            weights = geometric_halting_weights([model.halting(h) for h in rec["loop_out"]])   # [L, B, S]
         rms_per_token = torch.stack([h.float().pow(2).mean(-1).sqrt() for h in rec["loop_out"]])   # [L, B, S]
         mass = (weights * rms_per_token).mean(dim=(1, 2))
         mass = mass / mass.sum().clamp(min=1e-12)

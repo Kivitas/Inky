@@ -21,6 +21,7 @@ from inky import (  # noqa: E402
     InkyConfig,
     InkyModel,
     NgramBanIndex,
+    generation,
     modeling,
 )
 from inky.modeling import _apply_repetition_penalty, _WindowedNgramIndex  # noqa: E402
@@ -156,13 +157,13 @@ def test_gen01_banned_markers_follow_the_block_state():
 def test_gen01_generate_masks_separator_and_close_with_no_open_block():
     model = seeded_model(tiny_config())
     seen = []
-    original = modeling._sample
+    original = generation._sample
     try:
-        modeling._sample = scripted_sampler([OPEN, 20, SEP, 21, CLOSE, 22], log=seen)
+        generation._sample = scripted_sampler([OPEN, 20, SEP, 21, CLOSE, 22], log=seen)
         model.generate(torch.tensor([[3, 4]]), max_new_tokens=6, do_sample=True,
                        reduce_scratch_blocks=True, repetition_penalty=1.0, no_repeat_ngram_size=0)
     finally:
-        modeling._sample = original
+        generation._sample = original
     assert seen[0][0, SEP] == float("-inf") and seen[0][0, CLOSE] == float("-inf")   # nothing open yet
     assert seen[1][0, CLOSE] == float("-inf") and seen[1][0, SEP] != float("-inf")   # block open
     assert seen[3][0, SEP] == float("-inf") and seen[3][0, CLOSE] != float("-inf")   # separator already given
@@ -309,7 +310,7 @@ def run_with_rollback_check(monkeypatch, schedule, n_steps):
     model = seeded_model(tiny_config())
     prompt = [3, 4, 5]
     restores = []
-    original_restore = modeling._cache_restore
+    original_restore = generation._cache_restore
 
     def counting_restore(cache, snap):
         restores.append(snap["seq_len"])
@@ -324,9 +325,9 @@ def run_with_rollback_check(monkeypatch, schedule, n_steps):
         return original_forward(input_ids, *args, **kwargs)
 
     gen_logs = []
-    monkeypatch.setattr(modeling, "_cache_restore", counting_restore)
+    monkeypatch.setattr(generation, "_cache_restore", counting_restore)
     monkeypatch.setattr(model, "forward", recording_forward)
-    monkeypatch.setattr(modeling, "_sample", schedule_sampler(schedule, [0], gen_logs))
+    monkeypatch.setattr(generation, "_sample", schedule_sampler(schedule, [0], gen_logs))
     out = model.generate(torch.tensor([prompt]), max_new_tokens=n_steps, do_sample=True,
                          num_loops=2, reduce_scratch_blocks=True, repetition_penalty=1.0,
                          no_repeat_ngram_size=0)
@@ -394,7 +395,7 @@ def test_gen12_zero_and_two_are_still_accepted():
 
 def test_gen13_budget_counts_prose_not_notes(monkeypatch):
     script = [OPEN, 20, SEP, 21, CLOSE, 22, 23, 24]
-    monkeypatch.setattr(modeling, "_sample", scripted_sampler(list(script)))
+    monkeypatch.setattr(generation, "_sample", scripted_sampler(list(script)))
     model = seeded_model(tiny_config())
     out = model.generate(torch.tensor([[3, 4]]), max_new_tokens=3, do_sample=True,
                          reduce_scratch_blocks=True, count_prose_only=True,
@@ -404,7 +405,7 @@ def test_gen13_budget_counts_prose_not_notes(monkeypatch):
 
 def test_gen13_default_budget_still_counts_every_token(monkeypatch):
     script = [OPEN, 20, SEP, 21, CLOSE, 22, 23, 24]
-    monkeypatch.setattr(modeling, "_sample", scripted_sampler(list(script)))
+    monkeypatch.setattr(generation, "_sample", scripted_sampler(list(script)))
     model = seeded_model(tiny_config())
     out = model.generate(torch.tensor([[3, 4]]), max_new_tokens=3, do_sample=True,
                          reduce_scratch_blocks=True, repetition_penalty=1.0, no_repeat_ngram_size=0)
