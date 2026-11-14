@@ -21,8 +21,15 @@ dev = [
     "ruff>=0.17,<0.18",
 ]
 
+[project.scripts]
+inky-train = "scripts.train:main"
+inky-sample = "scripts.sample:main"
+inky-ablate = "scripts.ablate:main"
+inky-diagnose = "scripts.diagnose:main"
+inky-bench = "scripts.bench:main"
+
 [tool.setuptools.packages.find]
-include = ["inky*"]
+include = ["inky*", "scripts*"]
 
 [tool.ruff]
 line-length = 120

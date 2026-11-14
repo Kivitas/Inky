@@ -44,7 +44,7 @@ sys.path.insert(0, str(ROOT))
 import torch  # noqa: E402
 
 from inky import HybridOptimizer, InkyConfig, InkyModel  # noqa: E402
-from inky.data import iter_jsonl, prepare_corpus  # noqa: E402
+from inky.data import DEFAULT_MIN_CHARS, iter_jsonl, prepare_corpus  # noqa: E402
 from inky.evaluation import split_heldout  # noqa: E402
 from inky.train import train  # noqa: E402
 
@@ -255,6 +255,8 @@ def _dry_run_texts(seed: int, n_docs: int = 40) -> Iterable[str]:
 def _config_kwargs(args) -> Dict[str, Any]:
     """Dropout flags, then --config-json / --set overrides (later wins), with scratch ids following vocab_size."""
     kwargs = dict(embedding_dropout=args.embedding_dropout, residual_dropout=args.residual_dropout)
+    if getattr(args, "gradient_checkpointing", False):
+        kwargs["gradient_checkpointing"] = True
     kwargs.update(derive_scratch_ids(getattr(args, "config_overrides", {})))
     return kwargs
 
@@ -368,7 +370,9 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     )
     parser.add_argument("--keep-last", type=int, default=3, help="checkpoints to keep (0 keeps all)")
     parser.add_argument("--log-every", type=int, default=10)
-    parser.add_argument("--min-chars", type=int, default=200, help="quality filter: minimum document length")
+    parser.add_argument(
+        "--min-chars", type=int, default=DEFAULT_MIN_CHARS, help="quality filter: minimum document length"
+    )
     parser.add_argument("--resume", type=Path, default=None, help="a step_N checkpoint directory to resume from")
     parser.add_argument("--embedding-dropout", type=float, default=0.0,
                         help="dropout on the token embeddings, train mode only, in [0, 1) (default 0 = off)")
@@ -387,6 +391,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="torch.compile the training forward; falls back to eager with a warning on failure")
     parser.add_argument("--muon-batched", action="store_true",
                         help="batch the Muon Newton-Schulz step over same-shape matrices (same results, faster)")
+    parser.add_argument("--gradient-checkpointing", action="store_true",
+                        help="recompute block activations during backward to save memory")
     args = parser.parse_args(argv)
 
     if args.out_dir is None:
@@ -434,20 +440,53 @@ def main(argv: Optional[List[str]] = None) -> None:
 
     if args.dry_run:
         print(f"dry run: tiny config (vocab {config.vocab_size}), random-character corpus, out-dir {args.out_dir}")
-    windows = prepare_corpus(texts, encode, args.seq_len, eos_id, min_chars=args.min_chars)
-    print(f"corpus: {windows.shape[0]} windows of {args.seq_len} tokens")
-    if windows.shape[0] == 0:
-        _fail("the corpus produced no full windows; add more text or lower --seq-len")
-
-    train_windows, eval_batches = windows, None
+    eval_batches = None
     if args.eval_every > 0:
-        if windows.shape[0] < 2:
-            _fail("eval needs at least 2 windows, so the held-out split leaves some for training")
-        train_idx, eval_idx = split_heldout(list(range(windows.shape[0])), fraction=args.eval_fraction, seed=args.seed)
-        train_windows = windows[train_idx]
-        held = windows[eval_idx]
-        eval_batches = [held[i:i + args.batch_size] for i in range(0, held.shape[0], args.batch_size)]
-        print(f"split: {len(train_idx)} train windows, {len(eval_idx)} held out for eval")
+        raw_docs = list(texts)
+        if len(raw_docs) >= 2:
+            # Split raw documents before packing so train and eval never share packed windows or multi-window docs.
+            train_docs, eval_docs = split_heldout(raw_docs, fraction=args.eval_fraction, seed=args.seed)
+            train_tokens, train_doc_ids = prepare_corpus(
+                train_docs, encode, args.seq_len, eos_id, min_chars=args.min_chars, with_segments=True
+            )
+            eval_tokens, _ = prepare_corpus(
+                eval_docs, encode, args.seq_len, eos_id, min_chars=args.min_chars, with_segments=True
+            )
+            if train_tokens.shape[0] == 0:
+                _fail("the training split produced no full windows; add more text or lower --seq-len")
+            if eval_tokens.shape[0] == 0:
+                _fail(
+                    "the eval split produced no full windows; add more text, raise --eval-fraction, or lower --seq-len"
+                )
+            train_windows = lambda _rng, w=train_tokens, d=train_doc_ids: (w, d)  # noqa: E731
+            eval_batches = [eval_tokens[i:i + args.batch_size] for i in range(0, eval_tokens.shape[0], args.batch_size)]
+            print(
+                f"corpus: {train_tokens.shape[0]} train windows, {eval_tokens.shape[0]} eval windows "
+                f"of {args.seq_len} tokens (doc-level split)"
+            )
+        else:
+            windows, doc_ids = prepare_corpus(
+                raw_docs, encode, args.seq_len, eos_id, min_chars=args.min_chars, with_segments=True
+            )
+            print(f"corpus: {windows.shape[0]} windows of {args.seq_len} tokens")
+            if windows.shape[0] < 2:
+                _fail("eval needs at least 2 windows, so the held-out split leaves some for training")
+            train_idx, eval_idx = split_heldout(
+                list(range(windows.shape[0])), fraction=args.eval_fraction, seed=args.seed
+            )
+            tw, td = windows[train_idx], doc_ids[train_idx]
+            train_windows = lambda _rng, w=tw, d=td: (w, d)  # noqa: E731
+            held = windows[eval_idx]
+            eval_batches = [held[i:i + args.batch_size] for i in range(0, held.shape[0], args.batch_size)]
+            print(f"split: {len(train_idx)} train windows, {len(eval_idx)} held out for eval")
+    else:
+        windows, doc_ids = prepare_corpus(
+            texts, encode, args.seq_len, eos_id, min_chars=args.min_chars, with_segments=True
+        )
+        print(f"corpus: {windows.shape[0]} windows of {args.seq_len} tokens")
+        if windows.shape[0] == 0:
+            _fail("the corpus produced no full windows; add more text or lower --seq-len")
+        train_windows = lambda _rng, w=windows, d=doc_ids: (w, d)  # noqa: E731
 
     device = torch.device("cuda" if torch.cuda.is_available() and not args.dry_run else "cpu")
     torch.manual_seed(args.seed)

@@ -266,12 +266,19 @@ def train_arlo(
                         if not 0 <= gold < n:
                             raise ValueError(f"choice gold {gold} is outside the {n} options")
                         terms.append(arlo.training_loss(
-                            query, options, states, torch.tensor([gold]), task="choice"))
+                            query, options, states, torch.tensor([gold], device=query.device), task="choice"))
                     else:
                         if gold not in (0, 1):
                             raise ValueError(f"binary gold must be 0 or 1, got {gold}")
-                        terms.append(arlo.training_loss(
-                            query, query.unsqueeze(1), states, torch.tensor([float(gold)]), task="binary"))
+                        terms.append(
+                            arlo.training_loss(
+                                query,
+                                query.unsqueeze(1),
+                                states,
+                                torch.tensor([float(gold)], device=query.device),
+                                task="binary",
+                            )
+                        )
                 loss = torch.stack(terms).mean()
                 optimiser.zero_grad()
                 loss.backward()

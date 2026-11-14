@@ -458,6 +458,13 @@ def _train_line(step: int, steps: int, rec: Dict[str, Any]) -> str:
     )
 
 
+def _make_scaler(amp_dtype: Optional[str], device: torch.device):
+    """Return a CUDA GradScaler for fp16, or None. Rejects fp16 on non-CUDA devices."""
+    if amp_dtype == "fp16" and device.type != "cuda":
+        raise ValueError("amp_dtype='fp16' needs a CUDA model; use 'bf16' for mixed precision on CPU")
+    return torch.amp.GradScaler("cuda") if amp_dtype == "fp16" else None
+
+
 def train(
     model,
     optimizer,
@@ -632,9 +639,7 @@ def train(
     target = _unwrap(model)
     cfg = target.config
     device = next(model.parameters()).device
-    if amp_dtype == "fp16" and device.type != "cuda":
-        raise ValueError("amp_dtype='fp16' needs a CUDA model; use 'bf16' for mixed precision on CPU")
-    scaler = torch.amp.GradScaler("cuda") if amp_dtype == "fp16" else None
+    scaler = _make_scaler(amp_dtype, device)
     micro_step = functools.partial(
         _micro_step, gen=gen, device=device, amp_dtype=amp_dtype, grad_accum_steps=grad_accum_steps, scaler=scaler
     )
@@ -775,8 +780,15 @@ def train(
                 # The optimiser does not run, so its moments and the weights stay as they were.
                 optimizer.zero_grad()
                 target.reset_moe_load()   # the skipped step's routing must not feed the next balance update
-                if unscaled:
-                    scaler.update()  # lowers the loss scale after an fp16 overflow
+                if scaler is not None and scaler.is_enabled():
+                    if unscaled:
+                        scaler.update()  # lowers the loss scale after an fp16 overflow
+                    elif getattr(scaler, "_scale", None) is not None:
+                        # Non-finite loss occurred before unscale_(); force a scale backoff so the next
+                        # step does not repeat the exact same overflow indefinitely.
+                        scaler.update(new_scale=max(scaler.get_scale() * scaler.get_backoff_factor(), 1.0))
+                    elif hasattr(scaler, "_init_scale"):
+                        scaler._init_scale = max(scaler._init_scale * scaler.get_backoff_factor(), 1.0)
                 record.update(skipped=True, grad_norm=grad_norm, tokens_per_sec=_rate(step_tokens, step_t0, device))
                 consecutive_skips += 1
                 total_skipped += 1

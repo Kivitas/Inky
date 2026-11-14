@@ -54,6 +54,14 @@ class LatentKV(tuple):
         out.owner = self.owner
         return out
 
+    def truncate(self, new_len: int) -> "LatentKV":
+        """Return a view truncated to ``new_len`` positions without copying buffers."""
+        if new_len < 0 or new_len > self.length:
+            raise ValueError(f"cannot truncate LatentKV of length {self.length} to {new_len}")
+        out = LatentKV(self.c_buf, self.k_buf, new_len, writable=False)
+        out.owner = self.owner
+        return out
+
 
 class RMSNorm(nn.Module):
     def __init__(self, dim: int, eps: float = 1e-6):
@@ -685,7 +693,14 @@ class SelectiveSSMMixer(nn.Module):
         g = torch.sigmoid(self.gate_proj(x))             # [B, S, N] input-dependent input gate
 
         h0 = u.new_zeros(B, u.shape[-1], self.state_dim) if past is None else past[0]
-        y, h = self._chunked_scan(log_a, g, u, h0, seg)
+        if S == 1 and seg is None:
+            calc = torch.promote_types(u.dtype, torch.float32)
+            a = torch.exp(log_a.squeeze(1).to(calc))                             # [B, N]
+            ug = u.squeeze(1).to(calc).unsqueeze(-1) * g.squeeze(1).to(calc).unsqueeze(1)
+            h = a.unsqueeze(1) * h0.to(calc) + ug                                # [B, d, N] in calc (fp32)
+            y = torch.einsum("bdn,dn->bd", h.to(u.dtype), self.readout).unsqueeze(1)
+        else:
+            y, h = self._chunked_scan(log_a, g, u, h0, seg)
         y = y + self.skip * u                                                 # [B, S, d]
 
         present = (h, x.new_zeros(B, 1, 0))
@@ -709,8 +724,8 @@ class SelectiveSSMMixer(nn.Module):
         """
         B, S, _ = u.shape
         C_max = self.scan_chunk
-        calc = torch.promote_types(u.dtype, torch.float32)  # cumulative sums in at least float32
-        h = h0
+        calc = torch.promote_types(u.dtype, torch.float32)  # cumulative sums & carry in at least float32
+        h = h0.to(calc)
         ys = []
         for c0 in range(0, S, C_max):
             la = log_a[:, c0:c0 + C_max].to(calc)         # [B, C, N]
@@ -722,7 +737,7 @@ class SelectiveSSMMixer(nn.Module):
             causal = torch.ones(C, C, dtype=torch.bool, device=u.device).tril().view(1, C, C, 1)
             W = torch.exp(diff.masked_fill(~causal, 0.0)).masked_fill(~causal, 0.0).to(u.dtype)
             Mg = W * gc.unsqueeze(1)                       # [B, t, s, N], weight with the gate g_s
-            carry = torch.exp(L).to(u.dtype).unsqueeze(2) * h.unsqueeze(1)  # [B, C, d, N]
+            carry = torch.exp(L).unsqueeze(2) * h.unsqueeze(1)  # [B, C, d, N] in calc (fp32)
             if seg is not None:
                 seg_c = seg[:, c0:c0 + C_max]                                # [B, C]
                 same = seg_c.unsqueeze(2) == seg_c.unsqueeze(1)              # [B, t, s]: same segment
@@ -733,8 +748,8 @@ class SelectiveSSMMixer(nn.Module):
                     carry_mask = torch.ones_like(seg_c, dtype=torch.bool)    # the initial state is zero anyway
                 carry = carry * carry_mask[:, :, None, None].to(carry.dtype)
             intra = torch.matmul(Mg.permute(0, 3, 1, 2), uc.unsqueeze(1))   # [B, N, t, d]
-            h_chunk = intra.permute(0, 2, 3, 1) + carry                     # [B, C, d, N]
-            ys.append(torch.einsum("bcdn,dn->bcd", h_chunk, self.readout))
+            h_chunk = intra.permute(0, 2, 3, 1).to(calc) + carry            # [B, C, d, N] in calc (fp32)
+            ys.append(torch.einsum("bcdn,dn->bcd", h_chunk.to(u.dtype), self.readout))
             h = h_chunk[:, -1]
         return torch.cat(ys, dim=1), h
 
@@ -1525,7 +1540,7 @@ def pondernet_kl(weights: torch.Tensor, prior: torch.Tensor, mask: Optional[torc
     """
     p = weights.clamp(min=1e-12)
     q = prior.clamp(min=1e-12).view(-1, 1, 1)
-    per_token = (weights * (p.log() - q.log())).sum(dim=0)            # [B, S]
+    per_token = (p * (p.log() - q.log())).sum(dim=0)            # [B, S]
     if mask is None:
         return per_token.mean()
     real = mask.to(device=per_token.device, dtype=per_token.dtype)
