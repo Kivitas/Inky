@@ -49,6 +49,32 @@ class InkyCache:
         self.prefix: List[Optional[torch.Tensor]] = []
         self.seq_len = 0
 
+    def truncate(self, new_len: int) -> None:
+        """Roll back sequence-indexed KV entries to ``new_len`` positions in place.
+
+        Intended for speculative verification rollback when no recurrent state (SSM highway or
+        SelectiveSSMMixer) prevents O(1) sequence slicing.
+        """
+        if new_len < 0 or new_len > self.seq_len:
+            raise ValueError(f"cannot truncate InkyCache of length {self.seq_len} to {new_len}")
+        if new_len == self.seq_len:
+            return
+
+        def _trim(entry):
+            if entry is None:
+                return None
+            if isinstance(entry, LatentKV):
+                return entry.truncate(new_len)
+            k, v = entry
+            if k.ndim == 4 and v.ndim == 4:
+                return (k[:, :, :new_len], v[:, :, :new_len])
+            return entry
+
+        self.pre = [_trim(e) for e in self.pre]
+        self.post = [_trim(e) for e in self.post]
+        self.core = [[_trim(e) for e in layer_list] if layer_list is not None else None for layer_list in self.core]
+        self.seq_len = new_len
+
 
 @dataclass
 class InkyOutput:

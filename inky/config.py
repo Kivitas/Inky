@@ -37,12 +37,12 @@ class InkyConfig(PretrainedConfig):
         # decode step, which costs O(T * H * nope * kv_rank) per step and a transient [B, H, T, nope]
         # tensor. That removes most of the decode-time benefit of absorption for long contexts.
         qk_norm: bool = False,
-        # Which QK-norm to use when qk_norm is True. "head" (the default, unchanged behaviour): per-head
-        # norm of q_nope, q_pe, k_nope, k_pe; the k_nope norm blocks absorption, as described above.
-        # "latent": no k_nope norm (the latent c_kv is already RMS-normed); q_nope, q_pe and k_pe are
-        # normed. The key up-projection can then still be folded into the query, so the cached decode
-        # path stays cheap and matches the full path exactly. Ignored when qk_norm is False.
-        qk_norm_mode: str = "head",
+        # Which QK-norm to use when qk_norm is True. "latent" (default): no k_nope norm (the latent c_kv
+        # is already RMS-normed); q_nope, q_pe and k_pe are normed. The key up-projection can then still be
+        # folded into the query, so the cached decode path stays cheap and matches the full path exactly.
+        # "head": per-head norm of q_nope, q_pe, k_nope, k_pe; the k_nope norm blocks absorption, as above.
+        # Ignored when qk_norm is False.
+        qk_norm_mode: str = "latent",
         # Phase B comparison arms (all default to the existing architecture; none has been trained or compared).
         # attention_type: "mla" (multi-latent attention above) or "gqa" (plain grouped-query attention with
         # num_kv_heads key/value heads of width qk_nope_head_dim + qk_rope_head_dim and v_head_dim, RoPE on the

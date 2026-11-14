@@ -123,6 +123,9 @@ class InkyGenerationMixin:
         snapshots: Dict[int, Tuple[dict, InkyOutput]] = {}
         out = self(seq, past=cache, num_loops=num_loops, last_only=True)
         steps = 0
+        finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
+        pad_id = cfg.pad_token_id if cfg.pad_token_id is not None else eos_token_id
+        ban_open_next = False
         while True:
             if count_prose_only and scratch is not None:
                 if scratch.prose_count(prompt_len) >= max_new_tokens:
@@ -138,22 +141,32 @@ class InkyGenerationMixin:
             logits = _block_tokens(logits, ngram, history, tail_len, bad_word_ids)
             logits = _mask_ids(logits, blocked)
             if scratch is not None:
-                logits = _mask_ids(logits, scratch.banned_markers())
+                banned = scratch.banned_markers()
+                if ban_open_next:
+                    banned = set(banned)
+                    banned.add(cfg.scratch_open_id)
+                    ban_open_next = False
+                logits = _mask_ids(logits, banned)
             if do_sample:
                 next_tok = _sample(logits, temperature, top_k, top_p)
             else:
                 next_tok = logits.argmax(dim=-1)
+            if eos_token_id is not None and finished.any():
+                next_tok = torch.where(finished, pad_id, next_tok)
             new_tokens = next_tok.tolist()
             if scratch is not None and new_tokens[0] == cfg.scratch_open_id:
                 # cache.seq_len == seq.shape[1] here, so this is the state before the marker is fed.
                 snapshots[seq.shape[1]] = (_cache_snapshot(cache), out)
             seq = torch.cat([seq, next_tok[:, None]], dim=1)
             for b, token in enumerate(new_tokens):
-                history[b].append(token)
-                if ngram is not None:
-                    ngram[b].update(token)
-            if eos_token_id is not None and bool((next_tok == eos_token_id).all()):
-                break
+                if not finished[b]:
+                    history[b].append(token)
+                    if ngram is not None:
+                        ngram[b].update(token)
+            if eos_token_id is not None:
+                finished = finished | (next_tok == eos_token_id)
+                if bool(finished.all()):
+                    break
             if scratch is not None:
                 cut = scratch.feed(new_tokens[0])
                 if cut is not None:
@@ -171,6 +184,9 @@ class InkyGenerationMixin:
                         out = self(seq[:, cut:], past=cache, last_only=True)
                     else:
                         out = out_before
+                        # A zero-answer block (OPEN -> SEP -> CLOSE) restores the logits that just
+                        # selected OPEN; ban OPEN on the immediate next step to avoid an infinite loop.
+                        ban_open_next = True
                     continue
                 snapshots = {k: v for k, v in snapshots.items() if k in scratch.open_positions()}
             out = self(next_tok[:, None], past=cache, last_only=True)

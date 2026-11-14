@@ -4,7 +4,7 @@ Logits are [B, S, V] or [N, V]. The teacher is treated as a fixed target: its lo
 detached inside ``distillation_loss`` so no gradient reaches it.
 """
 
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
@@ -64,3 +64,51 @@ def distillation_loss(
 
     hard = F.cross_entropy(s, y, reduction="mean")
     return alpha * soft + (1.0 - alpha) * hard
+
+
+def chunked_distillation_loss(
+    student_hidden: torch.Tensor,
+    teacher_logits: torch.Tensor,
+    project_fn: Callable[[torch.Tensor], torch.Tensor],
+    targets: Optional[torch.Tensor] = None,
+    chunk_size: int = 1024,
+    temperature: float = 2.0,
+    alpha: float = 0.5,
+    ignore_index: int = -100,
+) -> torch.Tensor:
+    """Memory-bounded knowledge-distillation loss over hidden states.
+
+    Projects ``student_hidden`` through ``project_fn`` in chunks of ``chunk_size`` tokens so
+    long-sequence (e.g. 8k) distillation never materializes full ``[B, S, V]`` float32 logits.
+    Mathematically equivalent to ``distillation_loss(project_fn(student_hidden), ...)``.
+    """
+    h_flat = student_hidden.reshape(-1, student_hidden.shape[-1])
+    t_flat = teacher_logits.reshape(-1, teacher_logits.shape[-1])
+    y_flat = None
+    if targets is not None:
+        y_flat = targets.reshape(-1)
+        keep = y_flat != ignore_index
+        h_flat, t_flat, y_flat = h_flat[keep], t_flat[keep], y_flat[keep]
+
+    total_tokens = h_flat.shape[0]
+    if total_tokens == 0:
+        return (student_hidden.sum() * 0.0).float()
+
+    chunk = max(1, int(chunk_size))
+    scale = float(temperature) ** 2
+    soft_sum = student_hidden.new_zeros((), dtype=torch.float32)
+    hard_sum = student_hidden.new_zeros((), dtype=torch.float32)
+    for start in range(0, total_tokens, chunk):
+        end = min(start + chunk, total_tokens)
+        s_c = project_fn(h_flat[start:end]).float()
+        t_c = t_flat[start:end].float().detach()
+        log_s = F.log_softmax(s_c / temperature, dim=-1)
+        log_t = F.log_softmax(t_c / temperature, dim=-1)
+        soft_sum = soft_sum + F.kl_div(log_s, log_t, reduction="sum", log_target=True) * scale
+        if y_flat is not None:
+            hard_sum = hard_sum + F.cross_entropy(s_c, y_flat[start:end], reduction="sum")
+
+    soft = soft_sum / total_tokens
+    if y_flat is None:
+        return soft
+    return alpha * soft + (1.0 - alpha) * (hard_sum / total_tokens)

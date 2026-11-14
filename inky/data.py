@@ -518,12 +518,15 @@ def prepare_corpus(
     eos_id: int,
     min_chars: int = DEFAULT_MIN_CHARS,
     *,
+    with_segments: bool = False,
     reserved_ids: Iterable[int] = DEFAULT_RESERVED_IDS,
     stats: Optional[Dict[str, int]] = None,
-) -> torch.Tensor:
+) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
     """Run the full pipeline: clean, quality filter, dedupe, encode each document, then pack.
 
-    ``encode`` maps a string to a list of token ids. Returns a LongTensor of shape [N, seq_len].
+    ``encode`` maps a string to a list of token ids. Returns a LongTensor of shape [N, seq_len], or
+    ``(tokens, doc_ids)`` when ``with_segments=True`` so packed training can mask cross-document
+    attention and labels.
 
     Streaming: every stage is a generator, so ``docs`` is read once and documents are cleaned, filtered,
     deduplicated (``dedupe_stream``), encoded and packed one at a time. Only the dedupe state and the
@@ -561,7 +564,11 @@ def prepare_corpus(
             counts["kept"] += 1
             yield ids
 
-    packed = pack_sequences(_encoded(), seq_len, eos_id)
+    if with_segments:
+        packed, doc_ids, _ = pack_sequences_with_segments(_encoded(), seq_len, eos_id)
+    else:
+        packed = pack_sequences(_encoded(), seq_len, eos_id)
+        doc_ids = None
     if stats is not None:
         stats.update(counts)
     if counts["kept"] == 0:
@@ -571,4 +578,6 @@ def prepare_corpus(
             UserWarning,
             stacklevel=2,
         )
+    if with_segments:
+        return packed, doc_ids
     return packed

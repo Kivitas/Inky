@@ -276,8 +276,9 @@ def test_qk_norm_modes_are_validated_and_default_is_unchanged():
     with pytest.raises(ValueError):
         InkyConfig(qk_norm=True, qk_norm_mode="bogus")
     cfg = InkyConfig()
-    assert cfg.qk_norm is False and cfg.qk_norm_mode == "head"
-    assert InkyModel(InkyConfig()).count_parameters()["total"] == DEFAULT_PARAM_COUNT
+    assert cfg.qk_norm is False and cfg.qk_norm_mode == "latent"
+    with torch.device("meta"):
+        assert InkyModel(InkyConfig()).count_parameters()["total"] == DEFAULT_PARAM_COUNT
 
 
 def test_head_mode_still_matches_cached_vs_full():

@@ -112,6 +112,12 @@ def _local_window(base: Overrides) -> Overrides:
     return dict(local_window=window, local_window_loops=tuple(range(1, loops)))
 
 
+def _dense_unrolled(base: Overrides) -> Overrides:
+    """Unrolled non-recurrent dense transformer with the same total layer applications as the recurrent core."""
+    apps = int(base.get("num_recurrent_layers", 2)) * int(base.get("max_recurrent_loops", 6))
+    return dict(use_moe=False, **_core_shape(apps)(base))
+
+
 def _compose(*specs) -> Callable[[Overrides], Overrides]:
     """Merge variant specs (dicts or functions of the base) in order; later keys win."""
     def build(base: Overrides) -> Overrides:
@@ -146,6 +152,9 @@ VARIANTS: Dict[str, Union[Overrides, Callable[[Overrides], Overrides]]] = {
     "hybrid_ssm": {"ssm_mixer_layers": (1,)},                             # second recurrent layer is a selective SSM
     "v16k_core3x4": _compose(_vocab_variant(16000), _core_shape(3)),      # 16k vocabulary with the 3x4 core
     "v16k_core4x3": _compose(_vocab_variant(16000), _core_shape(4)),      # 16k vocabulary with the 4x3 core
+    "dense_unrolled": _dense_unrolled,                                    # non-recurrent dense transformer (12x1)
+    "dense_param_match": {"use_moe": False, "dense_intermediate_size": 6336},  # dense FFN matched to MoE total params
+    "mqa": {"attention_type": "gqa", "num_kv_heads": 1},                  # multi-query attention (single KV head)
 }
 
 

@@ -27,8 +27,13 @@ SMALL = ["--tiny", "--variants", "baseline,dense", "--prefill-len", "32", "--con
          "--extrapolate-to", "256"]
 
 
-def test_rows_are_finite_and_dense_is_smaller_with_matched_body_flops():
-    result = budget.main(SMALL)
+@pytest.fixture(scope="module")
+def small_budget():
+    return budget.main(SMALL)
+
+
+def test_rows_are_finite_and_dense_is_smaller_with_matched_body_flops(small_budget):
+    result = small_budget
     rows = {r["name"]: r for r in result["variants"]}
     assert list(rows) == ["baseline", "dense"]
     for row in rows.values():
@@ -44,8 +49,8 @@ def test_rows_are_finite_and_dense_is_smaller_with_matched_body_flops():
     assert abs(body_dense - body_base) / body_base < 0.05, (body_base, body_dense)
 
 
-def test_decode_flops_grow_with_context():
-    row = budget.main(SMALL)["variants"][0]
+def test_decode_flops_grow_with_context(small_budget):
+    row = small_budget["variants"][0]
     by_ctx = row["decode_flops_by_context"]
     assert by_ctx[64] > by_ctx[16]
     assert row["decode_flops_extrapolated"] >= by_ctx[64]

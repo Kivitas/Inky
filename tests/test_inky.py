@@ -61,12 +61,14 @@ EXPECTED_ARLO_PARAMS = 50_614_855
 
 
 def test_default_config_parameter_count_is_exact():
-    model = InkyModel(InkyConfig())
+    with torch.device("meta"):
+        model = InkyModel(InkyConfig())
     assert model.count_parameters()["total"] == EXPECTED_DEFAULT_PARAMS
 
 
 def test_arlo_parameter_count_is_exact():
-    model = InkyModel(InkyConfig(enable_arlo=True))
+    with torch.device("meta"):
+        model = InkyModel(InkyConfig(enable_arlo=True))
     assert model.count_parameters()["total"] == EXPECTED_ARLO_PARAMS
 
 

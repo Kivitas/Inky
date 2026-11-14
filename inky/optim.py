@@ -29,8 +29,9 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import torch
 import torch.nn as nn
 
-# 2D parameters that are lookup tables or per-loop tables and must stay with AdamW.
-ADAMW_ONLY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base", "out_gate")
+# 2D parameters that are lookup tables, per-loop tables, gating/readout weights, or heads and must stay with AdamW.
+ADAMW_ONLY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base", "out_gate", "a_gate", "readout", "lm_head")
+ADAMW_NO_DECAY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base", "out_gate", "a_gate", "binary_head")
 
 # Dotted-name segments of tiny gating modules: the MoE router (layers.SharedExpertMoE) and the
 # PonderNet halting gate (layers.PonderHalting, attribute ``halting``). Matched as whole
@@ -224,7 +225,12 @@ def _classify(
         and not _is_routing_name(name)
     ):
         return GROUP_MUON
-    if p.ndim < 2 or name.endswith(".bias"):
+    if (
+        p.ndim < 2
+        or name.endswith(".bias")
+        or _is_routing_name(name)
+        or any(key in name for key in ADAMW_NO_DECAY_NAMES)
+    ):
         return GROUP_ADAMW_NO_DECAY
     return GROUP_ADAMW_DECAY
 
@@ -362,10 +368,21 @@ class HybridOptimizer:
             group["lr"] = base * scale
 
     def step(self, max_grad_norm: Optional[float] = None) -> Optional[float]:
-        """One optimiser step. Returns the pre-clip gradient norm when clipping is requested."""
+        """One optimiser step. Returns the pre-clip gradient norm when clipping is requested.
+
+        Muon and AdamW parameter groups are clipped independently so large matrix gradients
+        do not throttle AdamW updates on embeddings, norms, or routers (since Muon's
+        Newton-Schulz step normalises out scalar gradient magnitude anyway).
+        """
         grad_norm = None
         if max_grad_norm is not None:
-            grad_norm = float(torch.nn.utils.clip_grad_norm_(self.params, max_grad_norm))
+            import math
+
+            adamw_params = [p for g in self.adamw.param_groups for p in g["params"] if p.grad is not None]
+            muon_params = [p for g in self.muon.param_groups for p in g["params"] if p.grad is not None]
+            a_norm = float(torch.nn.utils.clip_grad_norm_(adamw_params, max_grad_norm)) if adamw_params else 0.0
+            m_norm = float(torch.nn.utils.clip_grad_norm_(muon_params, max_grad_norm)) if muon_params else 0.0
+            grad_norm = math.hypot(a_norm, m_norm)
         self.muon.step()
         self.adamw.step()
         return grad_norm

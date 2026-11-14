@@ -226,7 +226,8 @@ def test_qk_norm_default_is_off_and_adds_no_parameters_when_off():
 def test_default_parameter_count_unchanged():
     from inky.modeling import InkyModel
 
-    model = InkyModel(InkyConfig())
+    with torch.device("meta"):
+        model = InkyModel(InkyConfig())
     assert sum(p.numel() for p in model.parameters()) == DEFAULT_PARAM_COUNT
 
 

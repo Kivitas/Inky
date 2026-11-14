@@ -108,6 +108,14 @@ def measure_variant(name: str, base: Dict[str, Any], args: argparse.Namespace, c
         model(_random_ids(gen, cfg.scratch_open_id, prefill), return_hidden=True, num_loops=loops)
     body = fc.get_total_flops() / prefill
     head = 2.0 * cfg.vocab_size * cfg.hidden_size
+    head_passes = 1.0 + (
+        loops * cfg.step_ce_token_fraction
+        if cfg.routing_mode == "ponder" and cfg.ponder_step_loss_coef > 0
+        else 0.0
+    )
+    train_body = body * (4.0 if cfg.gradient_checkpointing else 3.0)
+    train_head = head * head_passes * (4.0 if cfg.lm_loss_recompute else 3.0)
+    train_flops = train_body + train_head
 
     measured = [t for t in contexts if t < limit]
     skipped = [t for t in contexts if t >= limit]
@@ -151,6 +159,7 @@ def measure_variant(name: str, base: Dict[str, Any], args: argparse.Namespace, c
         "body_flops_per_token": body,
         "head_flops_per_token": head,
         "total_flops_per_token": body + head,
+        "train_flops_per_token": train_flops,
         "measured_contexts": measured,
         "skipped_contexts": skipped,
         "largest_context": largest,

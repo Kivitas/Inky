@@ -27,6 +27,7 @@ from typing import Dict, Tuple, Union
 
 import torch
 
+from .generation import _cache_restore, _cache_snapshot
 from .modeling import _USE_CONFIG_EOS, InkyCache, InkyModel
 
 
@@ -140,17 +141,29 @@ def self_speculative_generate(
             count(True, L - v_fed)
             v_fed = L
             preds = [int(out.logits[0, -1].argmax(dim=-1))]
+            v_snap = None
+            can_truncate = not cfg.use_highway and not cfg.ssm_mixer_layers
             if k > 0:
-                # Verify block on a fork. preds[i + 1] is the verifier's choice after drafts[i].
+                # Verify drafts directly on v_cache so accepted tokens stay cached without a
+                # redundant catch-up pass on the next round.
+                if not can_truncate:
+                    v_snap = _cache_snapshot(v_cache)
                 draft_t = torch.tensor([drafts], dtype=seq.dtype, device=seq.device)
-                trial = _fork(v_cache)
-                out = model(draft_t, past=trial, num_loops=max_loops, last_only=False)
+                out = model(draft_t, past=v_cache, num_loops=max_loops, last_only=False)
                 count(True, k)
                 preds += out.logits[0].argmax(dim=-1).tolist()
 
             n = 0
             while n < k and drafts[n] == preds[n]:
                 n += 1
+            if k > 0:
+                if n == k:
+                    v_fed = L + k
+                elif can_truncate:
+                    v_cache.truncate(L + n)
+                    v_fed = L + n
+                elif v_snap is not None:
+                    _cache_restore(v_cache, v_snap)
             new_tokens = drafts[:n] + [preds[n]]
 
             stats["drafted"] += k
