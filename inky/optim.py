@@ -30,8 +30,16 @@ import torch
 import torch.nn as nn
 
 # 2D parameters that are lookup tables, per-loop tables, gating/readout weights, or heads and must stay with AdamW.
-ADAMW_ONLY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base", "out_gate", "a_gate", "readout", "lm_head")
-ADAMW_NO_DECAY_NAMES: Tuple[str, ...] = ("step_embedding", "slot_base", "out_gate", "a_gate", "binary_head")
+ADAMW_ONLY_NAMES: Tuple[str, ...] = (
+    "step_embedding", "additive_step_embed", "slot_base", "out_gate", "a_gate", "readout", "lm_head",
+    "thought_gate", "reasoning_embed", "style_embed", "alpha_proj", "beta_proj",
+    "c1", "c2", "action_to_moe", "halt_head", "uncertainty_head", "action_embeddings",
+)
+ADAMW_NO_DECAY_NAMES: Tuple[str, ...] = (
+    "step_embedding", "additive_step_embed", "slot_base", "out_gate", "a_gate", "binary_head",
+    "thought_gate", "reasoning_embed", "style_embed", "alpha_proj", "beta_proj",
+    "c1", "c2", "action_to_moe", "halt_head", "uncertainty_head", "action_embeddings",
+)
 
 # Dotted-name segments of tiny gating modules: the MoE router (layers.SharedExpertMoE) and the
 # PonderNet halting gate (layers.PonderHalting, attribute ``halting``). Matched as whole

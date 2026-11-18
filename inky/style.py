@@ -12,7 +12,7 @@ Default policy:
     old hard ban.
 """
 
-from typing import Callable, Dict, Iterable, List, Sequence, Set, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 # UNVALIDATED HEURISTIC: multi-word stock phrases seen in AI-written prose. Not measured against
 # any corpus or detector; tune on your own data before relying on it.
@@ -40,6 +40,135 @@ STOCK_WORDS: List[str] = [
     "furthermore",
     "moreover",
 ]
+
+# Register vocabularies for formal vs. informal human-like prose modes.
+# Formal mode avoids casual slang, colloquial contractions, and chat interjections.
+INFORMAL_WORDS: List[str] = [
+    "gonna",
+    "wanna",
+    "gotta",
+    "kinda",
+    "sorta",
+    "yeah",
+    "nah",
+    "yep",
+    "nope",
+    "lol",
+    "omg",
+    "btw",
+    "imo",
+    "tbh",
+    "ain't",
+    "y'all",
+    "stuff",
+    "guys",
+    "awesome",
+    "totally",
+    "literally",
+    "basically",
+]
+
+INFORMAL_PHRASES: List[str] = [
+    "you know",
+    "kind of",
+    "sort of",
+    "no way",
+    "for real",
+    "by the way",
+    "to be honest",
+]
+
+# Informal mode avoids stiff, bureaucratic, archaic, or overly academic transitions.
+FORMAL_WORDS: List[str] = [
+    "heretofore",
+    "herein",
+    "thereof",
+    "whereby",
+    "notwithstanding",
+    "henceforth",
+    "aforementioned",
+    "inasmuch",
+    "consequently",
+    "subsequently",
+    "nevertheless",
+    "nonetheless",
+    "furthermore",
+    "moreover",
+    "thus",
+    "hence",
+    "shall",
+    "whilst",
+    "utilize",
+    "commence",
+]
+
+FORMAL_PHRASES: List[str] = [
+    "in accordance with",
+    "with respect to",
+    "prior to",
+    "subsequent to",
+    "it is imperative",
+    "one must",
+    "for the purpose of",
+    "in the event that",
+]
+
+STYLE_PROFILES: Dict[str, Dict[str, Any]] = {
+    "formal": {
+        "temperature": 0.7,
+        "top_p": 0.90,
+        "top_k": 40,
+        "min_p": 0.05,
+        "repetition_penalty": 1.12,
+        "no_repeat_ngram_size": 4,
+        "stock_word_penalty": 1.5,
+        "avoid_words": INFORMAL_WORDS,
+        "avoid_phrases": INFORMAL_PHRASES,
+    },
+    "informal": {
+        "temperature": 0.85,
+        "top_p": 0.95,
+        "top_k": 60,
+        "min_p": 0.03,
+        "repetition_penalty": 1.08,
+        "no_repeat_ngram_size": 4,
+        "stock_word_penalty": 2.0,
+        "avoid_words": FORMAL_WORDS,
+        "avoid_phrases": FORMAL_PHRASES,
+    },
+}
+
+
+def get_style_profile(style_mode: str) -> Dict[str, Any]:
+    """Return a copy of the decoding profile for ``style_mode`` ('formal' or 'informal')."""
+    if style_mode not in STYLE_PROFILES:
+        raise ValueError(f"style_mode must be one of {tuple(STYLE_PROFILES)}, got {style_mode!r}")
+    return dict(STYLE_PROFILES[style_mode])
+
+
+def build_style_controls(
+    style_mode: str,
+    encode: Optional[Callable[[str], Sequence[int]]] = None,
+) -> Dict[str, Any]:
+    """Build sampling and vocabulary controls for ``style_mode`` ('formal' or 'informal').
+
+    When ``encode`` is given, also computes ``bad_word_ids`` (stock phrases + out-of-register phrases)
+    and ``soft_penalty_ids`` (stock words + out-of-register words).
+    """
+    prof = get_style_profile(style_mode)
+    avoid_words = prof.pop("avoid_words")
+    avoid_phrases = prof.pop("avoid_phrases")
+    if encode is not None:
+        prof["bad_word_ids"] = build_bad_word_ids(
+            encode, phrases=list(STOCK_PHRASES) + list(avoid_phrases)
+        )
+        prof["soft_penalty_ids"] = soft_penalty_token_ids(
+            encode, words=list(STOCK_WORDS) + list(avoid_words)
+        )
+    else:
+        prof["bad_word_ids"] = None
+        prof["soft_penalty_ids"] = None
+    return prof
 
 
 def _variants(phrase: str) -> List[str]:

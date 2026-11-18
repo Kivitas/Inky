@@ -12,6 +12,61 @@ the 50,000 tokens of EOS_Tokenizer and must be added to that tokenizer as specia
 
 from transformers import PretrainedConfig
 
+# Built-in reasoning modes and their thinking loop counts:
+#   - "low":  2 loops (fast, lightweight thinking)
+#   - "high": 5 loops (deep thinking + balanced latent refinement)
+#   - "max":  10 loops (maximum iterative thinking + extended scratchpad allowance)
+REASONING_MODES: dict[str, int] = {
+    "low": 2,
+    "high": 5,
+    "max": 10,
+}
+
+# Extended PENCIL scratchpad note token budgets for all 3 reasoning modes (longer thinking time):
+REASONING_SCRATCH_BUDGETS: dict[str, int] = {
+    "low": 384,
+    "high": 768,
+    "max": 1536,
+}
+
+# Built-in prose register modes:
+#   - "formal":   composed, articulate, scholarly/literary prose; avoids slang & casual contractions
+#   - "informal": warm, natural, conversational human cadence; avoids stiff/bureaucratic connectors
+STYLE_MODES: tuple[str, ...] = ("formal", "informal")
+
+
+def resolve_reasoning_loops(
+    reasoning_mode: str | None,
+    num_loops: int | None = None,
+) -> int | None:
+    """Resolve a reasoning mode ('low'=2, 'high'=5, 'max'=10) to a loop count unless num_loops is explicit."""
+    if reasoning_mode is not None and reasoning_mode not in REASONING_MODES:
+        raise ValueError(
+            f"reasoning_mode must be one of {tuple(REASONING_MODES)} or None, got {reasoning_mode!r}"
+        )
+    if num_loops is not None:
+        return int(num_loops)
+    if reasoning_mode is not None:
+        return REASONING_MODES[reasoning_mode]
+    return None
+
+
+def resolve_reasoning_scratch_budget(
+    reasoning_mode: str | None,
+    scratch_max_note_tokens: int | None = None,
+    default_budget: int = 256,
+) -> int | None:
+    """Resolve a reasoning mode's extended scratchpad note token budget when left at the default."""
+    if scratch_max_note_tokens is None:
+        return None
+    if reasoning_mode is not None and scratch_max_note_tokens == default_budget:
+        if reasoning_mode not in REASONING_SCRATCH_BUDGETS:
+            raise ValueError(
+                f"reasoning_mode must be one of {tuple(REASONING_SCRATCH_BUDGETS)} or None, got {reasoning_mode!r}"
+            )
+        return REASONING_SCRATCH_BUDGETS[reasoning_mode]
+    return int(scratch_max_note_tokens)
+
 
 class InkyConfig(PretrainedConfig):
     model_type = "inky"
@@ -173,6 +228,46 @@ class InkyConfig(PretrainedConfig):
         # each block's attention and MoE branch outputs before they are added to the residual stream.
         embedding_dropout: float = 0.0,
         residual_dropout: float = 0.0,
+        # Reasoning & human-style modes:
+        # reasoning_mode: None (use max_recurrent_loops / num_loops), "low" (2 loops), "high" (5 loops),
+        # or "max" (10 loops).
+        reasoning_mode: str | None = None,
+        # style_mode: None, "formal", or "informal". Controls decoding cadence/register and optional
+        # internal FiLM conditioning when use_mode_conditioning is True.
+        style_mode: str | None = None,
+        # Architectural reasoning upgrades (opt-in so default InkyConfig() keeps 50,219,202 parameters):
+        # convergence_halting: modulates PonderNet halting by per-token state velocity ||h_n - h_{n-1}|| / ||h_n||
+        # so tokens still revising their representation continue pondering across 5-10 loops.
+        convergence_halting: bool = False,
+        # use_thought_gate: per-token, per-channel sigmoid gate on recurrent loop updates, allowing
+        # resolved dimensions to stay fixed while unresolved reasoning dimensions keep refining.
+        use_thought_gate: bool = False,
+        # use_mode_conditioning: learned FiLM embeddings for reasoning_mode ("low"/"high"/"max") and
+        # style_mode ("formal"/"informal").
+        use_mode_conditioning: bool = False,
+        # Hybrid Linear Mixer type for ssm_mixer_layers: "ssm" (SelectiveSSMMixer) or "gated_deltanet"
+        # (GatedDeltaNetMixer with O(1) matrix state S_t = alpha_t S_{t-1} + beta_t (v_t - S_{t-1} k_t) k_t^T).
+        linear_mixer_type: str = "ssm",
+        # Additive loop-step embedding e_t in R^{d_model} injected before recurrent block f_{theta_C}(u_t + e_t)
+        use_additive_step_embedding: bool = False,
+        # Isolated External Memory Bank (B) with Sub-Linear Product-Key Memory (PKM) Indexing:
+        enable_memory_bank: bool = False,
+        pkm_sub_keys: int = 256,           # S: total slots M = S^2 (e.g. 2048 -> 4.19M, 2646 -> ~7M slots)
+        pkm_key_dim: int = 128,            # d_k (split into two d_k/2 codebooks C^(1), C^(2))
+        pkm_mem_dim: int = 256,            # d_mem per value vector
+        pkm_top_k: int = 4,                # K winning slots fetched per token
+        pkm_query_steps: tuple = (1, 3, 5),  # T_query subset of loop iterations that query B
+        pkm_storage_dtype: str = "int8",   # "int4", "int8", or "float32"
+        pkm_routing_mode: str = "pkm",     # "pkm" (O(sqrt(M)) Cartesian product keys) or "hash" (O(1) m-gram hash)
+        # Joint Embedding Predictive Architecture (JEPA) Executive Controller:
+        enable_jepa: bool = False,
+        jepa_latent_dim: int = 128,        # d_z <= 256 compressed semantic latent dimension
+        jepa_horizon: int = 3,             # H=3 lookahead rollout horizon
+        jepa_num_actions: int = 4,         # number of candidate latent action plans simulated
+        jepa_compute_penalty: float = 0.05,  # lambda_compute in E(z_hat, z_goal) + lambda_compute * t
+        jepa_mem_threshold: float = 0.5,   # tau_mem threshold for triggering memory bank fetch gate g_mem
+        jepa_convergence_eps: float = 0.05,  # epsilon for ||z_hat_{t+1} - z_t||_2 < epsilon early halting
+        jepa_loss_coef: float = 0.1,       # weight of self-supervised JEPA latent prediction + VICReg loss
         **kwargs,
     ):
         for name, value in (("embedding_dropout", embedding_dropout), ("residual_dropout", residual_dropout)):
@@ -180,6 +275,55 @@ class InkyConfig(PretrainedConfig):
                 raise ValueError(f"{name} must be in [0, 1), got {value}")
         self.embedding_dropout = float(embedding_dropout)
         self.residual_dropout = float(residual_dropout)
+        if reasoning_mode is not None and reasoning_mode not in REASONING_MODES:
+            raise ValueError(
+                f"reasoning_mode must be one of {tuple(REASONING_MODES)} or None, got {reasoning_mode!r}"
+            )
+        self.reasoning_mode = reasoning_mode
+        if style_mode is not None and style_mode not in STYLE_MODES:
+            raise ValueError(f"style_mode must be one of {STYLE_MODES} or None, got {style_mode!r}")
+        self.style_mode = style_mode
+        self.convergence_halting = bool(convergence_halting)
+        self.use_thought_gate = bool(use_thought_gate)
+        self.use_mode_conditioning = bool(use_mode_conditioning)
+        if linear_mixer_type not in ("ssm", "gated_deltanet"):
+            raise ValueError(f"linear_mixer_type must be 'ssm' or 'gated_deltanet', got {linear_mixer_type!r}")
+        self.linear_mixer_type = linear_mixer_type
+        self.use_additive_step_embedding = bool(use_additive_step_embedding)
+        self.enable_memory_bank = bool(enable_memory_bank)
+        if int(pkm_sub_keys) < 2:
+            raise ValueError(f"pkm_sub_keys must be >= 2, got {pkm_sub_keys}")
+        self.pkm_sub_keys = int(pkm_sub_keys)
+        if int(pkm_key_dim) < 2 or int(pkm_key_dim) % 2 != 0:
+            raise ValueError(f"pkm_key_dim must be an even int >= 2, got {pkm_key_dim}")
+        self.pkm_key_dim = int(pkm_key_dim)
+        if int(pkm_mem_dim) < 2 or int(pkm_mem_dim) % 2 != 0:
+            raise ValueError(f"pkm_mem_dim must be an even int >= 2, got {pkm_mem_dim}")
+        self.pkm_mem_dim = int(pkm_mem_dim)
+        if int(pkm_top_k) < 1:
+            raise ValueError(f"pkm_top_k must be >= 1, got {pkm_top_k}")
+        self.pkm_top_k = int(pkm_top_k)
+        self.pkm_query_steps = tuple(sorted({int(s) for s in pkm_query_steps}))
+        if pkm_storage_dtype not in ("int4", "int8", "float32"):
+            raise ValueError(f"pkm_storage_dtype must be 'int4', 'int8' or 'float32', got {pkm_storage_dtype!r}")
+        self.pkm_storage_dtype = pkm_storage_dtype
+        if pkm_routing_mode not in ("pkm", "hash"):
+            raise ValueError(f"pkm_routing_mode must be 'pkm' or 'hash', got {pkm_routing_mode!r}")
+        self.pkm_routing_mode = pkm_routing_mode
+        self.enable_jepa = bool(enable_jepa)
+        if not 1 <= int(jepa_latent_dim) <= 256:
+            raise ValueError(f"jepa_latent_dim must be in [1, 256], got {jepa_latent_dim}")
+        self.jepa_latent_dim = int(jepa_latent_dim)
+        if int(jepa_horizon) < 1:
+            raise ValueError(f"jepa_horizon must be >= 1, got {jepa_horizon}")
+        self.jepa_horizon = int(jepa_horizon)
+        if int(jepa_num_actions) < 1:
+            raise ValueError(f"jepa_num_actions must be >= 1, got {jepa_num_actions}")
+        self.jepa_num_actions = int(jepa_num_actions)
+        self.jepa_compute_penalty = float(jepa_compute_penalty)
+        self.jepa_mem_threshold = float(jepa_mem_threshold)
+        self.jepa_convergence_eps = float(jepa_convergence_eps)
+        self.jepa_loss_coef = float(jepa_loss_coef)
         self.gradient_checkpointing = gradient_checkpointing
         self.lm_loss_recompute = bool(lm_loss_recompute)
         self.enable_arlo = enable_arlo
@@ -355,3 +499,78 @@ class InkyConfig(PretrainedConfig):
     @property
     def qk_head_dim(self) -> int:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @classmethod
+    def human_reasoning(cls, **overrides) -> "InkyConfig":
+        """Preset configuration with native 10-loop 'max' capacity, thought gating, convergence halting,
+        prelude re-injection, gated attention, latent QK-norm, and reasoning/style FiLM conditioning."""
+        defaults = dict(
+            max_recurrent_loops=REASONING_MODES["max"],
+            min_recurrent_loops=REASONING_MODES["low"],
+            ponder_prior_steps=float(REASONING_MODES["high"]),
+            loop_input_injection=True,
+            attention_gate=True,
+            qk_norm=True,
+            qk_norm_mode="latent",
+            convergence_halting=True,
+            use_thought_gate=True,
+            use_mode_conditioning=True,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def hybrid_linear_128k(cls, ratio: str = "1:3", **overrides) -> "InkyConfig":
+        """Preset with 128k context (Multi-Head Latent Attention) mixed with linear recurrent layers
+        (GatedDeltaNet / SelectiveSSM) at a 1:3 or 1:7 attention-to-linear ratio."""
+        if ratio == "1:3":
+            rec_layers = 4
+            linear_layers = (0, 1, 2)  # 3 linear layers + 1 MLA layer per loop (1:3 ratio)
+            loops = 5
+        elif ratio == "1:7":
+            rec_layers = 8
+            linear_layers = (0, 1, 2, 3, 4, 5, 6)  # 7 linear layers + 1 MLA layer per loop (1:7 ratio)
+            loops = 3
+        else:
+            raise ValueError(f"ratio must be '1:3' or '1:7', got {ratio!r}")
+        defaults = dict(
+            max_position_embeddings=131072,
+            rope_theta=2000000.0,
+            attention_type="mla",
+            num_recurrent_layers=rec_layers,
+            ssm_mixer_layers=linear_layers,
+            linear_mixer_type="gated_deltanet",
+            max_recurrent_loops=loops,
+            min_recurrent_loops=2,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)
+
+    @classmethod
+    def ultra_sparse_jepa(cls, **overrides) -> "InkyConfig":
+        """Ultra-Sparse MoE (shared expert + high routed expert count) paired with the JEPA executive
+        controller, Product-Key External Memory Bank (B), 1:3 Hybrid Linear/MLA layers, and 10-loop 'max'
+        thinking capacity."""
+        defaults = dict(
+            max_recurrent_loops=REASONING_MODES["max"],
+            min_recurrent_loops=REASONING_MODES["low"],
+            ponder_prior_steps=float(REASONING_MODES["high"]),
+            num_shared_experts=1,
+            num_routed_experts=32,
+            num_active_routed=2,
+            num_recurrent_layers=4,
+            ssm_mixer_layers=(0, 1, 2),
+            linear_mixer_type="gated_deltanet",
+            loop_input_injection=True,
+            use_additive_step_embedding=True,
+            attention_gate=True,
+            qk_norm=True,
+            qk_norm_mode="latent",
+            convergence_halting=True,
+            use_thought_gate=True,
+            use_mode_conditioning=True,
+            enable_memory_bank=True,
+            enable_jepa=True,
+        )
+        defaults.update(overrides)
+        return cls(**defaults)

@@ -10,7 +10,7 @@ from transformers import PreTrainedModel
 
 from .arlo import Arlo
 from .cache import InkyCache, InkyOutput, _claim, _writable_past  # noqa: F401
-from .config import InkyConfig
+from .config import REASONING_MODES, STYLE_MODES, InkyConfig, resolve_reasoning_loops
 from .decision import InkyDecisionMixin
 from .generation import (  # noqa: F401  (the generation helpers stay importable from here)
     _USE_CONFIG_EOS,
@@ -23,8 +23,10 @@ from .generation import (  # noqa: F401  (the generation helpers stay importable
     _sample,
     _WindowedNgramIndex,
 )
+from .jepa import JEPAController
 from .layers import (
     InkyBlock,
+    ModeConditioner,
     MoRRouter,
     PonderHalting,
     RecurrentCore,
@@ -34,6 +36,7 @@ from .layers import (
     geometric_prior,
     pondernet_kl,
 )
+from .memory_bank import ProductKeyMemoryBank
 from .scratch import DEFAULT_MAX_NOTE_TOKENS, ScratchTracker, reduce_scratch  # noqa: F401
 
 
@@ -58,8 +61,24 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         )
         self.arlo = Arlo(config) if config.enable_arlo else None
         self.mor_router = MoRRouter(config) if mor else None
+        self.mode_cond = (
+            ModeConditioner(config.hidden_size)
+            if getattr(config, "use_mode_conditioning", False)
+            else None
+        )
+        self.memory_bank = (
+            ProductKeyMemoryBank(config)
+            if getattr(config, "enable_memory_bank", False)
+            else None
+        )
+        self.jepa = (
+            JEPAController(config)
+            if getattr(config, "enable_jepa", False)
+            else None
+        )
         self.post_init()
-        # Start the halting gate at its prior. Set after post_init, which would reset the bias.
+        # Start the halting gate at its prior and thought gate at neutral. Set after post_init.
+        self.core.reset_thought_gate()
         if self.halting is not None:
             self.halting.reset_prior()
         if self.mor_router is not None:
@@ -98,6 +117,12 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         }
         if self.mor_router is not None:
             parts["mor_router"] = n(self.mor_router)
+        if self.mode_cond is not None:
+            parts["mode_conditioning"] = n(self.mode_cond)
+        if self.memory_bank is not None:
+            parts["memory_bank"] = n(self.memory_bank)
+        if self.jepa is not None:
+            parts["jepa_controller"] = n(self.jepa)
         parts["total"] = n(self)
         return parts
 
@@ -106,15 +131,18 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         cache: Optional[InkyCache],
         num_loops: Optional[int],
         generator: Optional[torch.Generator] = None,
+        reasoning_mode: Optional[str] = None,
     ) -> int:
+        eff_mode = reasoning_mode if reasoning_mode is not None else getattr(self.config, "reasoning_mode", None)
+        resolved = resolve_reasoning_loops(eff_mode, num_loops)
         if cache is not None and cache.num_loops is not None:
-            if num_loops is not None and num_loops != cache.num_loops:
+            if resolved is not None and resolved != cache.num_loops:
                 raise ValueError(
-                    f"num_loops={num_loops} differs from the {cache.num_loops} loops this cache was filled with"
+                    f"num_loops={resolved} differs from the {cache.num_loops} loops this cache was filled with"
                 )
             return cache.num_loops
-        if num_loops is not None:
-            return int(num_loops)
+        if resolved is not None:
+            return int(resolved)
         if self.config.routing_mode == "mor":
             return self.config.max_recurrent_loops      # the router sets each token's depth; this is the cap
         if self.training:
@@ -326,6 +354,8 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         attention_mask: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
         generator: Optional[torch.Generator] = None,
+        reasoning_mode: Optional[str] = None,
+        style_mode: Optional[str] = None,
     ) -> InkyOutput:
         """Causal forward pass.
 
@@ -400,11 +430,25 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                 cache.pre[i] = _claim(present, cache)
             moe_aux = moe_aux + aux
 
-        loops = self._choose_loops(cache, num_loops, generator)
+        eff_reasoning = reasoning_mode if reasoning_mode is not None else getattr(self.config, "reasoning_mode", None)
+        eff_style = style_mode if style_mode is not None else getattr(self.config, "style_mode", None)
+        if eff_reasoning is not None and eff_reasoning not in REASONING_MODES:
+            raise ValueError(
+                f"reasoning_mode must be one of {tuple(REASONING_MODES)} or None, got {eff_reasoning!r}"
+            )
+        if eff_style is not None and eff_style not in STYLE_MODES:
+            raise ValueError(f"style_mode must be one of {STYLE_MODES} or None, got {eff_style!r}")
+        if self.mode_cond is not None:
+            h = self.mode_cond(h, reasoning_mode=eff_reasoning, style_mode=eff_style)
+
+        loops = self._choose_loops(cache, num_loops, generator, reasoning_mode=eff_reasoning)
         if cache is not None and cache.num_loops is None:
             cache.num_loops = loops
             cache.core = [None] * loops
             cache.prefix = [None] * loops
+
+        prior_steps = float(REASONING_MODES[eff_reasoning]) if eff_reasoning is not None else None
+        conv_weight = 1.0 if getattr(self.config, "convergence_halting", False) else 0.0
 
         mor = self.config.routing_mode == "mor"
         last_mode = self.config.routing_mode == "last"
@@ -430,12 +474,33 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
             h_loop, prev_mem = h, None
             lambdas: List[torch.Tensor] = []
             loop_states: List[torch.Tensor] = []
+            jepa_z_preds: List[torch.Tensor] = []
             core_aux = h.new_zeros((), dtype=torch.float32)   # summed over loops, averaged below
 
             for step in range(1, loops + 1):
                 idx = step - 1
+                jepa_ctrl = (
+                    self.jepa(h_loop, step=step, h_goal_source=h)
+                    if self.jepa is not None
+                    else None
+                )
+                if jepa_ctrl is not None:
+                    jepa_z_preds.append(jepa_ctrl.z_pred)
+                    expert_bias = jepa_ctrl.moe_bias
+                    fetch_gate = jepa_ctrl.fetch_gate
+                else:
+                    expert_bias = None
+                    fetch_gate = None
+
+                if self.memory_bank is not None:
+                    u_t, _ = self.memory_bank(
+                        h_loop, step=step, input_ids=input_ids, fetch_gate=fetch_gate
+                    )
+                else:
+                    u_t = h_loop
+
                 h_next, mem, new_prefix, presents, aux = self.core(
-                    h_loop,
+                    u_t,
                     step,
                     cos,
                     sin,
@@ -450,6 +515,7 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                     segment_ids=segment_ids,
                     valid_mask=valid_mask,
                     h0=h,                                  # the prelude output (used by loop_input_injection)
+                    expert_bias=expert_bias,
                 )
                 if cache is not None:
                     cache.core[idx] = [_claim(e, cache) for e in presents]
@@ -458,7 +524,15 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                 core_aux = core_aux + aux
 
                 if not last_mode:
-                    lambdas.append(self.halting(h_next))
+                    lam = self.halting(
+                        h_next,
+                        prev_h=h_loop,
+                        prior_steps=prior_steps,
+                        convergence_weight=conv_weight,
+                    )
+                    if jepa_ctrl is not None:
+                        lam = 0.5 * (lam + jepa_ctrl.p_halt.to(lam.dtype))
+                    lambdas.append(lam)
                     loop_states.append(h_next)
                 h_loop = h_next
             # The recurrent layers run once per loop. Averaging keeps the aux at the scale of one pass, so
@@ -532,7 +606,8 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         if labels is not None:
             ce, z = self._lm_loss(h, labels)
             step_ce = self._weighted_step_ce(loop_states, weights, labels, generator=generator)
-            prior = geometric_prior(loops, self.halting.prior_lambda, device=h.device)
+            eff_lam = (1.0 / prior_steps) if prior_steps is not None else self.halting.prior_lambda
+            prior = geometric_prior(loops, eff_lam, device=h.device)
             kl = pondernet_kl(weights, prior, mask=keep)
             loss = (
                 ce
@@ -548,6 +623,10 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                 "moe_aux": moe_aux.detach(),
                 "ponder_kl": kl.detach(),
             }
+            if self.jepa is not None and len(loop_states) >= 2:
+                j_loss = self.jepa.jepa_loss(jepa_z_preds[:-1], loop_states[1:])
+                loss = loss + float(getattr(self.config, "jepa_loss_coef", 0.1)) * j_loss
+                parts["jepa_loss"] = j_loss.detach()
             return InkyOutput(loss=loss, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops,
                               loss_parts=parts)
 
@@ -594,6 +673,8 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         num_loops: Optional[int] = None,
         return_hidden: bool = False,
         last_only: bool = False,
+        reasoning_mode: Optional[str] = None,
+        style_mode: Optional[str] = None,
     ) -> InkyOutput:
         """Inference with per-token early exit (batch size 1, no cache, no training).
 
@@ -615,6 +696,15 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
         """
         if input_ids.shape[0] != 1:
             raise ValueError("early exit needs batch size 1")
+        eff_reasoning = reasoning_mode if reasoning_mode is not None else getattr(self.config, "reasoning_mode", None)
+        eff_style = style_mode if style_mode is not None else getattr(self.config, "style_mode", None)
+        if eff_reasoning is not None and eff_reasoning not in REASONING_MODES:
+            raise ValueError(
+                f"reasoning_mode must be one of {tuple(REASONING_MODES)} or None, got {eff_reasoning!r}"
+            )
+        if eff_style is not None and eff_style not in STYLE_MODES:
+            raise ValueError(f"style_mode must be one of {STYLE_MODES} or None, got {eff_style!r}")
+        resolved_loops = resolve_reasoning_loops(eff_reasoning, num_loops)
         if self.config.routing_mode in ("mor", "last"):
             if halt_threshold is not None:
                 raise ValueError(
@@ -623,8 +713,10 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                        else "there is no halting gate, every token runs every loop")
                 )
             self.eval()
-            L = int(num_loops) if num_loops is not None else self.config.max_recurrent_loops
-            out = self.forward(input_ids, num_loops=L, return_hidden=True)
+            L = int(resolved_loops) if resolved_loops is not None else self.config.max_recurrent_loops
+            out = self.forward(
+                input_ids, num_loops=L, return_hidden=True, reasoning_mode=eff_reasoning, style_mode=eff_style
+            )
             common = dict(
                 mean_loops=out.mean_loops,
                 mean_exit_loop=out.mean_loops,
@@ -646,12 +738,16 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
             raise ValueError(f"sequence length {S} exceeds max_position_embeddings")
         self.eval()
         cfg = self.config
-        L = num_loops if num_loops is not None else cfg.max_recurrent_loops
+        L = int(resolved_loops) if resolved_loops is not None else cfg.max_recurrent_loops
+        prior_steps = float(REASONING_MODES[eff_reasoning]) if eff_reasoning is not None else None
+        conv_weight = 1.0 if getattr(cfg, "convergence_halting", False) else 0.0
 
         cos, sin = self.rope(0, S)
         h = self.embed_tokens(input_ids)
         for layer in self.pre_layers:
             h, _, _ = layer(h, cos, sin, None)
+        if self.mode_cond is not None:
+            h = self.mode_cond(h, reasoning_mode=eff_reasoning, style_mode=eff_style)
 
         h0 = h                                                       # the prelude output (loop_input_injection)
         state = h.clone()
@@ -680,7 +776,12 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                 break
             out_act, ssm_mem = self.core.forward_subset(state, n, cos, sin, active, stores, ssm_mem, h0=h0)
             computed += int(active.numel())
-            lam = self.halting(out_act).squeeze(0)                    # [K]
+            lam = self.halting(
+                out_act,
+                prev_h=state[:, active],
+                prior_steps=prior_steps,
+                convergence_weight=conv_weight,
+            ).squeeze(0)                    # [K]
             if n < L:
                 w = surv[active] * lam
                 surv_new = surv[active] * (1.0 - lam)
