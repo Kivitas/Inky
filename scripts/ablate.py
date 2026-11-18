@@ -155,6 +155,18 @@ VARIANTS: Dict[str, Union[Overrides, Callable[[Overrides], Overrides]]] = {
     "dense_unrolled": _dense_unrolled,                                    # non-recurrent dense transformer (12x1)
     "dense_param_match": {"use_moe": False, "dense_intermediate_size": 6336},  # dense FFN matched to MoE total params
     "mqa": {"attention_type": "gqa", "num_kv_heads": 1},                  # multi-query attention (single KV head)
+    "human_reasoning": {                                                  # 10-loop reasoning + style/thought gating
+        "max_recurrent_loops": 10,
+        "min_recurrent_loops": 2,
+        "ponder_prior_steps": 5.0,
+        "loop_input_injection": True,
+        "attention_gate": True,
+        "qk_norm": True,
+        "qk_norm_mode": "latent",
+        "convergence_halting": True,
+        "use_thought_gate": True,
+        "use_mode_conditioning": True,
+    },
 }
 
 

@@ -754,6 +754,81 @@ class SelectiveSSMMixer(nn.Module):
         return torch.cat(ys, dim=1), h
 
 
+class GatedDeltaNetMixer(nn.Module):
+    """Linear recurrent token mixer using the Gated Delta Rule (O(1) state memory regardless of context length).
+
+    Maintains a per-head matrix state S_t in R^{H x d_h x d_h} updated via the gated delta rule:
+        S_t = alpha_t * S_{t-1} + beta_t * (v_t - S_{t-1} k_t) k_t^T
+        y_t = S_t q_t
+    Paired with Multi-Latent Attention (at a 1:3 or 1:7 ratio), this gives constant O(1) state memory on
+    128k+ contexts while retaining associative key-value recall and document-boundary resets via segment_ids.
+    """
+
+    def __init__(self, config: InkyConfig):
+        super().__init__()
+        d = config.hidden_size
+        self.num_heads = config.num_attention_heads
+        self.head_dim = max(8, d // self.num_heads)
+        inner = self.num_heads * self.head_dim
+        self.q_proj = nn.Linear(d, inner, bias=False)
+        self.k_proj = nn.Linear(d, inner, bias=False)
+        self.v_proj = nn.Linear(d, inner, bias=False)
+        self.alpha_proj = nn.Linear(d, self.num_heads)
+        self.beta_proj = nn.Linear(d, self.num_heads)
+        self.out_gate = nn.Linear(d, inner, bias=False)
+        self.out_proj = nn.Linear(inner, d, bias=False)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        cos: Optional[torch.Tensor] = None,
+        sin: Optional[torch.Tensor] = None,
+        past: Optional[KVEntry] = None,
+        attn_mask: Optional[torch.Tensor] = None,
+        segment_ids: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, KVEntry]:
+        if attn_mask is not None:
+            raise NotImplementedError(
+                "GatedDeltaNetMixer does not support attn_mask; use segment_ids for packed documents."
+            )
+        B, S, _ = x.shape
+        H, dh = self.num_heads, self.head_dim
+        seg = None
+        if segment_ids is not None:
+            if past is not None:
+                raise ValueError("segment_ids is only supported for prefill (no past cache)")
+            if tuple(segment_ids.shape) != (B, S):
+                raise ValueError(f"segment_ids must have shape {(B, S)}, got {tuple(segment_ids.shape)}")
+            seg = segment_ids.to(x.device)
+
+        calc = torch.promote_types(x.dtype, torch.float32)
+        q = F.normalize(self.q_proj(x).view(B, S, H, dh).to(calc), dim=-1)
+        k = F.normalize(self.k_proj(x).view(B, S, H, dh).to(calc), dim=-1)
+        v = self.v_proj(x).view(B, S, H, dh).to(calc)
+        alpha = torch.sigmoid(self.alpha_proj(x).to(calc)).unsqueeze(-1).unsqueeze(-1)  # [B, S, H, 1, 1]
+        beta = torch.sigmoid(self.beta_proj(x).to(calc)).unsqueeze(-1)                  # [B, S, H, 1]
+
+        state = x.new_zeros(B, H, dh, dh, dtype=calc) if past is None else past[0].to(calc)
+        ys = []
+        for t in range(S):
+            if seg is not None and t > 0:
+                same_doc = (seg[:, t] == seg[:, t - 1]).view(B, 1, 1, 1)
+                state = torch.where(same_doc, state, torch.zeros_like(state))
+            kt = k[:, t]                                                        # [B, H, dh]
+            vt = v[:, t]                                                        # [B, H, dh]
+            qt = q[:, t]                                                        # [B, H, dh]
+            pred_v = torch.einsum("bhij,bhj->bhi", state, kt)                   # S_{t-1} k_t
+            delta = beta[:, t] * (vt - pred_v)                                  # [B, H, dh]
+            state = alpha[:, t] * state + torch.einsum("bhi,bhj->bhij", delta, kt)
+            yt = torch.einsum("bhij,bhj->bhi", state, qt)                       # [B, H, dh]
+            ys.append(yt)
+
+        y = torch.stack(ys, dim=1).reshape(B, S, H * dh).to(x.dtype)
+        y = F.silu(self.out_gate(x)) * y
+        present = (state, x.new_zeros(B, 1, 0))
+        return self.out_proj(y), present
+
+
 class SwiGLU(nn.Module):
     def __init__(self, hidden_size: int, intermediate_size: int):
         super().__init__()
@@ -776,7 +851,10 @@ class DenseFFN(SwiGLU):
         super().__init__(config.hidden_size, config.dense_ffn_size)
 
     def forward(  # type: ignore[override]
-        self, x: torch.Tensor, row_mask: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        row_mask: Optional[torch.Tensor] = None,
+        expert_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         return super().forward(x), x.new_zeros((), dtype=torch.float32)
 
@@ -808,16 +886,23 @@ class SharedExpertMoE(nn.Module):
         self.register_buffer("load_counts", torch.zeros(self.num_routed), persistent=False)
 
     def forward(
-        self, x: torch.Tensor, row_mask: Optional[torch.Tensor] = None
+        self,
+        x: torch.Tensor,
+        row_mask: Optional[torch.Tensor] = None,
+        expert_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """``row_mask`` (optional bool, one entry per token row; None = every row counts) is used by the
         masked reference path of MoR routing: rows where it is False are still computed (their outputs are
         discarded by the caller) but do not enter the expert load counts or the router z-loss, so the
-        auxiliary terms equal those of the gather path that never sees those rows."""
+        auxiliary terms equal those of the gather path that never sees those rows.
+        ``expert_bias`` (optional [B, S, E] or [N, E], e.g. JEPA executive control signal b_moe) steers
+        the MoE router toward specialized experts."""
         B, S, D = x.shape
         flat = x.reshape(-1, D)
 
         logits = self.router(flat)
+        if expert_bias is not None:
+            logits = logits + expert_bias.reshape(-1, self.num_routed).to(logits.dtype)
         scores = torch.sigmoid(logits.float())
         _, idx = torch.topk(scores + self.balance_bias, self.top_k, dim=-1)
         weights = scores.gather(-1, idx)
@@ -937,7 +1022,10 @@ class InkyBlock(nn.Module):
         self.input_norm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         # The token mixer is named `attn` in both cases so the block's forward is the same.
         if use_ssm:
-            self.attn = SelectiveSSMMixer(config)
+            if getattr(config, "linear_mixer_type", "ssm") == "gated_deltanet":
+                self.attn = GatedDeltaNetMixer(config)
+            else:
+                self.attn = SelectiveSSMMixer(config)
         elif config.attention_type == "gqa":
             self.attn = GroupedQueryAttention(config)
         else:
@@ -951,13 +1039,14 @@ class InkyBlock(nn.Module):
             return F.dropout(branch, p=self.residual_dropout, training=True)
         return branch
 
-    def _forward(self, x, cos, sin, past, attn_mask=None, segment_ids=None, window=None):
-        # The SSM mixer has no window (its state already decays); only the attention variants take one.
-        extra = {} if window is None or isinstance(self.attn, SelectiveSSMMixer) else {"window": window}
+    def _forward(self, x, cos, sin, past, attn_mask=None, segment_ids=None, window=None, expert_bias=None):
+        # Linear recurrent mixers have no window (their state already decays); only attention variants take one.
+        is_linear = isinstance(self.attn, (SelectiveSSMMixer, GatedDeltaNetMixer))
+        extra = {} if window is None or is_linear else {"window": window}
         attn_out, present = self.attn(self.input_norm(x), cos, sin, past,
                                       attn_mask=attn_mask, segment_ids=segment_ids, **extra)
         x = x + self._residual_drop(attn_out) * self.residual_scale
-        mlp_out, aux = self.mlp(self.post_norm(x))
+        mlp_out, aux = self.mlp(self.post_norm(x), expert_bias=expert_bias)
         x = x + self._residual_drop(mlp_out) * self.residual_scale
         return x, present, aux
 
@@ -970,18 +1059,19 @@ class InkyBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         segment_ids: Optional[torch.Tensor] = None,
         window: Optional[int] = None,
+        expert_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, KVEntry, torch.Tensor]:
         """``attn_mask``, ``segment_ids`` and ``window`` are passed to the token mixer (see
         MultiLatentAttention.forward)."""
         if self.use_checkpoint and self.training and past is None and torch.is_grad_enabled():
             # Recompute activations in backward. Only used for full-sequence training, not decoding.
             def run(hs):
-                out, _, aux = self._forward(hs, cos, sin, None, attn_mask, segment_ids, window)
+                out, _, aux = self._forward(hs, cos, sin, None, attn_mask, segment_ids, window, expert_bias)
                 return out, aux
 
             out, aux = torch.utils.checkpoint.checkpoint(run, x, use_reentrant=False)
             return out, None, aux
-        return self._forward(x, cos, sin, past, attn_mask, segment_ids, window)
+        return self._forward(x, cos, sin, past, attn_mask, segment_ids, window, expert_bias)
 
     def forward_subset(
         self,
@@ -1036,15 +1126,56 @@ class InkyBlock(nn.Module):
 
 
 class LoopStepModulation(nn.Module):
-    """FiLM scale and shift that depend on the loop index. Starts as the identity."""
+    """FiLM scale and shift that depend on the loop index. Starts as the identity.
+
+    For loop indices beyond ``max_loops`` (e.g. ``reasoning_mode='max'`` running 10 loops on a 6-loop
+    config), clamps to the last learned step embedding and damps the modulation smoothly by
+    ``max_loops / step``.
+    """
 
     def __init__(self, hidden_size: int, max_loops: int):
         super().__init__()
+        self.max_loops = int(max_loops)
         self.step_embedding = nn.Parameter(torch.zeros(max_loops + 1, 2 * hidden_size))
 
     def forward(self, h: torch.Tensor, step: int) -> torch.Tensor:
-        scale, shift = self.step_embedding[step].chunk(2, dim=-1)
+        idx = min(max(int(step), 0), self.step_embedding.shape[0] - 1)
+        scale, shift = self.step_embedding[idx].chunk(2, dim=-1)
+        if step > self.max_loops and self.max_loops > 0:
+            damp = float(self.max_loops) / float(step)
+            scale = scale * damp
+            shift = shift * damp
         return h * (1.0 + scale) + shift
+
+
+class ModeConditioner(nn.Module):
+    """FiLM scale and shift conditioned on reasoning_mode ('low', 'high', 'max') and style_mode ('formal', 'informal').
+
+    Starts at 0 (identity) so the model starts identical to an unconditioned baseline and can learn
+    distinct circuit modulations for low/high/max thinking depth and formal/informal human register.
+    """
+
+    _REASONING_IDX = {"low": 0, "high": 1, "max": 2}
+    _STYLE_IDX = {"formal": 0, "informal": 1}
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.reasoning_embed = nn.Parameter(torch.zeros(3, 2 * hidden_size))
+        self.style_embed = nn.Parameter(torch.zeros(2, 2 * hidden_size))
+
+    def forward(
+        self,
+        h: torch.Tensor,
+        reasoning_mode: Optional[str] = None,
+        style_mode: Optional[str] = None,
+    ) -> torch.Tensor:
+        if reasoning_mode is not None and reasoning_mode in self._REASONING_IDX:
+            r_scale, r_shift = self.reasoning_embed[self._REASONING_IDX[reasoning_mode]].chunk(2, dim=-1)
+            h = h * (1.0 + r_scale.to(h.dtype)) + r_shift.to(h.dtype)
+        if style_mode is not None and style_mode in self._STYLE_IDX:
+            s_scale, s_shift = self.style_embed[self._STYLE_IDX[style_mode]].chunk(2, dim=-1)
+            h = h * (1.0 + s_scale.to(h.dtype)) + s_shift.to(h.dtype)
+        return h
 
 
 class StateSpaceMemoryHighway(nn.Module):
@@ -1237,13 +1368,42 @@ class RecurrentCore(nn.Module):
             gain_init=getattr(config, "highway_gain_init", 0.0),
         ) if config.use_highway else None
         self.damped_beta = nn.Parameter(torch.zeros(config.hidden_size))
+        self.max_loops = int(config.max_recurrent_loops)
+        self.thought_gate = (
+            nn.Linear(2 * config.hidden_size, config.hidden_size)
+            if getattr(config, "use_thought_gate", False)
+            else None
+        )
         self.loop_dropout_prob = config.loop_dropout_prob
         # loop_input_injection: per-channel gain on the prelude output added to every loop's block input. It
         # starts at 0, so the model starts identical to one without it.
         self.inject_gain = nn.Parameter(torch.zeros(config.hidden_size)) if config.loop_input_injection else None
+        # Additive loop-step embedding e_t in R^{d_model} for h_{t+1} = f_{theta_C}(u_t + e_t, KV_Cache^(t))
+        self.additive_step_embed = (
+            nn.Parameter(torch.zeros(config.max_recurrent_loops + 1, config.hidden_size))
+            if getattr(config, "use_additive_step_embedding", False)
+            else None
+        )
         # Local attention (config.local_window): which 1-based loops use the window.
         self.local_window = config.local_window
         self.local_loops = frozenset(config.local_window_loops) if config.local_window is not None else frozenset()
+        self.reset_thought_gate()
+
+    def reset_thought_gate(self) -> None:
+        """Zero-initialise the thought gate so sigmoid(0) = 0.5 and 2 * gate = 1.0 at startup."""
+        if self.thought_gate is not None:
+            nn.init.zeros_(self.thought_gate.weight)
+            nn.init.zeros_(self.thought_gate.bias)
+
+    def _mix_update(self, h_in: torch.Tensor, h_new: torch.Tensor, step: int) -> torch.Tensor:
+        """Damped residual update across loops, with optional per-token thought gate and deep-loop damping."""
+        beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(*([1] * (h_in.ndim - 1)), -1).to(h_in.dtype)
+        if step > self.max_loops and self.max_loops > 0:
+            beta = beta * (float(self.max_loops) / float(step))
+        if self.thought_gate is not None:
+            gate = torch.sigmoid(self.thought_gate(torch.cat([h_in, h_new], dim=-1)))
+            beta = beta * (2.0 * gate)
+        return (1.0 - beta) * h_in + beta * h_new
 
     def _inject(self, x: torch.Tensor, h0: Optional[torch.Tensor]) -> torch.Tensor:
         """``x + inject_gain * h0`` when injection is on (``h0`` is the prelude output), else ``x``."""
@@ -1267,6 +1427,7 @@ class RecurrentCore(nn.Module):
         segment_ids: Optional[torch.Tensor] = None,
         valid_mask: Optional[torch.Tensor] = None,
         h0: Optional[torch.Tensor] = None,
+        expert_bias: Optional[torch.Tensor] = None,
     ) -> Tuple[
         torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], List[Optional[KVEntry]], torch.Tensor
     ]:
@@ -1279,6 +1440,12 @@ class RecurrentCore(nn.Module):
         ``config.local_window_loops`` attend to the last ``config.local_window`` positions only."""
         h_in = h
         h = self._inject(h, h0)
+        if self.additive_step_embed is not None:
+            idx = min(max(int(step), 0), self.additive_step_embed.shape[0] - 1)
+            e_t = self.additive_step_embed[idx].to(h.dtype)
+            if step > self.max_loops and self.max_loops > 0:
+                e_t = e_t * (float(self.max_loops) / float(step))
+            h = h + e_t
         window = self.local_window if step in self.local_loops else None
         if self.step_mod is not None:
             h = self.step_mod(h, step)
@@ -1300,13 +1467,14 @@ class RecurrentCore(nn.Module):
                 presents.append(None)
                 continue
             past_i = past[i] if past is not None else None
-            h, present, layer_aux = layer(h, cos, sin, past_i, attn_mask=attn_mask, segment_ids=segment_ids,
-                                          window=window)
+            h, present, layer_aux = layer(
+                h, cos, sin, past_i, attn_mask=attn_mask, segment_ids=segment_ids,
+                window=window, expert_bias=expert_bias,
+            )
             presents.append(present)
             aux = aux + layer_aux
 
-        beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(1, 1, -1)
-        out = (1.0 - beta) * h_in + beta * h
+        out = self._mix_update(h_in, h, step)
         return out, mem, new_prefix, presents, aux
 
     def forward_mor(
@@ -1363,7 +1531,6 @@ class RecurrentCore(nn.Module):
         if attn_mask is not None or segment_ids is not None:
             extra = MultiLatentAttention._extra_mask(B, S, past_len, past_len > 0, attn_mask, segment_ids, device)
         stores: List[Optional[Tuple[torch.Tensor, torch.Tensor]]] = [None] * n_layers
-        beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(1, -1)
         all_rows = torch.arange(B * S, device=device)
         prev_mem = None
         aux_sum = h.new_zeros((), dtype=torch.float32)
@@ -1438,7 +1605,7 @@ class RecurrentCore(nn.Module):
             aux_sum = aux_sum + loop_aux
             loops_run += 1
 
-            core_out = (1.0 - beta) * h_in + beta * x_rows
+            core_out = self._mix_update(h_in, x_rows, n)
             if gate_flat is not None:
                 g = gate_flat[loop_rows].unsqueeze(-1).to(core_out.dtype)
                 core_out = h_in + g * (core_out - h_in)
@@ -1478,8 +1645,7 @@ class RecurrentCore(nn.Module):
         h_in_act = state[:, active]
         for j, layer in enumerate(self.layers):
             x_act = layer.forward_subset(x_act, active, cos, sin, stores[j])
-        beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(1, 1, -1)
-        return (1.0 - beta) * h_in_act + beta * x_act, mem
+        return self._mix_update(h_in_act, x_act, step), mem
 
 
 class PonderHalting(nn.Module):
@@ -1501,9 +1667,31 @@ class PonderHalting(nn.Module):
         p = self.prior_lambda
         nn.init.constant_(self.gate.bias, math.log(p / (1.0 - p)))
 
-    def forward(self, h: torch.Tensor) -> torch.Tensor:
-        """h [B, S, D] -> lambda [B, S] in (0, 1)."""
-        return torch.sigmoid(self.gate(h).float()).squeeze(-1)
+    def forward(
+        self,
+        h: torch.Tensor,
+        prev_h: Optional[torch.Tensor] = None,
+        prior_steps: Optional[float] = None,
+        convergence_weight: float = 0.0,
+    ) -> torch.Tensor:
+        """h [B, S, D] -> lambda [B, S] in (0, 1).
+
+        When ``prior_steps`` is given (e.g. 2 for 'low', 5 for 'high', 10 for 'max'), shifts the
+        halting logit so the effective geometric prior matches ``1 / prior_steps``.
+        When ``prev_h`` and ``convergence_weight > 0`` are given, modulates halting by the per-token
+        relative state velocity ||h - prev_h|| / ||h|| so unconverged tokens continue pondering.
+        """
+        logit = self.gate(h).float().squeeze(-1)
+        if prior_steps is not None and prior_steps >= 1.0:
+            p_target = min(max(1.0 / float(prior_steps), 1e-4), 1.0 - 1e-4)
+            p_base = min(max(self.prior_lambda, 1e-4), 1.0 - 1e-4)
+            logit = logit + (math.log(p_target / (1.0 - p_target)) - math.log(p_base / (1.0 - p_base)))
+        if prev_h is not None and convergence_weight > 0.0:
+            delta = (h.float() - prev_h.float()).pow(2).mean(dim=-1).sqrt()
+            norm = h.float().pow(2).mean(dim=-1).add(1e-6).sqrt()
+            rel_vel = (delta / norm).clamp(0.0, 2.0)
+            logit = logit - float(convergence_weight) * (rel_vel - 0.5)
+        return torch.sigmoid(logit)
 
 
 def geometric_halting_weights(lambdas: Sequence[torch.Tensor]) -> torch.Tensor:

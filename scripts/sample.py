@@ -25,8 +25,8 @@ sys.path.insert(0, str(ROOT))
 
 import torch  # noqa: E402
 
-from inky import InkyConfig, InkyModel, build_bad_word_ids  # noqa: E402
-from inky.style import STOCK_PHRASES  # noqa: E402
+from inky import REASONING_MODES, STYLE_MODES, InkyConfig, InkyModel, build_bad_word_ids  # noqa: E402
+from inky.style import STOCK_PHRASES, get_style_profile  # noqa: E402
 
 TINY_VOCAB = 512
 TINY_KWARGS = dict(
@@ -116,10 +116,11 @@ def build_bad_words(codec, phrases: Optional[str], use_default: bool) -> Optiona
 
 
 def generate_text(model: InkyModel, codec, prompt: str, *, max_new_tokens: int = 64, temperature: float = 0.8,
-                  top_p: float = 0.95, top_k: int = 50, repetition_penalty: float = 1.1,
+                  top_p: float = 0.95, top_k: int = 50, min_p: float = 0.0, repetition_penalty: float = 1.1,
                   no_repeat_ngram_size: int = 4, repeat_window: Optional[int] = None,
                   bad_word_ids: Optional[List[List[int]]] = None, reduce_scratch_blocks: bool = False,
-                  num_loops: Optional[int] = None, greedy: bool = False, seed: Optional[int] = None) -> str:
+                  num_loops: Optional[int] = None, reasoning_mode: Optional[str] = None,
+                  style_mode: Optional[str] = None, greedy: bool = False, seed: Optional[int] = None) -> str:
     """Encode ``prompt``, sample with the given controls, and decode only the new tokens."""
     ids = codec.encode(prompt)
     if not ids:
@@ -138,10 +139,11 @@ def generate_text(model: InkyModel, codec, prompt: str, *, max_new_tokens: int =
     device = next(model.parameters()).device
     prompt_ids = torch.tensor([ids], dtype=torch.long, device=device)
     out = model.generate(prompt_ids, max_new_tokens=max_new_tokens, do_sample=not greedy, temperature=temperature,
-                         top_k=top_k, top_p=top_p, repetition_penalty=repetition_penalty,
-                         num_loops=num_loops, no_repeat_ngram_size=no_repeat_ngram_size,
-                         repeat_window=repeat_window, bad_word_ids=bad_word_ids,
-                         reduce_scratch_blocks=reduce_scratch_blocks)
+                         top_k=top_k, top_p=top_p, min_p=min_p, repetition_penalty=repetition_penalty,
+                         num_loops=num_loops, reasoning_mode=reasoning_mode, style_mode=style_mode,
+                         no_repeat_ngram_size=no_repeat_ngram_size, repeat_window=repeat_window,
+                         bad_word_ids=bad_word_ids, reduce_scratch_blocks=reduce_scratch_blocks,
+                         encode=codec.encode)
     return codec.decode(out[0, len(ids):].tolist())
 
 
@@ -152,20 +154,36 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     parser.add_argument("--dry-run", action="store_true", help="char-level encoder and a fresh tiny model; no files")
     parser.add_argument("--prompt", default="Once upon a time")
     parser.add_argument("--max-new-tokens", type=int, default=64)
-    parser.add_argument("--temperature", type=float, default=0.8)
-    parser.add_argument("--top-p", type=float, default=0.95)
-    parser.add_argument("--top-k", type=int, default=50)
-    parser.add_argument("--repetition-penalty", type=float, default=1.1)
+    parser.add_argument("--temperature", type=float, default=None)
+    parser.add_argument("--top-p", type=float, default=None)
+    parser.add_argument("--top-k", type=int, default=None)
+    parser.add_argument("--min-p", type=float, default=0.0, help="min-p threshold relative to top token probability")
+    parser.add_argument("--repetition-penalty", type=float, default=None)
     parser.add_argument("--no-repeat-ngram-size", type=int, default=4, help="0 turns it off; 1 is rejected")
     parser.add_argument("--repeat-window", type=int, default=None, help="limit repetition rules to the last N tokens")
     parser.add_argument("--bad-words", default=None, help="comma-separated words or phrases to block")
     parser.add_argument("--default-bad-words", action="store_true", help="also block inky.style.STOCK_PHRASES")
     parser.add_argument("--reduce-scratch-blocks", action="store_true", help="PENCIL-style scratch reduction")
     parser.add_argument("--num-loops", type=int, default=None, help="recurrent loops (default: model maximum)")
+    parser.add_argument("--reasoning-mode", choices=list(REASONING_MODES), default=None,
+                        help="thinking depth preset: low (2 loops), high (5 loops), or max (10 loops)")
+    parser.add_argument("--style-mode", choices=list(STYLE_MODES), default=None,
+                        help="prose register mode: formal or informal")
     parser.add_argument("--greedy", action="store_true", help="argmax decoding instead of sampling")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
     args = parser.parse_args(argv)
+    prof = get_style_profile(args.style_mode) if args.style_mode is not None else {}
+    if args.temperature is None:
+        args.temperature = float(prof.get("temperature", 0.8))
+    if args.top_p is None:
+        args.top_p = float(prof.get("top_p", 0.95))
+    if args.top_k is None:
+        args.top_k = int(prof.get("top_k", 50))
+    if args.repetition_penalty is None:
+        args.repetition_penalty = float(prof.get("repetition_penalty", 1.1))
+    if args.min_p == 0.0 and "min_p" in prof:
+        args.min_p = float(prof["min_p"])
     if not args.dry_run and not (args.checkpoint and args.tokenizer_path):
         parser.error("give --checkpoint and --tokenizer-path, or use --dry-run")
     if args.max_new_tokens < 1:
@@ -187,10 +205,11 @@ def main(argv: Optional[List[str]] = None) -> str:
     try:
         text = generate_text(
             model, codec, args.prompt, max_new_tokens=args.max_new_tokens, temperature=args.temperature,
-            top_p=args.top_p, top_k=args.top_k, repetition_penalty=args.repetition_penalty,
+            top_p=args.top_p, top_k=args.top_k, min_p=args.min_p, repetition_penalty=args.repetition_penalty,
             no_repeat_ngram_size=args.no_repeat_ngram_size, repeat_window=args.repeat_window,
             bad_word_ids=build_bad_words(codec, args.bad_words, args.default_bad_words),
-            reduce_scratch_blocks=args.reduce_scratch_blocks, num_loops=args.num_loops, greedy=args.greedy,
+            reduce_scratch_blocks=args.reduce_scratch_blocks, num_loops=args.num_loops,
+            reasoning_mode=args.reasoning_mode, style_mode=args.style_mode, greedy=args.greedy,
             seed=args.seed)
     except ValueError as exc:     # a control rejected by generate(), for example no_repeat_ngram_size=1
         raise SystemExit(f"error: {exc}") from exc

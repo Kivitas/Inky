@@ -1,15 +1,16 @@
 """Text generation for ``InkyModel``: sampling with the prose controls, scratch reduction, and the helpers."""
 
-from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
+import math
+from typing import Callable, Dict, Iterable, List, Optional, Sequence, Set, Tuple, Union
 
 import torch
 
 from .cache import InkyCache, InkyOutput
-from .config import InkyConfig
+from .config import STYLE_MODES, InkyConfig, resolve_reasoning_loops, resolve_reasoning_scratch_budget
 from .data import DEFAULT_RESERVED_IDS
 from .metrics import print_report, text_report
 from .scratch import DEFAULT_MAX_NOTE_TOKENS, ScratchTracker
-from .style import NgramBanIndex, banned_by_bad_words
+from .style import NgramBanIndex, banned_by_bad_words, build_style_controls
 
 # Default for ``eos_token_id`` in generate / self_speculative_generate: use ``config.eos_token_id``.
 # An explicit None means "never stop at EOS"; an int means "stop at this id".
@@ -42,6 +43,10 @@ class InkyGenerationMixin:
         count_prose_only: bool = False,
         scratch_max_note_tokens: Optional[int] = DEFAULT_MAX_NOTE_TOKENS,
         blocked_token_ids: Optional[Sequence[int]] = None,
+        reasoning_mode: Optional[str] = None,
+        style_mode: Optional[str] = None,
+        min_p: float = 0.0,
+        encode: Optional[Callable[[str], Sequence[int]]] = None,
     ):
         """Sample a continuation.
 
@@ -92,6 +97,32 @@ class InkyGenerationMixin:
             raise ValueError(f"scratch_max_note_tokens must be None or >= 0, got {scratch_max_note_tokens}")
         if stock_word_penalty < 0:
             raise ValueError(f"stock_word_penalty must be >= 0, got {stock_word_penalty}")
+        if not 0.0 <= float(min_p) <= 1.0:
+            raise ValueError(f"min_p must be in [0, 1], got {min_p}")
+        eff_reasoning = reasoning_mode if reasoning_mode is not None else getattr(cfg, "reasoning_mode", None)
+        eff_style = style_mode if style_mode is not None else getattr(cfg, "style_mode", None)
+        resolved_loops = resolve_reasoning_loops(eff_reasoning, num_loops)
+        if eff_style is not None:
+            if eff_style not in STYLE_MODES:
+                raise ValueError(f"style_mode must be one of {STYLE_MODES} or None, got {eff_style!r}")
+            style_ctrl = build_style_controls(eff_style, encode=encode)
+            if min_p == 0.0:
+                min_p = float(style_ctrl["min_p"])
+            if style_ctrl["bad_word_ids"]:
+                valid_bads = [
+                    s for s in style_ctrl["bad_word_ids"] if all(0 <= int(t) < cfg.vocab_size for t in s)
+                ]
+                bad_word_ids = list(bad_word_ids or []) + [s for s in valid_bads if s not in (bad_word_ids or [])]
+            if style_ctrl["soft_penalty_ids"]:
+                valid_soft = [int(t) for t in style_ctrl["soft_penalty_ids"] if 0 <= int(t) < cfg.vocab_size]
+                if valid_soft:
+                    soft_penalty_ids = list(soft_penalty_ids or []) + valid_soft
+                    if stock_word_penalty == 0.0:
+                        stock_word_penalty = float(style_ctrl["stock_word_penalty"])
+        if eff_reasoning is not None:
+            scratch_max_note_tokens = resolve_reasoning_scratch_budget(
+                eff_reasoning, scratch_max_note_tokens, DEFAULT_MAX_NOTE_TOKENS
+            )
         penalty_mask = None
         if stock_word_penalty > 0:
             ids_list = sorted({int(t) for t in (soft_penalty_ids or ())})
@@ -121,7 +152,12 @@ class InkyGenerationMixin:
         # Before each open marker: the cache state and the logits that predicted the marker's position.
         # Keyed by the marker's index in seq. Used to roll back the cache when its block closes.
         snapshots: Dict[int, Tuple[dict, InkyOutput]] = {}
-        out = self(seq, past=cache, num_loops=num_loops, last_only=True)
+        fwd_kw = {}
+        if eff_reasoning is not None:
+            fwd_kw["reasoning_mode"] = eff_reasoning
+        if eff_style is not None:
+            fwd_kw["style_mode"] = eff_style
+        out = self(seq, past=cache, num_loops=resolved_loops, last_only=True, **fwd_kw)
         steps = 0
         finished = torch.zeros(input_ids.shape[0], dtype=torch.bool, device=input_ids.device)
         pad_id = cfg.pad_token_id if cfg.pad_token_id is not None else eos_token_id
@@ -148,7 +184,11 @@ class InkyGenerationMixin:
                     ban_open_next = False
                 logits = _mask_ids(logits, banned)
             if do_sample:
-                next_tok = _sample(logits, temperature, top_k, top_p)
+                next_tok = (
+                    _sample(logits, temperature, top_k, top_p, min_p)
+                    if min_p > 0.0
+                    else _sample(logits, temperature, top_k, top_p)
+                )
             else:
                 next_tok = logits.argmax(dim=-1)
             if eos_token_id is not None and finished.any():
@@ -181,7 +221,7 @@ class InkyGenerationMixin:
                     if ngram is not None:
                         ngram[0] = _make_ngram_index(no_repeat_ngram_size, scratch.out, repeat_window)
                     if seq.shape[1] > cut:
-                        out = self(seq[:, cut:], past=cache, last_only=True)
+                        out = self(seq[:, cut:], past=cache, last_only=True, **fwd_kw)
                     else:
                         out = out_before
                         # A zero-answer block (OPEN -> SEP -> CLOSE) restores the logits that just
@@ -189,7 +229,7 @@ class InkyGenerationMixin:
                         ban_open_next = True
                     continue
                 snapshots = {k: v for k, v in snapshots.items() if k in scratch.open_positions()}
-            out = self(next_tok[:, None], past=cache, last_only=True)
+            out = self(next_tok[:, None], past=cache, last_only=True, **fwd_kw)
         if not (report or display):
             return seq
         rep = text_report(seq[0, prompt_len:], bad_word_ids)
@@ -348,24 +388,29 @@ def _apply_repetition_penalty(
 
 
 def _candidate_distribution(
-    logits: torch.Tensor, temperature: float, top_k: int, top_p: float
+    logits: torch.Tensor, temperature: float, top_k: int, top_p: float, min_p: float = 0.0
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Kept candidates and their probabilities: ``(indices [B, K], probs [B, K])``.
 
-    With ``top_k`` set, only the k largest logits are read (torch.topk), and top-p works inside
+    With ``top_k`` set, only the k largest logits are read (torch.topk), and top-p / min-p work inside
     those k values, so the full vocabulary is never sorted (GEN-05). Without ``top_k`` and with
-    ``top_p < 1``, the full vocabulary is sorted as before. Ties at the k-th logit keep exactly k
-    tokens here, where the old mask kept every tie.
+    ``top_p < 1`` or ``min_p > 0``, the full vocabulary is sorted as before. Ties at the k-th logit
+    keep exactly k tokens here, where the old mask kept every tie.
     """
     logits = logits / max(temperature, 1e-5)
     V = logits.size(-1)
     if top_k and 0 < top_k < V:
         vals, idx = torch.topk(logits, top_k, dim=-1)          # sorted, largest first
-    elif top_p < 1.0:
+    elif top_p < 1.0 or min_p > 0.0:
         vals, idx = torch.sort(logits, descending=True, dim=-1)
     else:
         vals = logits
         idx = torch.arange(V, device=logits.device).unsqueeze(0).expand(logits.shape[0], V)
+    if min_p > 0.0:
+        min_logit = vals[..., :1] + math.log(min(max(float(min_p), 1e-8), 1.0))
+        remove_min = vals < min_logit
+        remove_min[..., 0] = False
+        vals = vals.masked_fill(remove_min, float("-inf"))
     if top_p < 1.0:
         cum = torch.softmax(vals, dim=-1).cumsum(dim=-1)
         remove = cum > top_p
@@ -375,7 +420,9 @@ def _candidate_distribution(
     return idx, torch.softmax(vals, dim=-1)
 
 
-def _sample(logits: torch.Tensor, temperature: float, top_k: int, top_p: float) -> torch.Tensor:
-    idx, probs = _candidate_distribution(logits, temperature, top_k, top_p)
+def _sample(
+    logits: torch.Tensor, temperature: float, top_k: int, top_p: float, min_p: float = 0.0
+) -> torch.Tensor:
+    idx, probs = _candidate_distribution(logits, temperature, top_k, top_p, min_p=min_p)
     pick = torch.multinomial(probs, num_samples=1)
     return idx.gather(-1, pick).squeeze(-1)
