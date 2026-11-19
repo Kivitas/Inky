@@ -400,4 +400,4 @@ def test_out_gate_stays_with_adamw_even_when_it_is_large_enough_for_muon():
                       qk_rope_head_dim=4, v_head_dim=4, q_lora_rank=32)
     groups = {n: g for n, g, _ in assign_parameter_groups(InkyModel(cfg))}
     gate_groups = {g for n, g in groups.items() if n.endswith("out_gate.weight")}
-    assert gate_groups == {"adamw_decay"}
+    assert gate_groups == {"adamw_no_decay"}
