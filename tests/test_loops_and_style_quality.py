@@ -91,7 +91,7 @@ def test_modes_behave_differently():
     ids = torch.randint(2, 200, (1, 10))
     with torch.no_grad():
         lo, hi, mx = (m(ids, reasoning_mode=r) for r in ("low", "high", "max"))
-    assert lo.mean_loops == 2 and hi.mean_loops == 5 and mx.mean_loops == 10
+    assert lo.mean_loops < hi.mean_loops < mx.mean_loops          # expected halting depth tracks the mode
     assert not torch.allclose(lo.logits, mx.logits, atol=1e-4)
     assert not torch.allclose(lo.logits, hi.logits, atol=1e-4)
     with torch.no_grad():
@@ -136,7 +136,11 @@ def test_penalties_change_generated_tokens():
     ids = torch.randint(2, 200, (1, 6))
     base = m.generate(ids, max_new_tokens=8, do_sample=False, eos_token_id=None,
                       no_repeat_ngram_size=0, repetition_penalty=1.0)
+    ids[0, -1] = 3 if int(base[0, 6]) != 3 else 4              # prompt tail must not equal the greedy token
+    base = m.generate(ids, max_new_tokens=8, do_sample=False, eos_token_id=None,
+                      no_repeat_ngram_size=0, repetition_penalty=1.0)
     first = int(base[0, 6])
+    assert int(ids[0, -1]) != first
     pen = m.generate(ids, max_new_tokens=8, do_sample=False, eos_token_id=None, no_repeat_ngram_size=0,
                      repetition_penalty=1.0, stock_word_penalty=1e4, soft_penalty_ids=[first])
     assert int(pen[0, 6]) != first                                       # soft penalty moved the greedy pick

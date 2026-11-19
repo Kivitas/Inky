@@ -120,7 +120,8 @@ def generate_text(model: InkyModel, codec, prompt: str, *, max_new_tokens: int =
                   no_repeat_ngram_size: int = 4, repeat_window: Optional[int] = None,
                   bad_word_ids: Optional[List[List[int]]] = None, reduce_scratch_blocks: bool = False,
                   num_loops: Optional[int] = None, reasoning_mode: Optional[str] = None,
-                  style_mode: Optional[str] = None, greedy: bool = False, seed: Optional[int] = None) -> str:
+                  style_mode: Optional[str] = None, greedy: bool = False, seed: Optional[int] = None,
+                  stock_word_penalty: Optional[float] = None) -> str:
     """Encode ``prompt``, sample with the given controls, and decode only the new tokens."""
     ids = codec.encode(prompt)
     if not ids:
@@ -143,7 +144,9 @@ def generate_text(model: InkyModel, codec, prompt: str, *, max_new_tokens: int =
                          num_loops=num_loops, reasoning_mode=reasoning_mode, style_mode=style_mode,
                          no_repeat_ngram_size=no_repeat_ngram_size, repeat_window=repeat_window,
                          bad_word_ids=bad_word_ids, reduce_scratch_blocks=reduce_scratch_blocks,
-                         encode=codec.encode)
+                         encode=codec.encode,
+                         style_overrides=({"stock_word_penalty": stock_word_penalty}
+                                          if stock_word_penalty is not None and style_mode is not None else None))
     return codec.decode(out[0, len(ids):].tolist())
 
 
@@ -169,6 +172,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                         help="thinking depth preset: low (2 loops), high (5 loops), or max (10 loops)")
     parser.add_argument("--style-mode", choices=list(STYLE_MODES), default=None,
                         help="prose register mode: formal or informal")
+    parser.add_argument("--stock-word-penalty", type=float, default=None,
+                        help="override the style profile's soft logit penalty on stock/out-of-register words")
     parser.add_argument("--greedy", action="store_true", help="argmax decoding instead of sampling")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--device", default="cpu")
@@ -186,6 +191,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         args.min_p = float(prof["min_p"])
     if not args.dry_run and not (args.checkpoint and args.tokenizer_path):
         parser.error("give --checkpoint and --tokenizer-path, or use --dry-run")
+    if args.stock_word_penalty is not None and args.stock_word_penalty < 0:
+        parser.error("--stock-word-penalty must be >= 0")
     if args.max_new_tokens < 1:
         parser.error("--max-new-tokens must be >= 1")
     return args
@@ -210,7 +217,7 @@ def main(argv: Optional[List[str]] = None) -> str:
             bad_word_ids=build_bad_words(codec, args.bad_words, args.default_bad_words),
             reduce_scratch_blocks=args.reduce_scratch_blocks, num_loops=args.num_loops,
             reasoning_mode=args.reasoning_mode, style_mode=args.style_mode, greedy=args.greedy,
-            seed=args.seed)
+            seed=args.seed, stock_word_penalty=args.stock_word_penalty)
     except ValueError as exc:     # a control rejected by generate(), for example no_repeat_ngram_size=1
         raise SystemExit(f"error: {exc}") from exc
     out = args.prompt + text

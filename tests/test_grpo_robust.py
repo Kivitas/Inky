@@ -71,18 +71,20 @@ def test_ref_modes_agree_and_no_grad():
 
 def test_toy_policy_shifts_toward_preferred_with_bounded_kl():
     m = _model()
-    tr = ContinualGRPOTrainer(m, lr=3e-3, grpo_epochs=2, kl_beta=0.1, ref_ema_decay=None, max_grad_norm=1.0)
+    tr = ContinualGRPOTrainer(
+        m, lr=3e-3, grpo_epochs=1, kl_beta=0.1, ref_ema_decay=None, max_grad_norm=1.0, ref_mode="params"
+    )
     prompt = torch.tensor([[5, 12]])
     good, bad = [10, 20, 30], [90, 91, 92]
     g0, b0 = _lp(m, prompt, good), _lp(m, prompt, bad)
     kl = 0.0
-    for _ in range(25):
+    for _ in range(8):
         st = tr.step_on_group(prompt, [good, bad], explicit_rewards=[1.0, -1.0], record_preferences=False, reasoning_mode="low")
         kl = st["kl"]
     g1, b1 = _lp(m, prompt, good), _lp(m, prompt, bad)
-    assert (g1 - g0) > 0.5 and (g1 - b1) > (g0 - b0) + 1.0
+    assert (g1 - g0) > 1.0 and (g1 - b1) > (g0 - b0) + 2.0
     assert b1 < b0
-    assert torch.isfinite(torch.tensor(kl)) and 0.0 <= kl < 5.0
+    assert torch.isfinite(torch.tensor(kl)) and 0.0 <= kl < 3.0
 
 
 def test_profile_save_load_and_decay(tmp_path):
