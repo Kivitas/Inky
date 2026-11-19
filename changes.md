@@ -12,7 +12,7 @@ Implemented in `inky/config.py`, `inky/layers.py`, `inky/modeling.py`, `inky/gen
 | :--- | :---: | :---: | :---: | :--- |
 | **`"low"`** | **`2` loops** | `2.0` | **`384` tokens** | Fast, low-latency latent pass with extended note allowance. |
 | **`"high"`** | **`5` loops** | `5.0` | **`768` tokens** | Deep 5-loop iterative refinement with balanced halting distribution. |
-| **`"max"`** | **`10` loops** | `10.0` | **`1,536` tokens** | Maximum 10-loop deep deductive thinking + $6\times$ PENCIL scratchpad capacity. |
+| **`"max"`** | **`10` loops** | `10.0` | **`1,536` tokens** | Maximum 10-loop deep deductive thinking + $6\times$ the default 256-token PENCIL scratchpad. Budgets take effect with `reduce_scratch_blocks`. |
 
 ### Recurrent Looping Improvements
 - **Deep 10-Loop Extrapolation & Progressive Depth Damping (`LoopStepModulation`, `RecurrentCore._mix_update`)**:
@@ -32,10 +32,11 @@ Implemented in `inky/style.py`, `inky/layers.py` (`ModeConditioner`), `inky/gene
 
 - **`"formal"` Mode (`STYLE_PROFILES["formal"]`)**:
   - **Sampling & Cadence**: Composed, precise decoding (`temperature=0.70`, `top_p=0.90`, `top_k=40`, `min_p=0.05`, `repetition_penalty=1.12`, `no_repeat_ngram_size=4`).
-  - **Register Controls**: Hard-blocks casual phrases (`INFORMAL_PHRASES`: `"you know"`, `"kind of"`, `"sort of"`, `"no way"`, `"for real"`, `"by the way"`, `"to be honest"`) + AI clichés (`STOCK_PHRASES`), and soft-penalizes colloquialisms/slang (`INFORMAL_WORDS`: `"gonna"`, `"wanna"`, `"gotta"`, `"kinda"`, `"yeah"`, `"nah"`, `"lol"`, `"omg"`, `"btw"`, `"tbh"`, `"ain't"`, `"stuff"`, `"totally"`, `"literally"`, `"basically"`) + `STOCK_WORDS`.
+  - **Register Controls**: Hard-blocks casual phrases (`INFORMAL_PHRASES`: `"you know"`, `"kind of"`, `"sort of"`, `"no way"`, `"for real"`, `"by the way"`, `"to be honest"`) + AI clichés (`STOCK_PHRASES`), and soft-penalizes colloquialisms/slang (`INFORMAL_WORDS`, 22 entries, e.g. `"gonna"`, `"wanna"`, `"gotta"`, `"kinda"`, `"yeah"`, `"nah"`, `"lol"`, `"omg"`, `"btw"`, `"tbh"`, `"ain't"`, `"stuff"`, `"totally"`, `"literally"`, `"basically"`) + `STOCK_WORDS`.
 - **`"informal"` Mode (`STYLE_PROFILES["informal"]`)**:
   - **Sampling & Cadence**: Warm, natural conversational burstiness (`temperature=0.85`, `top_p=0.95`, `top_k=60`, `min_p=0.03`, `repetition_penalty=1.08`, `no_repeat_ngram_size=4`).
-  - **Register Controls**: Hard-blocks stiff bureaucratic/academic connectors (`FORMAL_PHRASES`: `"in accordance with"`, `"with respect to"`, `"prior to"`, `"subsequent to"`, `"it is imperative"`, `"one must"`, `"for the purpose of"`, `"in the event that"`) + `STOCK_PHRASES`, and soft-penalizes stilted transitions (`FORMAL_WORDS`: `"heretofore"`, `"herein"`, `"thereof"`, `"whereby"`, `"notwithstanding"`, `"henceforth"`, `"aforementioned"`, `"consequently"`, `"subsequently"`, `"nevertheless"`, `"furthermore"`, `"moreover"`, `"thus"`, `"hence"`, `"shall"`, `"whilst"`, `"utilize"`, `"commence"`) + `STOCK_WORDS`.
+  - **Register Controls**: Hard-blocks stiff bureaucratic/academic connectors (`FORMAL_PHRASES`: `"in accordance with"`, `"with respect to"`, `"prior to"`, `"subsequent to"`, `"it is imperative"`, `"one must"`, `"for the purpose of"`, `"in the event that"`) + `STOCK_PHRASES`, and soft-penalizes stilted transitions (`FORMAL_WORDS`, 20 entries, e.g. `"heretofore"`, `"herein"`, `"thereof"`, `"whereby"`, `"notwithstanding"`, `"henceforth"`, `"aforementioned"`, `"consequently"`, `"subsequently"`, `"nevertheless"`, `"furthermore"`, `"moreover"`, `"thus"`, `"hence"`, `"shall"`, `"whilst"`, `"utilize"`, `"commence"`) + `STOCK_WORDS`.
+- **Profile application**: `generate(style_mode=...)` now applies the profile's temperature, `top_p`, `top_k`, repetition penalty and n-gram size (explicit non-default arguments win), not just `min_p` and the word lists. Stock-word penalty: 1.5 (formal) / 2.0 (informal).
 - **Log-Space `min_p` Truncation & Internal FiLM Conditioning (`ModeConditioner`)**:
   - Filters tail tokens below $\text{min\_p} \cdot p_{\max}$ in log-space (`_candidate_distribution`) and conditions hidden representations via zero-initialized FiLM embeddings (`reasoning_embed` for `low`/`high`/`max`, `style_embed` for `formal`/`informal`).
 
@@ -48,9 +49,9 @@ Implemented in `inky/layers.py` (`GatedDeltaNetMixer`, `SelectiveSSMMixer`, `Mul
 - **`GatedDeltaNetMixer` ($\mathcal{O}(1)$ Fast-Weight Matrix State)**:
   - Maintains a constant-size per-head associative matrix state $S_t \in \mathbb{R}^{H \times d_h \times d_h}$ updated via the Gated Delta Rule:
     $$S_t = \alpha_t S_{t-1} + \beta_t \left(v_t - S_{t-1} k_t\right) k_t^\top, \qquad y_t = S_t q_t$$
-  - Supports document-boundary state resets via `segment_ids` for packed pretraining and $\mathcal{O}(1)$ single-token cached decoding.
+  - Supports document-boundary state resets via `segment_ids` (prefill only; combining with a cache raises `ValueError`) and $\mathcal{O}(1)$ single-token cached decoding. Prefill is a sequential per-token loop. State is carried in fp32.
 - **Fast $\mathcal{O}(1)$ `SelectiveSSMMixer` Decode & FP32 Carry**:
-  - Single-token decode step bypasses chunked scan matrix construction when $S = 1$, keeping recurrent carry state $h$ in `float32` across chunks and decode steps.
+  - Per-channel diagonal state `[B, hidden, ssm_state_dim]`. Single-token decode step bypasses chunked scan matrix construction when $S = 1$, keeping recurrent carry state $h$ in `float32` across chunks and decode steps.
 - **128k Context Hybrid Presets (`InkyConfig.hybrid_linear_128k`)**:
   - Combines Multi-Head Latent Attention (MLA, compressed latent KV cache `LatentKV`) with linear recurrent layers at a **`1:3`** ($3$ linear : $1$ MLA) or **`1:7`** ($7$ linear : $1$ MLA) ratio with `max_position_embeddings = 131072` (128k context).
 
@@ -63,7 +64,7 @@ Implemented in `inky/layers.py` (`SharedExpertMoE`) and `inky/config.py` (`InkyC
 - **Shared + Ultra-Sparse Routed Experts**:
   - Combines always-on `shared_experts` with up to 32+ fine-grained `routed_experts` (top-2 active per token) and DeepSeek-V3 auxiliary-loss-free sign congestion balancing (`balance_update="sign"`).
 - **Dynamic Executive Expert Bias ($b_{\text{moe}}$)**:
-  - `SharedExpertMoE.forward` accepts `expert_bias` ($b_{\text{moe}} \in \mathbb{R}^{B \times S \times E_{\text{routed}}}$) from the JEPA controller to steer tokens toward specialized logic, code, or language experts based on simulated latent trajectories.
+  - `SharedExpertMoE.forward` accepts `expert_bias` ($b_{\text{moe}} \in \mathbb{R}^{B \times S \times E_{\text{routed}}}$) from the JEPA controller to steer tokens (added to router logits, so it changes routing weights as well as selection) toward specialized logic, code, or language experts based on simulated latent trajectories.
 
 ---
 
@@ -78,10 +79,10 @@ Implemented in `inky/memory_bank.py` (`ProductKeyMemoryBank`, `QuantizedValueTab
    - Projects normalized hidden state $\tilde{h}_t = \text{RMSNorm}(h_t)$ into $q_t = W_q \tilde{h}_t = [q_t^{(1)} \| q_t^{(2)}]$, computes sub-scores $s^{(1)} = C^{(1)} q_t^{(1)}$ and $s^{(2)} = C^{(2)} q_t^{(2)}$ in $\mathcal{O}(S \cdot d_k)$, and selects exact global Top-$K$ winners $\mathcal{I}^*$ over the $K^2$ Cartesian pairs $\mathcal{I}_1 \times \mathcal{I}_2$.
    - Also supports $\mathcal{O}(1)$ deterministic multi-head polynomial rolling $m$-gram hash routing (`routing_mode="hash"`).
 3. **Sparse Value Gather & Attention Aggregation**:
-   - Transfers strictly $K \cdot d_{\text{mem}}$ values per token from host RAM/NVMe, dequantizes on-device, and aggregates with scaled softmax weights:
+   - Transfers (mmap supported; the `pin_memory` option exists but is not wired by the bank) strictly $K \cdot d_{\text{mem}}$ values per token from host RAM/NVMe, dequantizes on-device, and aggregates with scaled softmax weights:
      $$\alpha_j = \frac{\exp(z_j / \sqrt{d_k})}{\sum_{r=1}^K \exp(z_r / \sqrt{d_k})}, \qquad m_t = \sum_{j=1}^K \alpha_j v_{i_j}$$
 4. **Gated Residual Injection into the Looped Core**:
-   - At designated loop steps $t \in \mathcal{T}_{\text{query}}$, fuses retrieved memory via token- and step-conditioned sigmoid gating (modulated by JEPA's `fetch_gate` $g_{\text{mem}}$):
+   - At designated loop steps $t \in \mathcal{T}_{\text{query}}$, fuses retrieved memory via token-conditioned sigmoid gating (multiplied by JEPA's `fetch_gate` $g_{\text{mem}}$). Defaults: bank `top_k=8`; `InkyConfig` `pkm_top_k=4`, `pkm_query_steps=(1,3,5)`:
      $$\hat{m}_t = W_{\text{out}} m_t, \qquad g_t = \sigma\!\left(W_g [\tilde{h}_t \| \hat{m}_t] + b_g\right), \qquad u_t = h_t + g_t \odot \hat{m}_t$$
 
 ---
@@ -99,8 +100,8 @@ Implemented in `inky/jepa.py` (`JEPAController`, `LatentStateEncoder`, `LatentWo
      $$E(\hat{z}, z_{\text{goal}}, t) = \|\hat{z}_{t+H} - z_{\text{goal}}\|_2^2 + \alpha_{\text{cos}}\!\left(1 - \cos(\hat{z}_{t+H}, z_{\text{goal}})\right) + \lambda_{\text{compute}} \cdot t$$
    - Selects optimal action plan $a_t^* = \arg\min_{a_t} E(\hat{z}, z_{\text{goal}}, t)$ with straight-through softmin differentiability during training.
 4. **Executive Control Signals & Self-Supervised VICReg Loss**:
-   - Emits per-loop **Bank Fetch Gate** ($g_{\text{mem}} \in \{0, 1\}$ when uncertainty exceeds $\tau_{\text{mem}}$), **MoE Expert Bias** ($b_{\text{moe}}$), and **Adaptive Loop Halting** ($p_{\text{halt}} = \sigma(w_h^\top z_t)$, boosted upon latent convergence $\|\hat{z}_{t+1} - z_t\|_2 < \epsilon$).
-   - Trains via stop-gradient multi-step latent prediction + VICReg variance/covariance anti-collapse regularization (`jepa_loss`), and verifies the 1.3 GB mobile active RAM budget (`memory_footprint_bytes`).
+   - Emits per-loop **Bank Fetch Gate** (hard 0/1 in eval, straight-through in training, when $0.5(\text{energy}+\sigma(\text{uncertainty}))>\tau_{\text{mem}}$), **MoE Expert Bias** ($b_{\text{moe}}$), and **Adaptive Loop Halting** ($p_{\text{halt}} = \sigma(w_h^\top z_t)$, boosted upon latent convergence $\|\hat{z}_{t+1} - z_t\|_2 < \epsilon$; averaged with the model's halting gate). $\alpha_{\text{cos}}$ is fixed at 0.5; `jepa_compute_penalty` now sets $\lambda_{\text{compute}}$. The JEPA loss pairs each loop's prediction with that loop's output state.
+   - Trains via stop-gradient multi-step latent prediction + VICReg variance/covariance anti-collapse regularization (`jepa_loss`), and reports footprint via `memory_footprint_bytes` (`active_ram_bytes` = controller + ~50M core; `within_mobile_ceiling` compares the total at the given bit width).
 
 ---
 
@@ -122,12 +123,12 @@ Implemented in `inky/grpo.py` (`ContinualGRPOTrainer`, `UserPreferenceProfile`, 
 ## 8. Audit Phases 1–4 Bug Fixes, Optimizations & Tooling
 
 - **Phase 1 (Integrity & Bug Fixes)**:
-  - Fixed `GradScaler` scale backoff on non-finite loss skips (`inky/train.py`), `train_arlo` target tensor device placement (`inky/arlo.py`), document-level train/eval split before sequence packing (`inky/data.py`, `scripts/train.py`), batched EOS padding & zero-answer scratchpad infinite-loop guard (`inky/generation.py`), `pondernet_kl` zero-weight gradient spike (`inky/layers.py`), and default `qk_norm_mode="latent"` (`inky/config.py`).
+  - Fixed `GradScaler` scale backoff on non-finite loss skips (`inky/train.py`), `train_arlo` target tensor device placement (`inky/arlo.py`), document-level train/eval split before sequence packing (`scripts/train.py` via `inky.evaluation.split_heldout`, then `prepare_corpus(..., with_segments=True)`), batched EOS padding & zero-answer scratchpad infinite-loop guard (`inky/generation.py`), `pondernet_kl` zero-weight gradient spike (`inky/layers.py`), and default `qk_norm_mode="latent"` (`inky/config.py`).
 - **Phase 2 (Optimizer, Speculative Cache Truncation & Compute Accounting)**:
-  - Routed `a_gate`, `readout`, `lm_head`, `thought_gate`, `reasoning_embed`, `style_embed`, and PKM/JEPA heads to AdamW and decoupled AdamW/Muon gradient clipping (`inky/optim.py`).
-  - Added $\mathcal{O}(1)$ in-place `LatentKV.truncate` and `InkyCache.truncate` for self-speculative decoding rollback (`inky/layers.py`, `inky/cache.py`, `inky/speculative.py`).
+  - Routed (AdamW; encoder/predictor/bank projections stay on Muon) `a_gate`, `readout`, `lm_head`, `thought_gate`, `reasoning_embed`, `style_embed`, and PKM/JEPA heads to AdamW and per-group AdamW/Muon gradient clipping (`inky/optim.py`; the fp16 GradScaler path in `inky/train.py` still clips globally).
+  - Added $\mathcal{O}(1)$ zero-copy `LatentKV.truncate` (returns a trimmed view) and `InkyCache.truncate` for self-speculative decoding rollback (`inky/layers.py`, `inky/cache.py`, `inky/speculative.py`); rollback applies only without highway/SSM mixers.
   - Added `train_flops_per_token` accounting in `scripts/arch_budget.py`.
 - **Phase 3 & 4 (Ablation Baselines, Chunked Distillation & Packaging)**:
   - Added `"dense_unrolled"`, `"dense_param_match"`, `"mqa"`, and `"human_reasoning"` variants in `scripts/ablate.py`.
-  - Added memory-bounded `chunked_distillation_loss` in `inky/distill.py`.
+  - Added memory-bounded `chunked_distillation_loss` in `inky/distill.py` (chunks are checkpointed under grad).
   - Added `--gradient-checkpointing` to `scripts/train.py` and `[project.scripts]` CLI entrypoints (`inky-train`, `inky-sample`, `inky-ablate`, `inky-diagnose`, `inky-bench`) in `pyproject.toml`.
