@@ -10,7 +10,7 @@ from .config import STYLE_MODES, InkyConfig, resolve_reasoning_loops, resolve_re
 from .data import DEFAULT_RESERVED_IDS
 from .metrics import print_report, text_report
 from .scratch import DEFAULT_MAX_NOTE_TOKENS, ScratchTracker
-from .style import NgramBanIndex, banned_by_bad_words, build_style_controls
+from .style import BadWordIndex, NgramBanIndex, banned_by_bad_words, build_style_controls
 
 # Default for ``eos_token_id`` in generate / self_speculative_generate: use ``config.eos_token_id``.
 # An explicit None means "never stop at EOS"; an int means "stop at this id".
@@ -47,8 +47,13 @@ class InkyGenerationMixin:
         style_mode: Optional[str] = None,
         min_p: float = 0.0,
         encode: Optional[Callable[[str], Sequence[int]]] = None,
+        style_overrides: Optional[Dict[str, object]] = None,
     ):
         """Sample a continuation.
+
+        ``style_overrides`` overrides entries of the ``style_mode`` profile (see
+        ``style.get_style_profile``), e.g. ``{"stock_word_penalty": 3.0}``. The model config's
+        ``style_profile_overrides`` (if any) is applied first, then this argument.
 
         ``blocked_token_ids`` are never emitted (set to -inf). None (the default) blocks the reserved
         special ids of the tokenizer, ``DEFAULT_RESERVED_IDS`` (49974 to 50002), minus the scratch ids,
@@ -99,13 +104,25 @@ class InkyGenerationMixin:
             raise ValueError(f"stock_word_penalty must be >= 0, got {stock_word_penalty}")
         if not 0.0 <= float(min_p) <= 1.0:
             raise ValueError(f"min_p must be in [0, 1], got {min_p}")
+        if do_sample and temperature < 0:
+            raise ValueError(f"temperature must be >= 0, got {temperature}")
+        if not 0.0 < top_p <= 1.0:
+            raise ValueError(f"top_p must be in (0, 1], got {top_p}")
+        if top_k < 0:
+            raise ValueError(f"top_k must be >= 0, got {top_k}")
+        if repetition_penalty <= 0:
+            raise ValueError(f"repetition_penalty must be > 0, got {repetition_penalty}")
+        if max_new_tokens < 0:
+            raise ValueError(f"max_new_tokens must be >= 0, got {max_new_tokens}")
         eff_reasoning = reasoning_mode if reasoning_mode is not None else getattr(cfg, "reasoning_mode", None)
         eff_style = style_mode if style_mode is not None else getattr(cfg, "style_mode", None)
         resolved_loops = resolve_reasoning_loops(eff_reasoning, num_loops)
         if eff_style is not None:
             if eff_style not in STYLE_MODES:
                 raise ValueError(f"style_mode must be one of {STYLE_MODES} or None, got {eff_style!r}")
-            style_ctrl = build_style_controls(eff_style, encode=encode)
+            merged_over = dict(getattr(cfg, "style_profile_overrides", None) or {})
+            merged_over.update(style_overrides or {})
+            style_ctrl = build_style_controls(eff_style, encode=encode, overrides=merged_over or None)
             if min_p == 0.0:
                 min_p = float(style_ctrl["min_p"])
             # Profile sampling params replace the signature defaults only (explicit values win).
@@ -123,7 +140,8 @@ class InkyGenerationMixin:
                 valid_bads = [
                     s for s in style_ctrl["bad_word_ids"] if all(0 <= int(t) < cfg.vocab_size for t in s)
                 ]
-                bad_word_ids = list(bad_word_ids or []) + [s for s in valid_bads if s not in (bad_word_ids or [])]
+                have = {tuple(x) for x in (bad_word_ids or [])}
+                bad_word_ids = list(bad_word_ids or []) + [s for s in valid_bads if tuple(s) not in have]
             if style_ctrl["soft_penalty_ids"]:
                 valid_soft = [int(t) for t in style_ctrl["soft_penalty_ids"] if 0 <= int(t) < cfg.vocab_size]
                 if valid_soft:
@@ -134,17 +152,19 @@ class InkyGenerationMixin:
             scratch_max_note_tokens = resolve_reasoning_scratch_budget(
                 eff_reasoning, scratch_max_note_tokens, DEFAULT_MAX_NOTE_TOKENS
             )
-        penalty_mask = None
+        penalty_vec = None
         if stock_word_penalty > 0:
             ids_list = sorted({int(t) for t in (soft_penalty_ids or ())})
             if not ids_list:
                 raise ValueError("stock_word_penalty > 0 needs soft_penalty_ids")
             if ids_list[0] < 0 or ids_list[-1] >= cfg.vocab_size:
                 raise ValueError("soft_penalty_ids must be token ids inside the vocabulary")
-            penalty_mask = torch.zeros(cfg.vocab_size, dtype=torch.float32, device=input_ids.device)
-            penalty_mask[ids_list] = 1.0
+            penalty_vec = torch.zeros(cfg.vocab_size, dtype=torch.float32, device=input_ids.device)
+            penalty_vec[ids_list] = float(stock_word_penalty)
 
         blocked = _blocked_ids(cfg, blocked_token_ids, eos_token_id)
+        blocked_t = torch.tensor(blocked, dtype=torch.long, device=input_ids.device) if blocked else None
+        bad_index = BadWordIndex(bad_word_ids) if bad_word_ids else None
         prompt_len = input_ids.shape[1]
         cache = InkyCache(cfg)
         seq = input_ids
@@ -154,7 +174,7 @@ class InkyGenerationMixin:
             [_make_ngram_index(no_repeat_ngram_size, row, repeat_window) for row in history]
             if no_repeat_ngram_size else None
         )
-        tail_len = max((len(s) - 1 for s in bad_word_ids), default=0) if bad_word_ids else 0
+        tail_len = bad_index.tail_len if bad_index is not None else 0
         scratch = (
             ScratchTracker(cfg.scratch_open_id, cfg.scratch_sep_id, cfg.scratch_close_id,
                            scratch_max_note_tokens, prefix=history[0])
@@ -182,18 +202,39 @@ class InkyGenerationMixin:
             steps += 1
             if cache.seq_len >= cfg.max_position_embeddings:
                 break
-            logits = _apply_repetition_penalty(out.logits[:, -1, :], seq, repetition_penalty, repeat_window)
-            if penalty_mask is not None:
-                logits = logits - stock_word_penalty * penalty_mask
-            logits = _block_tokens(logits, ngram, history, tail_len, bad_word_ids)
-            logits = _mask_ids(logits, blocked)
+            # One private float32 copy; every control below edits it in place. (``out.logits`` itself is kept
+            # for scratch rollback, so it must stay untouched.)
+            logits = out.logits[:, -1, :].to(torch.float32).clone()
+            if repetition_penalty != 1.0:
+                ctx = seq if repeat_window is None else seq[:, -repeat_window:]
+                picked = torch.gather(logits, 1, ctx)
+                logits.scatter_(1, ctx, torch.where(picked < 0, picked * repetition_penalty,
+                                                    picked / repetition_penalty))
+            if penalty_vec is not None:
+                logits -= penalty_vec
+            if ngram is not None or bad_index is not None:
+                rows_, cols_ = [], []
+                for b in range(logits.shape[0]):
+                    banned_b = ngram[b].banned() if ngram is not None else set()
+                    if bad_index is not None:
+                        banned_b = banned_b | bad_index.banned(history[b][-tail_len:] if tail_len > 0 else [])
+                    for t in banned_b:
+                        if t >= logits.shape[-1]:
+                            continue          # ids outside the vocabulary cannot be emitted anyway
+                        rows_.append(b)
+                        cols_.append(t)
+                if rows_:
+                    logits[torch.tensor(rows_, device=logits.device), torch.tensor(cols_, device=logits.device)] = float("-inf")
+            if blocked_t is not None:
+                logits[:, blocked_t] = float("-inf")
             if scratch is not None:
                 banned = scratch.banned_markers()
                 if ban_open_next:
                     banned = set(banned)
                     banned.add(cfg.scratch_open_id)
                     ban_open_next = False
-                logits = _mask_ids(logits, banned)
+                if banned:
+                    logits[:, sorted(banned)] = float("-inf")
             if do_sample:
                 next_tok = (
                     _sample(logits, temperature, top_k, top_p, min_p)

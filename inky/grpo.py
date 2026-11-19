@@ -17,7 +17,9 @@ Key components:
 """
 
 import copy
+import json
 import math
+import os
 from collections import Counter
 from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
@@ -214,6 +216,45 @@ class UserPreferenceProfile:
 
         return float(affinity_reward + 0.4 * length_reward + prose_reward)
 
+    def decay(self, factor: float = 0.9, min_count: int = 1) -> None:
+        """Forget old preferences: scale every count by ``factor`` in ``[0, 1]`` and drop entries below ``min_count``.
+
+        Style preference shrinks toward neutral and ``preferred_length`` is left unchanged (it is an EMA already).
+        """
+        if not 0.0 <= float(factor) <= 1.0:
+            raise ValueError(f"factor must be in [0, 1], got {factor}")
+        for name in ("liked_token_ids", "disliked_token_ids", "liked_ngrams", "disliked_ngrams"):
+            old: Counter = getattr(self, name)
+            new = Counter()
+            for k, v in old.items():
+                nv = int(math.floor(v * float(factor) + 0.5))
+                if nv >= max(1, int(min_count)):
+                    new[k] = nv
+            setattr(self, name, new)
+        self.style_preference *= float(factor)
+
+    def save(self, path: Union[str, "os.PathLike[str]"]) -> None:
+        """Atomically write the profile as JSON to ``path``."""
+        path = os.fspath(path)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(self.state_dict(), fh)
+        os.replace(tmp, path)
+
+    @classmethod
+    def load(cls, path: Union[str, "os.PathLike[str]"]) -> "UserPreferenceProfile":
+        """Build a profile from a file written by :meth:`save`."""
+        with open(os.fspath(path), "r", encoding="utf-8") as fh:
+            state = json.load(fh)
+        prof = cls(
+            preferred_length=float(state.get("preferred_length", 48.0)),
+            length_tolerance=float(state.get("length_tolerance", 32.0)),
+            ema_alpha=float(state.get("ema_alpha", 0.15)),
+            max_tracked_items=int(state.get("max_tracked_items", 4096)),
+        )
+        prof.load_state_dict(state)
+        return prof
+
     def state_dict(self) -> Dict[str, Any]:
         """Serialize the user's preference profile to a plain dictionary."""
         return {
@@ -268,12 +309,15 @@ def compute_group_relative_advantages(
     if r.numel() == 0:
         return r
     group_size = r.shape[-1]
+    r = torch.nan_to_num(r, nan=0.0, posinf=0.0, neginf=0.0)
     if group_size <= 1:
         return r.clone()
     mean = r.mean(dim=-1, keepdim=True)
     centered = r - mean
     std = r.std(dim=-1, unbiased=False, keepdim=True)
-    return centered / (std + eps)
+    adv = centered / (std + eps)
+    # Zero-variance (or float-noise-variance) groups carry no signal: do not amplify rounding noise.
+    return torch.where(std > 1e-5, adv, torch.zeros_like(adv))
 
 
 def sequence_log_probs(
@@ -331,6 +375,7 @@ def grpo_loss(
     mask: Optional[torch.Tensor] = None,
     clip_eps: float = 0.2,
     kl_beta: float = 0.04,
+    length_norm: str = "token",
 ) -> Tuple[torch.Tensor, Dict[str, float]]:
     """Compute the Group Relative Policy Optimization (GRPO) loss and diagnostic metrics.
 
@@ -343,6 +388,8 @@ def grpo_loss(
         raise ValueError(f"clip_eps must be >= 0, got {clip_eps}")
     if kl_beta < 0.0:
         raise ValueError(f"kl_beta must be >= 0, got {kl_beta}")
+    if length_norm not in ("token", "sequence"):
+        raise ValueError(f"length_norm must be 'token' or 'sequence', got {length_norm!r}")
 
     if mask is None:
         mask_f = torch.ones_like(policy_log_probs, dtype=torch.float32)
@@ -362,18 +409,30 @@ def grpo_loss(
     surrogate = torch.minimum(surr1, surr2)
 
     denom = mask_f.sum().clamp(min=1.0)
-    policy_loss = -(surrogate * mask_f).sum() / denom
+    # "token": one mean over all response tokens (long answers weigh more);
+    # "sequence": mean over per-sequence token means (every response weighs the same).
+    if length_norm == "sequence" and mask_f.ndim == 2:
+        row_len = mask_f.sum(dim=-1).clamp(min=1.0)
+
+        def _agg(x: torch.Tensor) -> torch.Tensor:
+            return ((x * mask_f).sum(dim=-1) / row_len).mean()
+    else:
+
+        def _agg(x: torch.Tensor) -> torch.Tensor:
+            return (x * mask_f).sum() / denom
+
+    policy_loss = -_agg(surrogate)
 
     if ref_log_probs is not None and kl_beta > 0.0:
         log_ref_diff = (ref_log_probs.detach().float() - policy_log_probs.float()).clamp(-20.0, 20.0)
         per_token_kl = torch.exp(log_ref_diff) - log_ref_diff - 1.0
-        kl_val = (per_token_kl * mask_f).sum() / denom
+        kl_val = _agg(per_token_kl)
         total_loss = policy_loss + kl_beta * kl_val
     else:
         if ref_log_probs is not None:
             log_ref_diff = (ref_log_probs.detach().float() - policy_log_probs.float()).clamp(-20.0, 20.0)
             per_token_kl = torch.exp(log_ref_diff) - log_ref_diff - 1.0
-            kl_val = (per_token_kl * mask_f).sum() / denom
+            kl_val = _agg(per_token_kl)
         else:
             kl_val = policy_loss.new_zeros(())
         total_loss = policy_loss
@@ -416,7 +475,13 @@ class ContinualGRPOTrainer:
         ref_ema_decay: Optional[float] = 0.995,
         bad_word_ids: Optional[Sequence[Sequence[int]]] = None,
         soft_penalty_ids: Optional[Sequence[int]] = None,
+        ref_mode: str = "copy",
+        length_norm: str = "token",
     ):
+        if ref_mode not in ("copy", "params", "none"):
+            raise ValueError(f"ref_mode must be 'copy', 'params' or 'none', got {ref_mode!r}")
+        if length_norm not in ("token", "sequence"):
+            raise ValueError(f"length_norm must be 'token' or 'sequence', got {length_norm!r}")
         if grpo_epochs < 1:
             raise ValueError(f"grpo_epochs must be >= 1, got {grpo_epochs}")
         if ref_ema_decay is not None and not 0.0 <= float(ref_ema_decay) <= 1.0:
@@ -440,16 +505,28 @@ class ContinualGRPOTrainer:
         self.bad_word_ids = list(bad_word_ids) if bad_word_ids is not None else None
         self.soft_penalty_ids = list(soft_penalty_ids) if soft_penalty_ids is not None else None
 
-        # Frozen reference policy for KL regularization
-        ref_cfg = copy.deepcopy(model.config)
-        device = next(model.parameters()).device
-        dtype = next(model.parameters()).dtype
-        self.ref_model = InkyModel(ref_cfg).to(device=device, dtype=dtype)
-        self.ref_model.load_state_dict(model.state_dict())
-        self.ref_model.eval()
-        self.ref_model.requires_grad_(False)
+        self.ref_mode = ref_mode
+        self.length_norm = length_norm
+        # Reference policy for the KL term, always evaluated under no_grad.
+        #  "copy":   a full frozen second model (most memory, simple).
+        #  "params": snapshot only the trainable tensors (e.g. a LoRA-free / partially frozen setup) and swap
+        #            them in for the reference pass; frozen weights are shared, so memory is ~trainable size.
+        #  "none":   no reference, KL penalty off (cheapest).
+        self.ref_model: Optional[InkyModel] = None
+        self._ref_params: Dict[str, torch.Tensor] = {}
+        if ref_mode == "copy":
+            ref_cfg = copy.deepcopy(model.config)
+            device = next(model.parameters()).device
+            dtype = next(model.parameters()).dtype
+            self.ref_model = InkyModel(ref_cfg).to(device=device, dtype=dtype)
+            self.ref_model.load_state_dict(model.state_dict())
+            self.ref_model.eval()
+            self.ref_model.requires_grad_(False)
+        elif ref_mode == "params":
+            self._ref_params = {n: p.detach().clone() for n, p in model.named_parameters() if p.requires_grad}
 
         self.step_count: int = 0
+        self.nonfinite_skips: int = 0
 
     @torch.no_grad()
     def sync_reference_policy(self, tau: float = 1.0) -> None:
@@ -459,6 +536,13 @@ class ContinualGRPOTrainer:
         """
         if not 0.0 <= float(tau) <= 1.0:
             raise ValueError(f"tau must be in [0, 1], got {tau}")
+        if self.ref_mode == "none":
+            return
+        if self.ref_mode == "params":
+            for n, p in self.model.named_parameters():
+                if n in self._ref_params:
+                    self._ref_params[n].mul_(1.0 - tau).add_(p.detach(), alpha=tau)
+            return
         if tau == 1.0:
             self.ref_model.load_state_dict(self.model.state_dict())
             return
@@ -486,7 +570,7 @@ class ContinualGRPOTrainer:
 
         clean_responses: List[List[int]] = []
         for resp in responses:
-            r_list = _to_id_list(resp)
+            r_list = self._truncate_at_eos(_to_id_list(resp))
             if not r_list:
                 r_list = [int(self.model.config.eos_token_id)]
             clean_responses.append(r_list)
@@ -513,6 +597,40 @@ class ContinualGRPOTrainer:
             resp_mask[i, : len(r_list)] = 1.0
 
         return batch_ids, resp_mask, clean_responses
+
+    def _truncate_at_eos(self, resp: List[int]) -> List[int]:
+        """Keep tokens up to and including the first EOS; generation pads after EOS must not be trained on."""
+        eos = self.model.config.eos_token_id
+        if eos is not None and int(eos) in resp:
+            resp = resp[: resp.index(int(eos)) + 1]
+        return resp
+
+    @torch.no_grad()
+    def _ref_log_probs(self, batch_ids, attn, loops, reasoning, style, prompt_len, resp_mask):
+        if self.ref_mode == "none":
+            return None
+        kw = dict(attention_mask=attn, num_loops=loops, reasoning_mode=reasoning, style_mode=style)
+        if self.ref_mode == "copy":
+            self.ref_model.eval()
+            logits = self.ref_model(batch_ids, **kw).logits
+        else:  # swap the snapshot in, run, swap the live weights back
+            live = {}
+            params = dict(self.model.named_parameters())
+            for n, snap in self._ref_params.items():
+                live[n] = params[n].data
+                params[n].data = snap
+            was_training = self.model.training
+            self.model.eval()
+            try:
+                logits = self.model(batch_ids, **kw).logits
+                self.model.reset_moe_load()
+            finally:
+                for n, d in live.items():
+                    params[n].data = d
+                if was_training:
+                    self.model.train()
+        lp, _ = sequence_log_probs(logits, batch_ids, prompt_len=prompt_len)
+        return lp * resp_mask
 
     def _step_optimizer(self) -> float:
         if isinstance(self.optimizer, HybridOptimizer):
@@ -544,8 +662,12 @@ class ContinualGRPOTrainer:
         """
         if not responses:
             raise ValueError("responses must contain at least 1 candidate sequence")
+        if explicit_rewards is not None and len(explicit_rewards) == 0:
+            explicit_rewards = None  # empty feedback: fall back to profile scores only
         if explicit_rewards is not None and len(explicit_rewards) != len(responses):
             raise ValueError(f"got {len(responses)} responses but {len(explicit_rewards)} explicit_rewards")
+        if explicit_rewards is not None:
+            explicit_rewards = [float(x) if math.isfinite(float(x)) else 0.0 for x in explicit_rewards]
 
         eff_reasoning = (
             reasoning_mode if reasoning_mode is not None else getattr(self.model.config, "reasoning_mode", None)
@@ -601,16 +723,9 @@ class ContinualGRPOTrainer:
 
         # 2. Compute reference and old log-probabilities
         with torch.no_grad():
-            self.ref_model.eval()
-            ref_out = self.ref_model(
-                batch_ids,
-                attention_mask=full_attn_mask,
-                num_loops=fixed_loops,
-                reasoning_mode=eff_reasoning,
-                style_mode=eff_style,
+            ref_log_probs = self._ref_log_probs(
+                batch_ids, full_attn_mask, fixed_loops, eff_reasoning, eff_style, prompt_len, resp_mask
             )
-            ref_log_probs, _ = sequence_log_probs(ref_out.logits, batch_ids, prompt_len=prompt_len)
-            ref_log_probs = ref_log_probs * resp_mask
 
             was_training = self.model.training
             self.model.eval()
@@ -629,7 +744,8 @@ class ContinualGRPOTrainer:
         self.model.train()
         last_metrics: Dict[str, float] = {}
         grad_norm = 0.0
-        for _ in range(self.grpo_epochs):
+        skipped_flat = bool(float(advantages.abs().max().item()) == 0.0) if advantages.numel() else True
+        for _ in range(0 if skipped_flat else self.grpo_epochs):
             self.optimizer.zero_grad(set_to_none=True)
             out = self.model(
                 batch_ids,
@@ -649,14 +765,27 @@ class ContinualGRPOTrainer:
                 mask=resp_mask,
                 clip_eps=self.clip_eps,
                 kl_beta=self.kl_beta,
+                length_norm=self.length_norm,
             )
             total_loss = rl_loss + out.moe_aux_loss
+            if not torch.isfinite(total_loss):
+                self.optimizer.zero_grad(set_to_none=True)
+                self.nonfinite_skips += 1
+                continue
             total_loss.backward()
+            if any(p.grad is not None and not torch.isfinite(p.grad).all() for p in self.model.parameters()):
+                # Never let a NaN/inf gradient reach the weights or the optimiser moments.
+                self.optimizer.zero_grad(set_to_none=True)
+                self.model.reset_moe_load()
+                self.nonfinite_skips += 1
+                continue
             grad_norm = self._step_optimizer()
             self.model.update_moe_balance()
 
         if not was_training:
             self.model.eval()
+        if not last_metrics:  # zero-variance group: no policy signal, nothing was optimised
+            last_metrics = {"loss": 0.0, "policy_loss": 0.0, "kl": 0.0, "clip_fraction": 0.0}
 
         if self.ref_ema_decay is not None and self.ref_ema_decay < 1.0:
             self.sync_reference_policy(tau=1.0 - self.ref_ema_decay)
@@ -670,6 +799,8 @@ class ContinualGRPOTrainer:
             "kl": last_metrics["kl"],
             "clip_fraction": last_metrics["clip_fraction"],
             "grad_norm": grad_norm,
+            "skipped_zero_variance": skipped_flat,
+            "nonfinite_skips": self.nonfinite_skips,
             "rewards": combined_rewards,
             "advantages": advantages.detach().cpu().tolist(),
             "mean_reward": float(rewards_tensor.mean().item()),
@@ -730,7 +861,7 @@ class ContinualGRPOTrainer:
                 soft_penalty_ids=self.soft_penalty_ids,
                 stock_word_penalty=1.0 if self.soft_penalty_ids else 0.0,
             )
-            resp = gen[0, prompt_len:].tolist()
+            resp = self._truncate_at_eos(gen[0, prompt_len:].tolist())
             if not resp:
                 resp = [int(self.model.config.eos_token_id)]
             candidates.append(resp)

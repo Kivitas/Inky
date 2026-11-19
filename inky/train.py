@@ -806,7 +806,10 @@ def train(
                 if scaler is not None:
                     # The grads are already unscaled and finite. Clip here, as HybridOptimizer.step would.
                     if max_grad_norm is not None:
-                        torch.nn.utils.clip_grad_norm_(optimizer.params, max_grad_norm)
+                        for grp in (optimizer.adamw, optimizer.muon):  # per group, as HybridOptimizer.step
+                            gp = [p for g in grp.param_groups for p in g["params"] if p.grad is not None]
+                            if gp:
+                                torch.nn.utils.clip_grad_norm_(gp, max_grad_norm)
                     scaler.step(optimizer.muon)
                     scaler.step(optimizer.adamw)
                     scaler.update()

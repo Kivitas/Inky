@@ -139,23 +139,34 @@ STYLE_PROFILES: Dict[str, Dict[str, Any]] = {
 }
 
 
-def get_style_profile(style_mode: str) -> Dict[str, Any]:
-    """Return a copy of the decoding profile for ``style_mode`` ('formal' or 'informal')."""
+def get_style_profile(style_mode: str, overrides: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+    """Return a copy of the decoding profile for ``style_mode`` ('formal' or 'informal').
+
+    ``overrides`` replaces individual profile entries (any key of the profile, e.g. ``stock_word_penalty``
+    or ``avoid_words``); unknown keys are rejected so a typo cannot silently do nothing.
+    """
     if style_mode not in STYLE_PROFILES:
         raise ValueError(f"style_mode must be one of {tuple(STYLE_PROFILES)}, got {style_mode!r}")
-    return dict(STYLE_PROFILES[style_mode])
+    prof = dict(STYLE_PROFILES[style_mode])
+    if overrides:
+        unknown = set(overrides) - set(prof)
+        if unknown:
+            raise ValueError(f"unknown style profile keys {sorted(unknown)}; valid: {sorted(prof)}")
+        prof.update(overrides)
+    return prof
 
 
 def build_style_controls(
     style_mode: str,
     encode: Optional[Callable[[str], Sequence[int]]] = None,
+    overrides: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """Build sampling and vocabulary controls for ``style_mode`` ('formal' or 'informal').
 
     When ``encode`` is given, also computes ``bad_word_ids`` (stock phrases + out-of-register phrases)
     and ``soft_penalty_ids`` (stock words + out-of-register words).
     """
-    prof = get_style_profile(style_mode)
+    prof = get_style_profile(style_mode, overrides)
     avoid_words = prof.pop("avoid_words")
     avoid_phrases = prof.pop("avoid_phrases")
     if encode is not None:
@@ -189,13 +200,16 @@ def build_bad_word_ids(
     which restores the old global single-word ban.
     """
     seqs: List[List[int]] = []
+    seen: Set[Tuple[int, ...]] = set()
     sources = list(phrases)
     if include_single_words:
         sources += list(words)
     for phrase in sources:
         for variant in _variants(phrase):
             ids = list(encode(variant))
-            if ids and ids not in seqs:
+            key = tuple(ids)
+            if ids and key not in seen:
+                seen.add(key)
                 seqs.append(ids)
     return seqs
 
@@ -211,10 +225,12 @@ def soft_penalty_token_ids(
     decoding path does not apply one.
     """
     out: List[int] = []
+    seen: Set[int] = set()
     for word in words:
         for variant in _variants(word):
             ids = list(encode(variant))
-            if len(ids) == 1 and ids[0] not in out:
+            if len(ids) == 1 and ids[0] not in seen:
+                seen.add(ids[0])
                 out.append(ids[0])
     return out
 
@@ -234,6 +250,36 @@ def banned_by_bad_words(ids: Sequence[int], bad_word_ids: Sequence[Sequence[int]
         if len(ids) >= len(prefix) and list(ids[len(ids) - len(prefix):]) == prefix:
             banned.add(seq[-1])
     return banned
+
+
+class BadWordIndex:
+    """Precompiled bad-word sequences: ``banned(tail)`` costs one dict lookup per distinct prefix length
+    instead of a scan over every sequence (the style profiles produce hundreds of variants).
+
+    Gives exactly the result of ``banned_by_bad_words(tail, bad_word_ids)``. ``tail_len`` is the number of
+    trailing context tokens that matter.
+    """
+
+    def __init__(self, bad_word_ids: Sequence[Sequence[int]]):
+        self.singles: Set[int] = set()
+        self.by_prefix: Dict[Tuple[int, ...], Set[int]] = {}
+        for seq in bad_word_ids:
+            if len(seq) == 1:
+                self.singles.add(int(seq[0]))
+            elif len(seq) > 1:
+                self.by_prefix.setdefault(tuple(int(t) for t in seq[:-1]), set()).add(int(seq[-1]))
+        self.prefix_lens = sorted({len(k) for k in self.by_prefix})
+        self.tail_len = self.prefix_lens[-1] if self.prefix_lens else 0
+
+    def banned(self, ids: Sequence[int]) -> Set[int]:
+        out = set(self.singles)
+        n = len(ids)
+        for k in self.prefix_lens:
+            if k <= n:
+                hit = self.by_prefix.get(tuple(ids[n - k:]))
+                if hit:
+                    out |= hit
+        return out
 
 
 class NgramBanIndex:
