@@ -421,6 +421,15 @@ def _rate(tokens: int, t0: float, device: torch.device) -> float:
     return tokens / max(time.perf_counter() - t0, 1e-9)
 
 
+def _clip_per_group(optimizer, max_grad_norm: float) -> float:
+    """Clip AdamW and Muon groups independently, exactly as ``HybridOptimizer.step`` does; returns their hypot."""
+    norms = []
+    for opt in (optimizer.adamw, optimizer.muon):
+        gp = [p for g in opt.param_groups for p in g["params"] if p.grad is not None]
+        norms.append(float(torch.nn.utils.clip_grad_norm_(gp, max_grad_norm)) if gp else 0.0)
+    return math.hypot(*norms)
+
+
 def _micro_step(forward, ids, docs, num_loops, *, gen, device, amp_dtype, grad_accum_steps, scaler):
     """Forward and (if finite) backward for one micro-batch. Returns ``(out, loss_value, did_backward)``."""
     labels = ids.clone()
@@ -806,10 +815,7 @@ def train(
                 if scaler is not None:
                     # The grads are already unscaled and finite. Clip here, as HybridOptimizer.step would.
                     if max_grad_norm is not None:
-                        for grp in (optimizer.adamw, optimizer.muon):  # per group, as HybridOptimizer.step
-                            gp = [p for g in grp.param_groups for p in g["params"] if p.grad is not None]
-                            if gp:
-                                torch.nn.utils.clip_grad_norm_(gp, max_grad_norm)
+                        _clip_per_group(optimizer, max_grad_norm)
                     scaler.step(optimizer.muon)
                     scaler.step(optimizer.adamw)
                     scaler.update()

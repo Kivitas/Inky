@@ -651,7 +651,7 @@ class SelectiveSSMMixer(nn.Module):
     (``attn_mask``) are not supported.
     """
 
-    scan_chunk = 64  # tokens per chunk in the chunked scan; the within-chunk work is O(chunk^2 * N)
+    scan_chunk = 32  # tokens per chunk in the chunked scan; the within-chunk work is O(chunk^2 * N)
 
     def __init__(self, config: InkyConfig):
         super().__init__()
@@ -724,33 +724,42 @@ class SelectiveSSMMixer(nn.Module):
         """
         B, S, _ = u.shape
         C_max = self.scan_chunk
-        calc = torch.promote_types(u.dtype, torch.float32)  # cumulative sums & carry in at least float32
-        h = h0.to(calc)
+        calc = torch.promote_types(u.dtype, torch.float32)  # cumulative sums, weights & carry in at least float32
+        h = h0.to(calc)                                      # [B, d, N]
+        R = self.readout.to(calc)                            # [d, N]
         ys = []
         for c0 in range(0, S, C_max):
-            la = log_a[:, c0:c0 + C_max].to(calc)         # [B, C, N]
-            gc = g[:, c0:c0 + C_max].to(u.dtype)           # [B, C, N]
-            uc = u[:, c0:c0 + C_max]                       # [B, C, d]
+            la = log_a[:, c0:c0 + C_max].to(calc)           # [B, C, N]
+            gc = g[:, c0:c0 + C_max].to(calc)               # [B, C, N]
+            uc = u[:, c0:c0 + C_max].to(calc)               # [B, C, d]
             C = la.shape[1]
-            L = torch.cumsum(la, dim=1)                    # [B, C, N], non-increasing
-            diff = L.unsqueeze(2) - L.unsqueeze(1)         # [B, t, s, N] = L_t - L_s
+            L = torch.cumsum(la, dim=1)                     # [B, C, N], non-increasing
+            diff = L.unsqueeze(2) - L.unsqueeze(1)          # [B, t, s, N] = L_t - L_s
             causal = torch.ones(C, C, dtype=torch.bool, device=u.device).tril().view(1, C, C, 1)
-            W = torch.exp(diff.masked_fill(~causal, 0.0)).masked_fill(~causal, 0.0).to(u.dtype)
-            Mg = W * gc.unsqueeze(1)                       # [B, t, s, N], weight with the gate g_s
-            carry = torch.exp(L).unsqueeze(2) * h.unsqueeze(1)  # [B, C, d, N] in calc (fp32)
             if seg is not None:
-                seg_c = seg[:, c0:c0 + C_max]                                # [B, C]
-                same = seg_c.unsqueeze(2) == seg_c.unsqueeze(1)              # [B, t, s]: same segment
-                Mg = Mg * same.unsqueeze(-1).to(Mg.dtype)
+                seg_c = seg[:, c0:c0 + C_max]
+                causal = causal & (seg_c.unsqueeze(2) == seg_c.unsqueeze(1)).unsqueeze(-1)   # [B, t, s, 1]
+                last_run = (seg_c == seg_c[:, -1:])                                          # [B, C]
                 if c0 > 0:
-                    carry_mask = seg_c == seg[:, c0 - 1].unsqueeze(1)        # [B, C]: h belongs to token c0-1
+                    carry_ok = seg_c == seg[:, c0 - 1].unsqueeze(1)                          # [B, C]
                 else:
-                    carry_mask = torch.ones_like(seg_c, dtype=torch.bool)    # the initial state is zero anyway
-                carry = carry * carry_mask[:, :, None, None].to(carry.dtype)
-            intra = torch.matmul(Mg.permute(0, 3, 1, 2), uc.unsqueeze(1))   # [B, N, t, d]
-            h_chunk = intra.permute(0, 2, 3, 1).to(calc) + carry            # [B, C, d, N] in calc (fp32)
-            ys.append(torch.einsum("bcdn,dn->bcd", h_chunk.to(u.dtype), self.readout))
-            h = h_chunk[:, -1]
+                    carry_ok = torch.ones_like(seg_c, dtype=torch.bool)
+            Mg = torch.exp(diff.masked_fill(~causal, 0.0)).masked_fill(~causal, 0.0) * gc.unsqueeze(1)
+            # Readout folded into the weights: y[t, d] = sum_s u[s, d] * sum_n R[d, n] Mg[t, s, n]  (no [B, C, d, N])
+            Kw = (Mg.reshape(B, C * C, -1) @ R.t()).view(B, C, C, -1)                       # [B, t, s, d]
+            y = (Kw * uc.unsqueeze(1)).sum(2)                                               # [B, C, d]
+            eL = torch.exp(L)                                                               # [B, C, N]
+            if seg is not None:
+                eL = eL * carry_ok.unsqueeze(-1).to(calc)
+            y = y + eL @ (R * h).transpose(1, 2)                                            # carry readout [B, C, d]
+            ys.append(y.to(u.dtype))
+            # carried state: h_C = e^{L_C} h + sum_s e^{L_C - L_s} g_s u_s
+            w_end = torch.exp(L[:, -1:] - L) * gc                                           # [B, C, N]
+            decay_end = torch.exp(L[:, -1])                                                 # [B, N]
+            if seg is not None:
+                w_end = w_end * last_run.unsqueeze(-1).to(calc)
+                decay_end = decay_end * carry_ok[:, -1:].to(calc)
+            h = decay_end.unsqueeze(1) * h + uc.transpose(1, 2) @ w_end                    # [B, d, N]
         return torch.cat(ys, dim=1), h
 
 
@@ -1004,6 +1013,10 @@ class SharedExpertMoE(nn.Module):
 
         logits = self.router(flat)
         if expert_bias is not None:
+            if expert_bias.shape[-1] != self.num_routed or expert_bias.numel() != flat.shape[0] * self.num_routed:
+                raise ValueError(
+                    f"expert_bias must have {flat.shape[0]} x {self.num_routed} entries ([B, S, E] or [N, E]), "
+                    f"got shape {tuple(expert_bias.shape)}")
             logits = logits + expert_bias.reshape(-1, self.num_routed).to(logits.dtype)
         scores = torch.sigmoid(logits.float())
         _, idx = torch.topk(scores + self.balance_bias, self.top_k, dim=-1)
