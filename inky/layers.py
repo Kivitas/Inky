@@ -764,6 +764,9 @@ class GatedDeltaNetMixer(nn.Module):
     128k+ contexts while retaining associative key-value recall and document-boundary resets via segment_ids.
     """
 
+    chunk_size = 64            # tokens per chunk of the parallel prefill
+    recurrent_max_tokens = 1   # at most this many tokens use the plain recurrence (decode)
+
     def __init__(self, config: InkyConfig):
         super().__init__()
         d = config.hidden_size
@@ -805,28 +808,127 @@ class GatedDeltaNetMixer(nn.Module):
         q = F.normalize(self.q_proj(x).view(B, S, H, dh).to(calc), dim=-1)
         k = F.normalize(self.k_proj(x).view(B, S, H, dh).to(calc), dim=-1)
         v = self.v_proj(x).view(B, S, H, dh).to(calc)
-        alpha = torch.sigmoid(self.alpha_proj(x).to(calc)).unsqueeze(-1).unsqueeze(-1)  # [B, S, H, 1, 1]
-        beta = torch.sigmoid(self.beta_proj(x).to(calc)).unsqueeze(-1)                  # [B, S, H, 1]
+        log_alpha = F.logsigmoid(self.alpha_proj(x).to(calc))                            # [B, S, H]
+        beta = torch.sigmoid(self.beta_proj(x).to(calc))                                 # [B, S, H]
 
         state = x.new_zeros(B, H, dh, dh, dtype=calc) if past is None else past[0].to(calc)
+        if S <= self.recurrent_max_tokens:
+            y, state = self._recurrent(q, k, v, log_alpha, beta, state, seg)
+        else:
+            y, state = self._chunked(q, k, v, log_alpha, beta, state, seg)
+
+        y = y.reshape(B, S, H * dh).to(x.dtype)
+        y = F.silu(self.out_gate(x)) * y
+        present = (state, x.new_zeros(B, 1, 0))
+        return self.out_proj(y), present
+
+    @staticmethod
+    def _segment_index(seg: torch.Tensor) -> torch.Tensor:
+        """Run index of each token: increments at every change of id (a returning id is a NEW run, exactly
+        as the recurrent reference resets the state at every boundary)."""
+        change = torch.zeros_like(seg, dtype=torch.long)
+        change[:, 1:] = (seg[:, 1:] != seg[:, :-1]).long()
+        return change.cumsum(1)
+
+    def _recurrent(self, q, k, v, log_alpha, beta, state, seg=None):
+        """Reference per-token recurrence (also the decode path). Returns y [B, S, H, dh], state."""
+        B, S, H, dh = q.shape
+        alpha = torch.exp(log_alpha)
         ys = []
         for t in range(S):
             if seg is not None and t > 0:
                 same_doc = (seg[:, t] == seg[:, t - 1]).view(B, 1, 1, 1)
                 state = torch.where(same_doc, state, torch.zeros_like(state))
-            kt = k[:, t]                                                        # [B, H, dh]
-            vt = v[:, t]                                                        # [B, H, dh]
-            qt = q[:, t]                                                        # [B, H, dh]
+            kt, vt, qt = k[:, t], v[:, t], q[:, t]
             pred_v = torch.einsum("bhij,bhj->bhi", state, kt)                   # S_{t-1} k_t
-            delta = beta[:, t] * (vt - pred_v)                                  # [B, H, dh]
-            state = alpha[:, t] * state + torch.einsum("bhi,bhj->bhij", delta, kt)
-            yt = torch.einsum("bhij,bhj->bhi", state, qt)                       # [B, H, dh]
-            ys.append(yt)
+            delta = beta[:, t].unsqueeze(-1) * (vt - pred_v)
+            state = alpha[:, t][..., None, None] * state + torch.einsum("bhi,bhj->bhij", delta, kt)
+            ys.append(torch.einsum("bhij,bhj->bhi", state, qt))
+        return torch.stack(ys, dim=1), state
 
-        y = torch.stack(ys, dim=1).reshape(B, S, H * dh).to(x.dtype)
-        y = F.silu(self.out_gate(x)) * y
-        present = (state, x.new_zeros(B, 1, 0))
-        return self.out_proj(y), present
+    def _chunked(self, q, k, v, log_alpha, beta, state, seg=None):
+        """Chunkwise-parallel (WY / UT-transform) evaluation of the same recurrence.
+
+        With gamma_t the within-chunk cumulative decay, the state is S_t = gamma_t S_0 + sum_{s<=t}
+        (gamma_t / gamma_s) u_s k_s^T where the pseudo-values u solve the unit lower-triangular system
+        (I + L) U = beta * (V - gamma_prev * K S_0^T), L[t, s] = beta_t (gamma_{t-1}/gamma_s) k_t.k_s.
+        Everything that does not depend on S_0 (the triangular solves, masks, intra-chunk attention) is computed
+        for all chunks in parallel; only a 3-matmul state update remains sequential per chunk. All ratios
+        are exp of non-positive log-differences. Runs in fp32 (or wider). Segment resets mask the pairs and the
+        carried state by run index."""
+        B, S, H, dh = q.shape
+        Cs = self.chunk_size
+        dev, dt = q.device, q.dtype
+        pad = (-S) % Cs
+        if pad:  # pad with inert tokens at the end (beta=0, alpha=1 keep the state; outputs are discarded)
+            z4 = q.new_zeros(B, pad, H, dh)
+            q, k, v = torch.cat([q, z4], 1), torch.cat([k, z4], 1), torch.cat([v, z4], 1)
+            log_alpha = torch.cat([log_alpha, log_alpha.new_zeros(B, pad, H)], 1)
+            beta = torch.cat([beta, beta.new_zeros(B, pad, H)], 1)
+        T = q.shape[1]
+        n = T // Cs
+        sid = None
+        if seg is not None:
+            sid = self._segment_index(seg)
+            if pad:
+                sid = torch.cat([sid, sid[:, -1:].expand(B, pad)], 1)
+            sid = sid.view(B, n, Cs)
+        # -> [B, H, n, C, *]
+        def r4(a): return a.view(B, n, Cs, H, dh).permute(0, 3, 1, 2, 4)
+        def r3(a): return a.view(B, n, Cs, H).permute(0, 3, 1, 2)
+        qc, kc, vc = r4(q), r4(k), r4(v)
+        la, bt = r3(log_alpha), r3(beta)                                   # [B, H, n, C]
+        lg = torch.cumsum(la, dim=-1)                                      # log gamma_t
+        lgp = lg - la                                                      # log gamma_{t-1}
+        idx = torch.arange(Cs, device=dev)
+        tril = idx.view(-1, 1) >= idx.view(1, -1)                          # s <= t
+        stril = idx.view(-1, 1) > idx.view(1, -1)                          # s < t
+        if sid is not None:
+            same = (sid.unsqueeze(-1) == sid.unsqueeze(-2)).unsqueeze(1)   # [B, 1, n, C, C]
+            tril = tril & same
+            stril = stril & same
+        kk = kc @ kc.transpose(-1, -2)                                     # [B,H,n,C,C]
+        qk = qc @ kc.transpose(-1, -2)
+        r_prev = torch.exp((lgp.unsqueeze(-1) - lg.unsqueeze(-2)).masked_fill(~stril, 0.0)).masked_fill(~stril, 0.0)
+        r_cur = torch.exp((lg.unsqueeze(-1) - lg.unsqueeze(-2)).masked_fill(~tril, 0.0)).masked_fill(~tril, 0.0)
+        Lm = bt.unsqueeze(-1) * r_prev * kk
+        eye = torch.eye(Cs, dtype=dt, device=dev)
+        Tinv = torch.linalg.solve_triangular(Lm + eye, eye.expand_as(Lm), upper=False, unitriangular=True)
+        g_prev = torch.exp(lgp)                                            # gamma_{t-1}
+        g_cur = torch.exp(lg)
+        if sid is not None:
+            # carry from the previous chunk reaches token t iff no run change in (c0-1 .. t]
+            prev_last = torch.cat([sid[:, :1, :1] - 1, sid[:, :-1, -1:]], dim=1)   # [B, n, 1]
+            carry_ok = (sid == prev_last)                                  # [B, n, C]
+            cm = carry_ok.unsqueeze(1).to(dt)                              # [B, 1, n, C]
+            g_prev = g_prev * cm
+            g_cur = g_cur * cm
+            end_ok = (sid == sid[:, :, -1:]).unsqueeze(1)                  # tokens in the chunk's last run
+            carry_end = carry_ok[:, :, -1].unsqueeze(1)                    # [B, 1, n]
+        else:
+            end_ok = None
+        W0 = Tinv @ (bt.unsqueeze(-1) * vc)                                # [B,H,n,C,dh]
+        P = Tinv * (bt * g_prev).unsqueeze(-2)                             # Tinv @ diag(beta*gamma_prev)
+        A = r_cur * qk                                                     # intra-chunk read weights
+        # state-update weights: gamma_C / gamma_s (restricted to the last run when segmented)
+        w_end = torch.exp(lg[..., -1:] - lg)
+        if end_ok is not None:
+            w_end = w_end * end_ok.to(dt)
+        gC = torch.exp(lg[..., -1])                                        # [B,H,n]
+        if sid is not None:
+            gC = gC * carry_end.to(dt)
+        kw = kc * w_end.unsqueeze(-1)                                      # [B,H,n,C,dh]
+        ys = []
+        for c in range(n):
+            Sc = state                                                     # [B,H,dh(i),dh(j)]
+            KS = kc[:, :, c] @ Sc.transpose(-1, -2)                        # [B,H,C,dh_i] = (K S^T)
+            U = W0[:, :, c] - P[:, :, c] @ KS
+            QS = qc[:, :, c] @ Sc.transpose(-1, -2)
+            ys.append(g_cur[:, :, c].unsqueeze(-1) * QS + A[:, :, c] @ U)
+            state = gC[:, :, c, None, None] * Sc + U.transpose(-1, -2) @ kw[:, :, c]
+        y = torch.stack(ys, dim=2)                                         # [B,H,n,C,dh]
+        y = y.permute(0, 2, 3, 1, 4).reshape(B, T, H, dh)[:, :S]
+        return y, state
 
 
 class SwiGLU(nn.Module):
@@ -1125,27 +1227,36 @@ class InkyBlock(nn.Module):
         return out, (c_store, k_store), present, aux
 
 
+def _deep_loop_damp(step: int, max_loops: int, enabled: bool = True) -> float:
+    """Scale for loops beyond ``max_loops``: ``max_loops / step`` (1.0 inside the trained range or when off)."""
+    if enabled and max_loops > 0 and step > max_loops:
+        return float(max_loops) / float(step)
+    return 1.0
+
+
 class LoopStepModulation(nn.Module):
     """FiLM scale and shift that depend on the loop index. Starts as the identity.
 
     For loop indices beyond ``max_loops`` (e.g. ``reasoning_mode='max'`` running 10 loops on a 6-loop
     config), clamps to the last learned step embedding and damps the modulation smoothly by
-    ``max_loops / step``.
+    ``max_loops / step`` (``damp_deep=False`` reuses the last embedding undamped).
     """
 
-    def __init__(self, hidden_size: int, max_loops: int):
+    def __init__(self, hidden_size: int, max_loops: int, damp_deep: bool = True):
         super().__init__()
         self.max_loops = int(max_loops)
+        self.damp_deep = bool(damp_deep)
         self.step_embedding = nn.Parameter(torch.zeros(max_loops + 1, 2 * hidden_size))
 
     def forward(self, h: torch.Tensor, step: int) -> torch.Tensor:
-        idx = min(max(int(step), 0), self.step_embedding.shape[0] - 1)
-        scale, shift = self.step_embedding[idx].chunk(2, dim=-1)
-        if step > self.max_loops and self.max_loops > 0:
-            damp = float(self.max_loops) / float(step)
-            scale = scale * damp
-            shift = shift * damp
-        return h * (1.0 + scale) + shift
+        step = int(step)
+        idx = min(max(step, 0), self.step_embedding.shape[0] - 1)
+        emb = self.step_embedding[idx]
+        damp = _deep_loop_damp(step, self.max_loops, self.damp_deep)
+        if damp != 1.0:
+            emb = emb * damp
+        scale, shift = emb.to(h.dtype).chunk(2, dim=-1)
+        return torch.addcmul(shift, h, 1.0 + scale)
 
 
 class ModeConditioner(nn.Module):
@@ -1153,6 +1264,8 @@ class ModeConditioner(nn.Module):
 
     Starts at 0 (identity) so the model starts identical to an unconditioned baseline and can learn
     distinct circuit modulations for low/high/max thinking depth and formal/informal human register.
+    The two FiLMs are composed into a single scale/shift (on the small [D] vectors) so ``h`` is touched
+    once. Unknown mode names raise ``ValueError`` rather than silently doing nothing.
     """
 
     _REASONING_IDX = {"low": 0, "high": 1, "max": 2}
@@ -1169,13 +1282,24 @@ class ModeConditioner(nn.Module):
         reasoning_mode: Optional[str] = None,
         style_mode: Optional[str] = None,
     ) -> torch.Tensor:
-        if reasoning_mode is not None and reasoning_mode in self._REASONING_IDX:
-            r_scale, r_shift = self.reasoning_embed[self._REASONING_IDX[reasoning_mode]].chunk(2, dim=-1)
-            h = h * (1.0 + r_scale.to(h.dtype)) + r_shift.to(h.dtype)
-        if style_mode is not None and style_mode in self._STYLE_IDX:
+        if reasoning_mode is not None and reasoning_mode not in self._REASONING_IDX:
+            raise ValueError(f"reasoning_mode must be one of {tuple(self._REASONING_IDX)}, got {reasoning_mode!r}")
+        if style_mode is not None and style_mode not in self._STYLE_IDX:
+            raise ValueError(f"style_mode must be one of {tuple(self._STYLE_IDX)}, got {style_mode!r}")
+        if reasoning_mode is None and style_mode is None:
+            return h
+        # (1 + s_r) * (1 + s_s) and t_r * (1 + s_s) + t_s: the composition of the two FiLMs, on [D] vectors.
+        scale = shift = None
+        if reasoning_mode is not None:
+            scale, shift = self.reasoning_embed[self._REASONING_IDX[reasoning_mode]].chunk(2, dim=-1)
+            scale = 1.0 + scale
+        if style_mode is not None:
             s_scale, s_shift = self.style_embed[self._STYLE_IDX[style_mode]].chunk(2, dim=-1)
-            h = h * (1.0 + s_scale.to(h.dtype)) + s_shift.to(h.dtype)
-        return h
+            if scale is None:
+                scale, shift = 1.0 + s_scale, s_shift
+            else:
+                scale, shift = scale * (1.0 + s_scale), shift * (1.0 + s_scale) + s_shift
+        return torch.addcmul(shift.to(h.dtype), h, scale.to(h.dtype))
 
 
 class StateSpaceMemoryHighway(nn.Module):
@@ -1360,7 +1484,10 @@ class RecurrentCore(nn.Module):
             InkyBlock(config, residual_scale=scale, use_ssm=i in mixer_layers)
             for i in range(config.num_recurrent_layers)
         )
-        self.step_mod = LoopStepModulation(config.hidden_size, config.max_recurrent_loops) \
+        self.deep_damp = bool(getattr(config, "deep_loop_damping", True))
+        self.beta_min = float(getattr(config, "loop_beta_min", 0.05))
+        self.beta_span = float(getattr(config, "loop_beta_max", 0.95)) - self.beta_min
+        self.step_mod = LoopStepModulation(config.hidden_size, config.max_recurrent_loops, self.deep_damp) \
             if config.use_step_modulation else None
         # use_highway=False (ablation) does not create the module, so parameter counts reflect it.
         self.ssm = StateSpaceMemoryHighway(
@@ -1397,13 +1524,14 @@ class RecurrentCore(nn.Module):
 
     def _mix_update(self, h_in: torch.Tensor, h_new: torch.Tensor, step: int) -> torch.Tensor:
         """Damped residual update across loops, with optional per-token thought gate and deep-loop damping."""
-        beta = (0.05 + 0.90 * torch.sigmoid(self.damped_beta)).view(*([1] * (h_in.ndim - 1)), -1).to(h_in.dtype)
-        if step > self.max_loops and self.max_loops > 0:
-            beta = beta * (float(self.max_loops) / float(step))
+        beta = (self.beta_min + self.beta_span * torch.sigmoid(self.damped_beta)).to(h_in.dtype)
+        damp = _deep_loop_damp(step, self.max_loops, self.deep_damp)
+        if damp != 1.0:
+            beta = beta * damp
         if self.thought_gate is not None:
             gate = torch.sigmoid(self.thought_gate(torch.cat([h_in, h_new], dim=-1)))
             beta = beta * (2.0 * gate)
-        return (1.0 - beta) * h_in + beta * h_new
+        return torch.lerp(h_in, h_new, beta)      # (1 - beta) * h_in + beta * h_new, broadcast over [D]
 
     def _inject(self, x: torch.Tensor, h0: Optional[torch.Tensor]) -> torch.Tensor:
         """``x + inject_gain * h0`` when injection is on (``h0`` is the prelude output), else ``x``."""
@@ -1443,8 +1571,9 @@ class RecurrentCore(nn.Module):
         if self.additive_step_embed is not None:
             idx = min(max(int(step), 0), self.additive_step_embed.shape[0] - 1)
             e_t = self.additive_step_embed[idx].to(h.dtype)
-            if step > self.max_loops and self.max_loops > 0:
-                e_t = e_t * (float(self.max_loops) / float(step))
+            damp = _deep_loop_damp(int(step), self.max_loops, self.deep_damp)
+            if damp != 1.0:
+                e_t = e_t * damp
             h = h + e_t
         window = self.local_window if step in self.local_loops else None
         if self.step_mod is not None:
