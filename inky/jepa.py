@@ -310,6 +310,7 @@ class JEPAController(nn.Module):
         softmin_temp: float = 0.5,
         vicreg_var_coef: float = 0.1,
         vicreg_cov_coef: float = 0.04,
+        gate_temp: float = 0.1,
         rms_norm_eps: float = 1e-6,
     ):
         super().__init__()
@@ -324,6 +325,11 @@ class JEPAController(nn.Module):
             convergence_eps = float(getattr(config, "jepa_convergence_eps", convergence_eps))
             mem_threshold = float(getattr(config, "jepa_mem_threshold", mem_threshold))
             lambda_compute = float(getattr(config, "jepa_compute_penalty", lambda_compute))
+            alpha_cos = float(getattr(config, "jepa_alpha_cos", alpha_cos))
+            softmin_temp = float(getattr(config, "jepa_softmin_temp", softmin_temp))
+            vicreg_var_coef = float(getattr(config, "jepa_vicreg_var_coef", vicreg_var_coef))
+            vicreg_cov_coef = float(getattr(config, "jepa_vicreg_cov_coef", vicreg_cov_coef))
+            gate_temp = float(getattr(config, "jepa_gate_temp", gate_temp))
         elif isinstance(config, int):
             hidden_size = int(config)
 
@@ -342,6 +348,9 @@ class JEPAController(nn.Module):
         self.num_routed_experts = int(num_routed_experts)
         self.convergence_eps = float(convergence_eps)
         self.mem_threshold = float(mem_threshold)
+        if float(gate_temp) <= 0.0:
+            raise ValueError(f"gate_temp must be > 0, got {gate_temp}")
+        self.gate_temp = float(gate_temp)
         self.vicreg_var_coef = float(vicreg_var_coef)
         self.vicreg_cov_coef = float(vicreg_cov_coef)
 
@@ -407,10 +416,12 @@ class JEPAController(nn.Module):
 
         # Memory bank fetch gate: triggers when combined latent uncertainty + energy exceeds tau_mem.
         uncertainty = torch.sigmoid(self.uncertainty_head(z_t).squeeze(-1))
-        mem_score = 0.5 * (energy + uncertainty)
+        # Squash energy to [0, 1) so it is commensurate with tau_mem and the soft gate never saturates.
+        energy_n = energy.clamp(min=0.0) / (1.0 + energy.clamp(min=0.0))
+        mem_score = 0.5 * (energy_n + uncertainty)
         hard_gate = (mem_score > self.mem_threshold).to(z_t.dtype)
         if self.training:
-            soft_gate = torch.sigmoid((mem_score - self.mem_threshold) / 0.1)
+            soft_gate = torch.sigmoid((mem_score - self.mem_threshold) / self.gate_temp)
             fetch_gate = hard_gate - soft_gate.detach() + soft_gate
         else:
             fetch_gate = hard_gate
@@ -486,12 +497,17 @@ class JEPAController(nn.Module):
 
         return total_loss / float(len(z_pred_list))
 
-    def memory_footprint_bytes(self, bits: int = 4) -> Dict[str, float]:
-        """Compute active and total memory budget estimates for mobile deployment.
+    def memory_footprint_bytes(
+        self, bits: int = 4, memory_bank: Optional[nn.Module] = None
+    ) -> Dict[str, float]:
+        """Memory budget estimates against the 1.3 GB mobile ceiling.
 
-        Verifies that the ~15M controller budget, 50M active core, 300M total core, and
-        1.8B memory-mapped knowledge bank at ``bits``-bit quantization fit well within the
-        1.3 GB mobile ceiling.
+        The ceiling is a RAM budget, so ``within_mobile_ceiling`` checks the *active resident*
+        footprint (controller + ~50M active core + any resident non-table bank parameters, i.e.
+        the sub-key codebooks and projections of ``memory_bank``). The mmap-backed value table
+        is paged from storage and is reported separately (``mmap_bank_bytes``); the stricter
+        everything-resident total is ``within_total_ceiling``. When ``memory_bank`` is given its
+        real ``value_table.storage_bytes`` replaces the nominal 1.8B-parameter bank estimate.
         """
         if int(bits) < 1:
             raise ValueError(f"bits must be >= 1, got {bits}")
@@ -502,8 +518,16 @@ class JEPAController(nn.Module):
         active_core_bytes = 50_000_000.0 * bytes_per_param
         total_core_bytes = 300_000_000.0 * bytes_per_param
         mmap_bank_bytes = 1_800_000_000.0 * bytes_per_param
-        active_ram_bytes = controller_bytes + active_core_bytes
-        total_bytes = controller_budget_bytes + total_core_bytes + mmap_bank_bytes
+        resident_bank_bytes = 0.0
+        if memory_bank is not None:
+            vt = getattr(memory_bank, "value_table", None)
+            resident_bank_bytes = float(
+                sum(p.numel() for p in memory_bank.parameters())
+            ) * bytes_per_param
+            if vt is not None:
+                mmap_bank_bytes = float(vt.storage_bytes)
+        active_ram_bytes = controller_bytes + active_core_bytes + resident_bank_bytes
+        total_bytes = controller_budget_bytes + total_core_bytes + mmap_bank_bytes + resident_bank_bytes
         mobile_ceiling_bytes = 1_300_000_000.0
 
         return {
@@ -514,8 +538,10 @@ class JEPAController(nn.Module):
             "active_core_bytes": active_core_bytes,
             "total_core_bytes": total_core_bytes,
             "mmap_bank_bytes": mmap_bank_bytes,
+            "resident_bank_bytes": resident_bank_bytes,
             "active_ram_bytes": active_ram_bytes,
             "total_bytes": total_bytes,
             "mobile_ceiling_bytes": mobile_ceiling_bytes,
-            "within_mobile_ceiling": 1.0 if total_bytes <= mobile_ceiling_bytes else 0.0,
+            "within_mobile_ceiling": 1.0 if active_ram_bytes <= mobile_ceiling_bytes else 0.0,
+            "within_total_ceiling": 1.0 if total_bytes <= mobile_ceiling_bytes else 0.0,
         }
