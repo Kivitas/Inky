@@ -323,6 +323,7 @@ class JEPAController(nn.Module):
             horizon = int(getattr(config, "jepa_horizon", horizon))
             convergence_eps = float(getattr(config, "jepa_convergence_eps", convergence_eps))
             mem_threshold = float(getattr(config, "jepa_mem_threshold", mem_threshold))
+            lambda_compute = float(getattr(config, "jepa_compute_penalty", lambda_compute))
         elif isinstance(config, int):
             hidden_size = int(config)
 

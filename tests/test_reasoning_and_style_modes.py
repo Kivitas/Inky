@@ -184,3 +184,30 @@ def test_generate_and_sample_cli_with_reasoning_and_style_modes():
     preset = InkyConfig.human_reasoning()
     assert preset.max_recurrent_loops == 10
     assert "human_reasoning" in ablate.VARIANTS
+
+
+def test_style_profile_values_and_generate_applies_them(monkeypatch):
+    import inky.generation as gen
+
+    f, i = get_style_profile("formal"), get_style_profile("informal")
+    assert (f["temperature"], f["top_p"], f["top_k"], f["min_p"], f["repetition_penalty"]) == (0.7, 0.90, 40, 0.05, 1.12)
+    assert (i["temperature"], i["top_p"], i["top_k"], i["min_p"], i["repetition_penalty"]) == (0.85, 0.95, 60, 0.03, 1.08)
+    assert f["no_repeat_ngram_size"] == i["no_repeat_ngram_size"] == 4
+
+    seen = []
+    real = gen._sample
+
+    def spy(logits, temperature, top_k, top_p, min_p=0.0):
+        seen.append((temperature, top_k, top_p, min_p))
+        return real(logits, temperature, top_k, top_p, min_p)
+
+    monkeypatch.setattr(gen, "_sample", spy)
+    torch.manual_seed(0)
+    model = InkyModel(_tiny_cfg()).eval()
+    prompt = torch.tensor([[10, 11, 12]])
+    model.generate(prompt, max_new_tokens=2, style_mode="informal", encode=sample_script.CharCodec().encode)
+    assert seen and seen[0] == (0.85, 60, 0.95, 0.03)
+    seen.clear()
+    model.generate(prompt, max_new_tokens=2, style_mode="formal", temperature=0.5,
+                   encode=sample_script.CharCodec().encode)
+    assert seen[0] == (0.5, 40, 0.90, 0.05)
