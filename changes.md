@@ -49,9 +49,9 @@ Implemented in `inky/layers.py` (`GatedDeltaNetMixer`, `SelectiveSSMMixer`, `Mul
 - **`GatedDeltaNetMixer` ($\mathcal{O}(1)$ Fast-Weight Matrix State)**:
   - Maintains a constant-size per-head associative matrix state $S_t \in \mathbb{R}^{H \times d_h \times d_h}$ updated via the Gated Delta Rule:
     $$S_t = \alpha_t S_{t-1} + \beta_t \left(v_t - S_{t-1} k_t\right) k_t^\top, \qquad y_t = S_t q_t$$
-  - Supports document-boundary state resets via `segment_ids` (prefill only; combining with a cache raises `ValueError`) and $\mathcal{O}(1)$ single-token cached decoding. Prefill is a sequential per-token loop. State is carried in fp32.
+  - Supports document-boundary state resets via `segment_ids` (prefill only; combining with a cache raises `ValueError`) and $\mathcal{O}(1)$ single-token cached decoding. Prefill uses a chunkwise WY-transform (chunk 64, fp32, exact vs the per-token reference to ~1e-16 in double); the per-token loop remains as the decode path and test reference. State is carried in fp32.
 - **Fast $\mathcal{O}(1)$ `SelectiveSSMMixer` Decode & FP32 Carry**:
-  - Per-channel diagonal state `[B, hidden, ssm_state_dim]`. Single-token decode step bypasses chunked scan matrix construction when $S = 1$, keeping recurrent carry state $h$ in `float32` across chunks and decode steps.
+  - Per-channel diagonal state `[B, hidden, ssm_state_dim]`; chunked scan rewritten without the `[B,C,d,N]` tensor (~6.7x faster on CPU, see `scripts/bench_mixers.py`). Single-token decode step bypasses chunked scan matrix construction when $S = 1$, keeping recurrent carry state $h$ in `float32` across chunks and decode steps.
 - **128k Context Hybrid Presets (`InkyConfig.hybrid_linear_128k`)**:
   - Combines Multi-Head Latent Attention (MLA, compressed latent KV cache `LatentKV`) with linear recurrent layers at a **`1:3`** ($3$ linear : $1$ MLA) or **`1:7`** ($7$ linear : $1$ MLA) ratio with `max_position_embeddings = 131072` (128k context).
 
@@ -79,10 +79,10 @@ Implemented in `inky/memory_bank.py` (`ProductKeyMemoryBank`, `QuantizedValueTab
    - Projects normalized hidden state $\tilde{h}_t = \text{RMSNorm}(h_t)$ into $q_t = W_q \tilde{h}_t = [q_t^{(1)} \| q_t^{(2)}]$, computes sub-scores $s^{(1)} = C^{(1)} q_t^{(1)}$ and $s^{(2)} = C^{(2)} q_t^{(2)}$ in $\mathcal{O}(S \cdot d_k)$, and selects exact global Top-$K$ winners $\mathcal{I}^*$ over the $K^2$ Cartesian pairs $\mathcal{I}_1 \times \mathcal{I}_2$.
    - Also supports $\mathcal{O}(1)$ deterministic multi-head polynomial rolling $m$-gram hash routing (`routing_mode="hash"`).
 3. **Sparse Value Gather & Attention Aggregation**:
-   - Transfers (mmap supported; the `pin_memory` option exists but is not wired by the bank) strictly $K \cdot d_{\text{mem}}$ values per token from host RAM/NVMe, dequantizes on-device, and aggregates with scaled softmax weights:
+   - Transfers (mmap supported; `pkm_pin_memory` stages gathers through a pinned buffer on CUDA, untested without a GPU) strictly $K \cdot d_{\text{mem}}$ values per token from host RAM/NVMe, dequantizes on-device, and aggregates with scaled softmax weights:
      $$\alpha_j = \frac{\exp(z_j / \sqrt{d_k})}{\sum_{r=1}^K \exp(z_r / \sqrt{d_k})}, \qquad m_t = \sum_{j=1}^K \alpha_j v_{i_j}$$
 4. **Gated Residual Injection into the Looped Core**:
-   - At designated loop steps $t \in \mathcal{T}_{\text{query}}$, fuses retrieved memory via token-conditioned sigmoid gating (multiplied by JEPA's `fetch_gate` $g_{\text{mem}}$). Defaults: bank `top_k=8`; `InkyConfig` `pkm_top_k=4`, `pkm_query_steps=(1,3,5)`:
+   - At designated loop steps $t \in \mathcal{T}_{\text{query}}$, fuses retrieved memory via token-conditioned sigmoid gating with a zero-init learned per-loop-step bias (`pkm_step_gate`), multiplied by JEPA's `fetch_gate` $g_{\text{mem}}$. Defaults: bank `top_k=8`; `InkyConfig` `pkm_top_k=4`, `pkm_query_steps=(1,3,5)`:
      $$\hat{m}_t = W_{\text{out}} m_t, \qquad g_t = \sigma\!\left(W_g [\tilde{h}_t \| \hat{m}_t] + b_g\right), \qquad u_t = h_t + g_t \odot \hat{m}_t$$
 
 ---
@@ -100,8 +100,8 @@ Implemented in `inky/jepa.py` (`JEPAController`, `LatentStateEncoder`, `LatentWo
      $$E(\hat{z}, z_{\text{goal}}, t) = \|\hat{z}_{t+H} - z_{\text{goal}}\|_2^2 + \alpha_{\text{cos}}\!\left(1 - \cos(\hat{z}_{t+H}, z_{\text{goal}})\right) + \lambda_{\text{compute}} \cdot t$$
    - Selects optimal action plan $a_t^* = \arg\min_{a_t} E(\hat{z}, z_{\text{goal}}, t)$ with straight-through softmin differentiability during training.
 4. **Executive Control Signals & Self-Supervised VICReg Loss**:
-   - Emits per-loop **Bank Fetch Gate** (hard 0/1 in eval, straight-through in training, when $0.5(\text{energy}+\sigma(\text{uncertainty}))>\tau_{\text{mem}}$), **MoE Expert Bias** ($b_{\text{moe}}$), and **Adaptive Loop Halting** ($p_{\text{halt}} = \sigma(w_h^\top z_t)$, boosted upon latent convergence $\|\hat{z}_{t+1} - z_t\|_2 < \epsilon$; averaged with the model's halting gate). $\alpha_{\text{cos}}$ is fixed at 0.5; `jepa_compute_penalty` now sets $\lambda_{\text{compute}}$. The JEPA loss pairs each loop's prediction with that loop's output state.
-   - Trains via stop-gradient multi-step latent prediction + VICReg variance/covariance anti-collapse regularization (`jepa_loss`), and reports footprint via `memory_footprint_bytes` (`active_ram_bytes` = controller + ~50M core; `within_mobile_ceiling` compares the total at the given bit width).
+   - Emits per-loop **Bank Fetch Gate** (hard 0/1 in eval, straight-through in training, when $0.5(\text{energy}+\sigma(\text{uncertainty}))>\tau_{\text{mem}}$), **MoE Expert Bias** ($b_{\text{moe}}$), and **Adaptive Loop Halting** ($p_{\text{halt}} = \sigma(w_h^\top z_t)$, boosted upon latent convergence $\|\hat{z}_{t+1} - z_t\|_2 < \epsilon$; averaged with the model's halting gate). $\alpha_{\text{cos}}$ (`jepa_alpha_cos`), softmin temperature, VICReg coefficients and gate temperature are configurable; the fetch-gate energy is squashed as $E/(1+E)$ so `uncertainty_head` receives gradient; `jepa_compute_penalty` sets $\lambda_{\text{compute}}$. The JEPA loss pairs each loop's prediction with that loop's output state.
+   - Trains via stop-gradient multi-step latent prediction + VICReg variance/covariance anti-collapse regularization (`jepa_loss`), and reports footprint via `memory_footprint_bytes` (`active_ram_bytes` = controller + ~50M core; `within_mobile_ceiling` checks active RAM against 1.3 GB; `within_total_ceiling` checks the total).
 
 ---
 
@@ -132,3 +132,14 @@ Implemented in `inky/grpo.py` (`ContinualGRPOTrainer`, `UserPreferenceProfile`, 
   - Added `"dense_unrolled"`, `"dense_param_match"`, `"mqa"`, and `"human_reasoning"` variants in `scripts/ablate.py`.
   - Added memory-bounded `chunked_distillation_loss` in `inky/distill.py` (chunks are checkpointed under grad).
   - Added `--gradient-checkpointing` to `scripts/train.py` and `[project.scripts]` CLI entrypoints (`inky-train`, `inky-sample`, `inky-ablate`, `inky-diagnose`, `inky-bench`) in `pyproject.toml`.
+
+---
+
+## 9. Quality Pass (Loops, Style, Mixers, PKM/JEPA, GRPO)
+
+- **Generation/style**: one fp32 logit copy per decode step; `BadWordIndex` (~99x faster bad-word lookup); validated sampling args and `style_overrides`; fused `ModeConditioner` FiLM; configurable `loop_beta_min/max`, `deep_loop_damping`, `style_profile_overrides`.
+- **Halting**: fixed NaN gradient in convergence-aware halting when a token's state is unchanged (epsilon inside the sqrt).
+- **GRPO**: zero-variance/NaN groups yield zero advantage and skip the update; non-finite steps are skipped (`nonfinite_skips`); `length_norm`, `ref_mode="copy"|"params"|"none"` (always under `no_grad`); `UserPreferenceProfile.decay/save/load`.
+- **Training**: fp16 GradScaler path clips per optimizer group (`_clip_per_group`).
+- **Tests**: new suites `test_loops_and_style_quality`, `test_mixers_parallel`, `test_pkm_jepa_quality`, `test_grpo_robust`, `test_distill_chunked`, `test_train_scaler_clip`.
+- **Known gaps**: MLA and hybrid/MoE presets unchanged; no GPU/Triton benchmarks; with both `num_loops` and a mode set, the halting prior still follows the mode; `ref_mode="params"` does not snapshot buffers (KL differs ~5e-3 from `"copy"`); `generate` profile precedence compares against signature defaults.
