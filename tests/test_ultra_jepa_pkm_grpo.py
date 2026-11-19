@@ -393,3 +393,9 @@ def test_hybrid_linear_gated_deltanet_and_ultra_sparse_jepa_model() -> None:
             style_mode=style,
         )
         assert gen.shape == (1, 5)
+
+
+def test_jepa_config_wires_compute_penalty() -> None:
+    from inky.jepa import JEPAController
+    cfg = InkyConfig.ultra_sparse_jepa(jepa_compute_penalty=0.123)
+    assert abs(JEPAController(cfg).critic.lambda_compute - 0.123) < 1e-9

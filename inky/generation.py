@@ -108,6 +108,17 @@ class InkyGenerationMixin:
             style_ctrl = build_style_controls(eff_style, encode=encode)
             if min_p == 0.0:
                 min_p = float(style_ctrl["min_p"])
+            # Profile sampling params replace the signature defaults only (explicit values win).
+            if temperature == 0.8:
+                temperature = float(style_ctrl["temperature"])
+            if top_k == 50:
+                top_k = int(style_ctrl["top_k"])
+            if top_p == 0.95:
+                top_p = float(style_ctrl["top_p"])
+            if repetition_penalty == 1.1:
+                repetition_penalty = float(style_ctrl["repetition_penalty"])
+            if no_repeat_ngram_size == 4:
+                no_repeat_ngram_size = int(style_ctrl["no_repeat_ngram_size"])
             if style_ctrl["bad_word_ids"]:
                 valid_bads = [
                     s for s in style_ctrl["bad_word_ids"] if all(0 <= int(t) < cfg.vocab_size for t in s)

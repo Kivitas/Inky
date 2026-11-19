@@ -623,8 +623,9 @@ class InkyModel(InkyGenerationMixin, InkyDecisionMixin, PreTrainedModel):
                 "moe_aux": moe_aux.detach(),
                 "ponder_kl": kl.detach(),
             }
-            if self.jepa is not None and len(loop_states) >= 2:
-                j_loss = self.jepa.jepa_loss(jepa_z_preds[:-1], loop_states[1:])
+            if self.jepa is not None and len(loop_states) >= 1:
+                # z_pred computed from the loop input at step n predicts that step's output state.
+                j_loss = self.jepa.jepa_loss(jepa_z_preds, loop_states)
                 loss = loss + float(getattr(self.config, "jepa_loss_coef", 0.1)) * j_loss
                 parts["jepa_loss"] = j_loss.detach()
             return InkyOutput(loss=loss, past=cache, moe_aux_loss=moe_aux, mean_loops=mean_loops,
