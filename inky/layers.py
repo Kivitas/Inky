@@ -1829,7 +1829,7 @@ class PonderHalting(nn.Module):
             p_base = min(max(self.prior_lambda, 1e-4), 1.0 - 1e-4)
             logit = logit + (math.log(p_target / (1.0 - p_target)) - math.log(p_base / (1.0 - p_base)))
         if prev_h is not None and convergence_weight > 0.0:
-            delta = (h.float() - prev_h.float()).pow(2).mean(dim=-1).sqrt()
+            delta = (h.float() - prev_h.float()).pow(2).mean(dim=-1).add(1e-12).sqrt()
             norm = h.float().pow(2).mean(dim=-1).add(1e-6).sqrt()
             rel_vel = (delta / norm).clamp(0.0, 2.0)
             logit = logit - float(convergence_weight) * (rel_vel - 0.5)
