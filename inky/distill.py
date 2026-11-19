@@ -8,6 +8,7 @@ from typing import Callable, Optional, Tuple
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 
 
 def shift_for_next_token(
@@ -98,15 +99,27 @@ def chunked_distillation_loss(
     scale = float(temperature) ** 2
     soft_sum = student_hidden.new_zeros((), dtype=torch.float32)
     hard_sum = student_hidden.new_zeros((), dtype=torch.float32)
+    def _chunk_terms(h_c, t_c, y_c):
+        s_c = project_fn(h_c).float()
+        log_s = F.log_softmax(s_c / temperature, dim=-1)
+        log_t = F.log_softmax(t_c.float().detach() / temperature, dim=-1)
+        soft_c = F.kl_div(log_s, log_t, reduction="sum", log_target=True) * scale
+        hard_c = F.cross_entropy(s_c, y_c, reduction="sum") if y_c is not None else soft_c.new_zeros(())
+        return soft_c, hard_c
+
+    use_ckpt = torch.is_grad_enabled() and h_flat.requires_grad
     for start in range(0, total_tokens, chunk):
         end = min(start + chunk, total_tokens)
-        s_c = project_fn(h_flat[start:end]).float()
-        t_c = t_flat[start:end].float().detach()
-        log_s = F.log_softmax(s_c / temperature, dim=-1)
-        log_t = F.log_softmax(t_c / temperature, dim=-1)
-        soft_sum = soft_sum + F.kl_div(log_s, log_t, reduction="sum", log_target=True) * scale
-        if y_flat is not None:
-            hard_sum = hard_sum + F.cross_entropy(s_c, y_flat[start:end], reduction="sum")
+        y_c = y_flat[start:end] if y_flat is not None else None
+        if use_ckpt:
+            # Recompute each chunk's [chunk, V] logits in backward so they are not all kept alive.
+            soft_c, hard_c = torch.utils.checkpoint.checkpoint(
+                _chunk_terms, h_flat[start:end], t_flat[start:end], y_c, use_reentrant=False
+            )
+        else:
+            soft_c, hard_c = _chunk_terms(h_flat[start:end], t_flat[start:end], y_c)
+        soft_sum = soft_sum + soft_c
+        hard_sum = hard_sum + hard_c
 
     soft = soft_sum / total_tokens
     if y_flat is None:

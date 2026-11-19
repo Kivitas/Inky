@@ -134,3 +134,8 @@ def test_train_cli_gradient_checkpointing_and_pyproject_scripts():
     scripts_tbl = pyproject["project"]["scripts"]
     for cmd in ("inky-train", "inky-sample", "inky-ablate", "inky-diagnose", "inky-bench"):
         assert cmd in scripts_tbl
+    import importlib
+
+    for target in scripts_tbl.values():
+        module_name, func_name = target.split(":")
+        assert callable(getattr(importlib.import_module(module_name), func_name))

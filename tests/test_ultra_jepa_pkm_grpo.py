@@ -399,3 +399,32 @@ def test_jepa_config_wires_compute_penalty() -> None:
     from inky.jepa import JEPAController
     cfg = InkyConfig.ultra_sparse_jepa(jepa_compute_penalty=0.123)
     assert abs(JEPAController(cfg).critic.lambda_compute - 0.123) < 1e-9
+
+
+def test_linear_mixers_fp32_carry_and_moe_expert_bias_steering() -> None:
+    from inky.layers import SelectiveSSMMixer, SharedExpertMoE
+
+    torch.manual_seed(3)
+    cfg = _tiny_ultra_config()
+    x = torch.randn(2, 6, cfg.hidden_size).bfloat16()
+    seg = torch.tensor([[0, 0, 1, 1, 1, 2], [0, 0, 0, 1, 1, 1]])
+    for cls in (GatedDeltaNetMixer, SelectiveSSMMixer):
+        m = cls(cfg).to(torch.bfloat16).eval()
+        with torch.no_grad():
+            _, p = m(x)
+            assert p[0].dtype == torch.float32          # prefill carry kept in fp32
+            _, p = m(x[:, :1], past=p)
+            assert p[0].dtype == torch.float32          # single-token decode carry kept in fp32
+            out, _ = m(x, segment_ids=seg)
+            alone, _ = m(x[:, 2:5])
+            assert torch.allclose(out[0, 2:5].float(), alone[0].float(), atol=5e-2)
+
+    moe = SharedExpertMoE(cfg).eval()
+    bias = torch.zeros(1, 5, cfg.num_routed_experts)
+    bias[..., 3] = 50.0
+    with torch.no_grad():
+        moe(torch.randn(1, 5, cfg.hidden_size), expert_bias=bias)
+    assert int(moe.load_counts.argmax()) == 3
+    moe.update_balance_bias()
+    assert moe.balance_bias[3] < 0 < moe.balance_bias[0]
+    assert torch.allclose(moe.balance_bias.abs(), torch.full_like(moe.balance_bias, cfg.balance_rate))

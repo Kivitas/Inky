@@ -15,7 +15,7 @@ Parameter partitioning (see ``assign_parameter_groups``; deterministic, follows
 
 Step order per training step (strict coupling, as in EOS):
   1. loss.backward()
-  2. clip_grad_norm over all parameters (one global norm, both groups)
+  2. clip_grad_norm per group (Muon and AdamW clipped independently; returned norm is their hypot)
   3. muon.step()
   4. adamw.step()
 
