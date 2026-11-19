@@ -245,6 +245,17 @@ class InkyConfig(PretrainedConfig):
         # use_mode_conditioning: learned FiLM embeddings for reasoning_mode ("low"/"high"/"max") and
         # style_mode ("formal"/"informal").
         use_mode_conditioning: bool = False,
+        # Loop-update hyperparameters (previously hard-coded in RecurrentCore). The damped residual update
+        # uses beta = loop_beta_min + (loop_beta_max - loop_beta_min) * sigmoid(damped_beta); the defaults
+        # (0.05, 0.95) reproduce the earlier 0.05 + 0.90 * sigmoid. deep_loop_damping scales the update, the
+        # step modulation and the additive step embedding by max_recurrent_loops / step for loops beyond
+        # max_recurrent_loops (e.g. 'max' mode on a short checkpoint); False reuses the last step unscaled.
+        loop_beta_min: float = 0.05,
+        loop_beta_max: float = 0.95,
+        deep_loop_damping: bool = True,
+        # Per-key overrides of style.STYLE_PROFILES applied by generate(style_mode=...), e.g.
+        # {"stock_word_penalty": 3.0}. None keeps the built-in profiles.
+        style_profile_overrides: dict | None = None,
         # Hybrid Linear Mixer type for ssm_mixer_layers: "ssm" (SelectiveSSMMixer) or "gated_deltanet"
         # (GatedDeltaNetMixer with O(1) matrix state S_t = alpha_t S_{t-1} + beta_t (v_t - S_{t-1} k_t) k_t^T).
         linear_mixer_type: str = "ssm",
@@ -258,6 +269,9 @@ class InkyConfig(PretrainedConfig):
         pkm_top_k: int = 4,                # K winning slots fetched per token
         pkm_query_steps: tuple = (1, 3, 5),  # T_query subset of loop iterations that query B
         pkm_storage_dtype: str = "int8",   # "int4", "int8", or "float32"
+        pkm_hash_ngram: int = 3,           # m-gram window for pkm_routing_mode="hash"
+        pkm_pin_memory: bool = False,      # pin host-RAM value table (only effective when CUDA present)
+        pkm_step_gate: bool = True,        # learned per-loop-step bias on the memory injection gate
         pkm_routing_mode: str = "pkm",     # "pkm" (O(sqrt(M)) Cartesian product keys) or "hash" (O(1) m-gram hash)
         # Joint Embedding Predictive Architecture (JEPA) Executive Controller:
         enable_jepa: bool = False,
@@ -267,6 +281,12 @@ class InkyConfig(PretrainedConfig):
         jepa_compute_penalty: float = 0.05,  # lambda_compute in E(z_hat, z_goal) + lambda_compute * t
         jepa_mem_threshold: float = 0.5,   # tau_mem threshold for triggering memory bank fetch gate g_mem
         jepa_convergence_eps: float = 0.05,  # epsilon for ||z_hat_{t+1} - z_t||_2 < epsilon early halting
+        jepa_alpha_cos: float = 0.5,       # alpha_cos weight of cosine distance in the energy
+        jepa_action_dim: int = 32,         # action-plan embedding width
+        jepa_softmin_temp: float = 0.5,    # straight-through softmin temperature over action plans
+        jepa_vicreg_var_coef: float = 0.1, # VICReg variance (anti-collapse) weight
+        jepa_vicreg_cov_coef: float = 0.04,  # VICReg covariance weight
+        jepa_gate_temp: float = 0.1,       # sigmoid temperature of the straight-through fetch gate
         jepa_loss_coef: float = 0.1,       # weight of self-supervised JEPA latent prediction + VICReg loss
         **kwargs,
     ):
@@ -286,6 +306,14 @@ class InkyConfig(PretrainedConfig):
         self.convergence_halting = bool(convergence_halting)
         self.use_thought_gate = bool(use_thought_gate)
         self.use_mode_conditioning = bool(use_mode_conditioning)
+        if not 0.0 <= float(loop_beta_min) <= float(loop_beta_max) <= 1.0:
+            raise ValueError(
+                f"need 0 <= loop_beta_min <= loop_beta_max <= 1, got {loop_beta_min}, {loop_beta_max}"
+            )
+        self.loop_beta_min = float(loop_beta_min)
+        self.loop_beta_max = float(loop_beta_max)
+        self.deep_loop_damping = bool(deep_loop_damping)
+        self.style_profile_overrides = dict(style_profile_overrides) if style_profile_overrides else None
         if linear_mixer_type not in ("ssm", "gated_deltanet"):
             raise ValueError(f"linear_mixer_type must be 'ssm' or 'gated_deltanet', got {linear_mixer_type!r}")
         self.linear_mixer_type = linear_mixer_type
@@ -310,6 +338,11 @@ class InkyConfig(PretrainedConfig):
         if pkm_routing_mode not in ("pkm", "hash"):
             raise ValueError(f"pkm_routing_mode must be 'pkm' or 'hash', got {pkm_routing_mode!r}")
         self.pkm_routing_mode = pkm_routing_mode
+        if int(pkm_hash_ngram) < 1:
+            raise ValueError(f"pkm_hash_ngram must be >= 1, got {pkm_hash_ngram}")
+        self.pkm_hash_ngram = int(pkm_hash_ngram)
+        self.pkm_pin_memory = bool(pkm_pin_memory)
+        self.pkm_step_gate = bool(pkm_step_gate)
         self.enable_jepa = bool(enable_jepa)
         if not 1 <= int(jepa_latent_dim) <= 256:
             raise ValueError(f"jepa_latent_dim must be in [1, 256], got {jepa_latent_dim}")
@@ -324,6 +357,16 @@ class InkyConfig(PretrainedConfig):
         self.jepa_mem_threshold = float(jepa_mem_threshold)
         self.jepa_convergence_eps = float(jepa_convergence_eps)
         self.jepa_loss_coef = float(jepa_loss_coef)
+        if int(jepa_action_dim) < 1:
+            raise ValueError(f"jepa_action_dim must be >= 1, got {jepa_action_dim}")
+        self.jepa_action_dim = int(jepa_action_dim)
+        if float(jepa_softmin_temp) <= 0.0 or float(jepa_gate_temp) <= 0.0:
+            raise ValueError("jepa_softmin_temp and jepa_gate_temp must be > 0")
+        self.jepa_alpha_cos = float(jepa_alpha_cos)
+        self.jepa_softmin_temp = float(jepa_softmin_temp)
+        self.jepa_gate_temp = float(jepa_gate_temp)
+        self.jepa_vicreg_var_coef = float(jepa_vicreg_var_coef)
+        self.jepa_vicreg_cov_coef = float(jepa_vicreg_cov_coef)
         self.gradient_checkpointing = gradient_checkpointing
         self.lm_loss_recompute = bool(lm_loss_recompute)
         self.enable_arlo = enable_arlo

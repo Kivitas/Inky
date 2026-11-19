@@ -124,7 +124,12 @@ class QuantizedValueTable(nn.Module):
             return torch.from_numpy(mmap_arr)
         tensor = torch.empty(shape, dtype=torch_dtype, device="cpu")
         if self.pin_memory and torch.cuda.is_available():
-            tensor = tensor.pin_memory()
+            try:
+                tensor = tensor.pin_memory()
+            except RuntimeError:  # pinning can fail under host-memory pressure; fall back to pageable
+                self.pin_memory = False
+        else:
+            self.pin_memory = False
         return tensor
 
     def _apply(self, fn, recurse: bool = True):
@@ -200,28 +205,53 @@ class QuantizedValueTable(nn.Module):
         Returns:
             Tensor of shape ``[..., K, mem_dim]`` on ``device`` with dtype ``dtype``.
         """
-        target_device = indices.device if device is None else device
-        gather_idx = indices.detach().to(device=self.table.device, dtype=torch.long)
+        target_device = torch.device(indices.device if device is None else device)
+        lead = indices.shape
+        flat = indices.detach().reshape(-1).to(device=self.table.device, dtype=torch.long)
+        n = flat.numel()
+        # Deduplicate hot slots: gather / transfer / dequantize each distinct row once.
+        inverse = None
+        if n >= 64:
+            uniq, inverse = torch.unique(flat, return_inverse=True)
+            if uniq.numel() * 4 > n * 3:  # <25% saving: skip the scatter-back cost
+                inverse = None
+            else:
+                flat = uniq
+        rows = self._gather_rows(flat, target_device)
+        scales = None
+        if self.scales is not None:
+            scales = self.scales.index_select(0, flat).to(device=target_device, dtype=dtype, non_blocking=True)
+        out = self._dequantize(rows, scales, dtype)
+        if inverse is not None:
+            out = out.index_select(0, inverse.to(out.device))
+        return out.reshape(*lead, self.mem_dim)
 
+    def _gather_rows(self, flat: torch.Tensor, target_device: torch.device) -> torch.Tensor:
+        """Row gather from the cold table; stages through a reusable pinned buffer when pinned."""
+        if self.pin_memory and target_device.type == "cuda" and self.table.device.type == "cpu":
+            width = self.table.shape[1]
+            buf = getattr(self, "_staging", None)
+            if buf is None or buf.shape[0] < flat.numel() or buf.dtype != self.table.dtype:
+                buf = torch.empty((max(flat.numel(), 1024), width), dtype=self.table.dtype).pin_memory()
+                self._staging = buf
+            view = buf[: flat.numel()]
+            torch.index_select(self.table, 0, flat, out=view)
+            return view.to(target_device, non_blocking=True)
+        return self.table.index_select(0, flat).to(device=target_device, non_blocking=True)
+
+    def _dequantize(
+        self, rows: torch.Tensor, scales: Optional[torch.Tensor], dtype: torch.dtype
+    ) -> torch.Tensor:
+        """Dequantize gathered rows ``[N, w]`` -> ``[N, mem_dim]`` (single pass, on device)."""
         if self.storage_dtype == "float32":
-            gathered = self.table[gather_idx]
-            return gathered.to(device=target_device, dtype=dtype, non_blocking=True)
-
-        assert self.scales is not None
-        gathered_scales = self.scales[gather_idx].to(
-            device=target_device, dtype=dtype, non_blocking=True
-        )
-
+            return rows.to(dtype=dtype)
         if self.storage_dtype == "int8":
-            gathered_q = self.table[gather_idx].to(device=target_device, non_blocking=True)
-            return gathered_q.to(dtype=dtype) * gathered_scales
-
-        # storage_dtype == "int4": transfer packed bytes [..., K, d_mem // 2] then unpack on device
-        gathered_packed = self.table[gather_idx].to(device=target_device, non_blocking=True)
-        low = (gathered_packed & 0x0F).to(torch.int8) - 8
-        high = ((gathered_packed >> 4) & 0x0F).to(torch.int8) - 8
-        unpacked = torch.stack((low, high), dim=-1).reshape(*indices.shape, self.mem_dim)
-        return unpacked.to(dtype=dtype) * gathered_scales
+            return rows.to(dtype) * scales
+        n = rows.shape[0]
+        out = torch.empty((n, self.mem_dim // 2, 2), dtype=dtype, device=rows.device)
+        out[..., 0] = (rows & 0x0F).to(dtype) - 8.0
+        out[..., 1] = (rows >> 4).to(dtype) - 8.0
+        return out.reshape(n, self.mem_dim) * scales
 
 
 class ProductKeyMemoryBank(nn.Module):
@@ -250,6 +280,9 @@ class ProductKeyMemoryBank(nn.Module):
         mmap_path: Optional[str] = None,
         keep_table_on_cpu: bool = True,
         init_std: float = 0.02,
+        pin_memory: bool = False,
+        step_gate: bool = True,
+        max_steps: Optional[int] = None,
     ) -> None:
         super().__init__()
         if isinstance(hidden_size, InkyConfig):
@@ -264,6 +297,11 @@ class ProductKeyMemoryBank(nn.Module):
             hash_ngram = int(getattr(cfg, "pkm_hash_ngram", getattr(cfg, "memory_bank_hash_ngram", hash_ngram)))
             storage_dtype = str(
                 getattr(cfg, "pkm_storage_dtype", getattr(cfg, "memory_bank_storage_dtype", storage_dtype))
+            )
+            pin_memory = bool(getattr(cfg, "pkm_pin_memory", pin_memory))
+            step_gate = bool(getattr(cfg, "pkm_step_gate", step_gate))
+            max_steps = max_steps if max_steps is not None else max(
+                [int(getattr(cfg, "max_loops", 0) or 0)] + [int(x) for x in query_steps]
             )
             rms_norm_eps = float(getattr(cfg, "rms_norm_eps", rms_norm_eps))
             init_std = float(getattr(cfg, "initializer_range", init_std))
@@ -310,6 +348,7 @@ class ProductKeyMemoryBank(nn.Module):
             storage_dtype=storage_dtype,
             scale_dtype=scale_dtype,
             mmap_path=mmap_path,
+            pin_memory=pin_memory,
             keep_on_cpu=keep_table_on_cpu,
             init_std=init_std,
         )
@@ -317,6 +356,14 @@ class ProductKeyMemoryBank(nn.Module):
         # Output projection W_out and Gated Residual Injection W_g
         self.out_proj = nn.Linear(self.mem_dim, self.hidden_size, bias=False)
         self.gate_proj = nn.Linear(2 * self.hidden_size, self.hidden_size, bias=True)
+
+        # Step-conditioned gate: learned per-loop-step logit bias b_step (zero-init => starts as
+        # the plain token-conditioned gate). Steps beyond the table clamp to its last row.
+        n_steps = int(max_steps) if max_steps is not None else max(self.query_steps | {1})
+        self.step_gate_bias = (
+            nn.Parameter(torch.zeros(max(n_steps, max(self.query_steps | {1})) + 1, self.hidden_size))
+            if step_gate else None
+        )
 
         # Prime multipliers for deterministic multi-head rolling n-gram hash routing
         primes = torch.arange(1, self.top_k + 1, dtype=torch.long) * 2654435761 + 104729
@@ -333,15 +380,16 @@ class ProductKeyMemoryBank(nn.Module):
             slot indices lie in ``[0, S^2)`` via ``a * S + b``.
         """
         q = self.q_proj(h_norm)
-        q1, q2 = q.chunk(2, dim=-1)
-
-        s1 = F.linear(q1, self.c1.to(dtype=q1.dtype))  # [B, L, S]
-        s2 = F.linear(q2, self.c2.to(dtype=q2.dtype))  # [B, L, S]
-
-        v1, idx1 = torch.topk(s1, k=self.top_k, dim=-1)  # [B, L, K]
-        v2, idx2 = torch.topk(s2, k=self.top_k, dim=-1)  # [B, L, K]
-
         leading = h_norm.shape[:-1]
+        half = self.key_dim // 2
+        # One batched matmul scores both codebooks: [2, N, d/2] x [2, d/2, S] -> [2, N, S]
+        qs = q.reshape(1, -1, 2, half).squeeze(0).transpose(0, 1)
+        cb = torch.stack((self.c1, self.c2), dim=0).to(dtype=q.dtype)
+        scores = torch.bmm(qs, cb.transpose(1, 2))
+        v, idx = torch.topk(scores, k=self.top_k, dim=-1)  # one top-K for both halves
+        v1, v2 = v[0].reshape(*leading, self.top_k), v[1].reshape(*leading, self.top_k)
+        idx1, idx2 = idx[0].reshape(*leading, self.top_k), idx[1].reshape(*leading, self.top_k)
+
         k_sq = self.top_k * self.top_k
 
         # Form K x K Cartesian sum grid s^(1)_a + s^(2)_b and flat indices a * S + b
@@ -444,7 +492,11 @@ class ProductKeyMemoryBank(nn.Module):
 
         # Gated residual injection into the recurrent state
         m_hat = self.out_proj(m_t)  # [B, L, hidden_size]
-        gate = torch.sigmoid(self.gate_proj(torch.cat([h_norm, m_hat], dim=-1)))
+        logits = self.gate_proj(torch.cat([h_norm, m_hat], dim=-1))
+        if self.step_gate_bias is not None:
+            row = min(max(int(step), 0), self.step_gate_bias.shape[0] - 1)
+            logits = logits + self.step_gate_bias[row].to(dtype=logits.dtype)
+        gate = torch.sigmoid(logits)
 
         if fetch_gate is not None:
             fg = fetch_gate.to(device=gate.device, dtype=gate.dtype)
